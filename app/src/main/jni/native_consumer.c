@@ -124,15 +124,14 @@ static void proxy_down(void)
     if (proxy.sock >= 0) close(proxy.sock);
     proxy.sock = -1;
     if (proxy.child > 0) {
-        int st = 0;
-        pid_t r = waitpid(proxy.child, &st, WNOHANG);
-        if (r == proxy.child) {
-            if (WIFEXITED(st))
-                LOGI("proxy: child %d exited=%d", proxy.child, WEXITSTATUS(st));
-            else if (WIFSIGNALED(st))
-                LOGI("proxy: child %d signaled=%d", proxy.child, WTERMSIG(st));
-            proxy.child = -1;
-        }
+        kill(proxy.child, SIGKILL);
+        waitpid(proxy.child, NULL, 0);
+        proxy.child = -1;
+    }
+    if (proxy.listen >= 0) {
+        close(proxy.listen);
+        proxy.listen = -1;
+        unlink(proxy.sock_path);
     }
     vdr2_bell_registered = 0;
 }
@@ -144,6 +143,19 @@ static int proxy_spawn(void)
         LOGE("proxy: no daemon path");
         return -EINVAL;
     }
+
+    /* Clean up any previous daemon and socket before spawning a new one */
+    if (proxy.child > 0) {
+        kill(proxy.child, SIGKILL);
+        waitpid(proxy.child, NULL, 0);
+        proxy.child = -1;
+    }
+    if (proxy.listen >= 0) {
+        close(proxy.listen);
+        proxy.listen = -1;
+        unlink(proxy.sock_path);
+    }
+
     if (proxy.listen < 0) {
         snprintf(proxy.sock_path, sizeof(proxy.sock_path), "%s.sock",
                  proxy.daemon_path);
