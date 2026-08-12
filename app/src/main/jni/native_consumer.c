@@ -454,10 +454,12 @@ static int vdr2_wait_fence(void)
 {
     struct pollfd pfd = { .fd = vdr2_bell, .events = POLLIN };
     int pr = poll(&pfd, 1, 5000);
+    LOGI("wait_fence: bell_fd=%d poll_ret=%d errno=%d", vdr2_bell, pr, errno);
     if (pr <= 0) return pr == 0 ? -ETIMEDOUT : -errno;
     unsigned long long cnt;
     if (read(vdr2_bell, &cnt, sizeof(cnt)) != sizeof(cnt) && errno != EAGAIN)
         return -errno;
+    LOGI("wait_fence: drained count=%llu", cnt);
     return 0;
 }
 
@@ -471,6 +473,7 @@ static int vdr2_frame_slot(void)
     int ret = vdr2_proxy_ioctl(VDR2_IOC_FRAME, &fo, sizeof(fo),
                                NULL, 0, &frame_fd);
     if (frame_fd >= 0) close(frame_fd);
+    LOGI("frame_slot: ret=%d slot=%d seq=%llu", ret, fo.slot, fo.seq);
     if (ret < 0) return -1;
     return fo.slot;
 }
@@ -562,12 +565,17 @@ static void *render_loop(void *arg)
 {
     struct consumer *c = arg;
     LOGI("render loop started");
+    int loop_count = 0;
 
     while (c->running) {
+        loop_count++;
         /* Wait for the container to finish a flip. */
         int fwait = vdr2_wait_fence();
         if (fwait < 0) {
-            LOGI("fence wait failed ret=%d", fwait);
+            LOGI("fence wait failed ret=%d loop=%d", fwait, loop_count);
+            /* Even on timeout, query FRAME to trigger vdr2_proxy_ioctl
+             * which re-registers the bell if the daemon was restarted. */
+            vdr2_frame_slot();
             usleep(16000);
             continue;
         }
@@ -575,13 +583,13 @@ static void *render_loop(void *arg)
         /* Ask the KPM which slot was flipped. */
         int target_slot = vdr2_frame_slot();
         if (target_slot < 0) {
-            LOGI("frame slot unavailable");
+            LOGI("frame slot unavailable loop=%d", loop_count);
             continue;
         }
 
-        /* Dequeue until we get the buffer that belongs to the flipped slot.
-         * The right one is guaranteed to be in the pool since the container
-         * rendered into a registered slot buffer. */
+        LOGI("render frame slot=%d loop=%d", target_slot, loop_count);
+
+        /* Dequeue until we get the buffer that belongs to the flipped slot. */
         for (int retries = 0; retries < VDR2_SLOTS * 2; retries++) {
             ANativeWindowBuffer *anb = NULL;
             int fence = -1;
