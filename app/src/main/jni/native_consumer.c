@@ -452,6 +452,12 @@ static int vdrm_present(void)
  * Blocks up to 5s; returns 0 on ring, -ETIMEDOUT otherwise. */
 static int vdr2_wait_fence(void)
 {
+    unsigned long long probe_cnt;
+    int probe = read(vdr2_bell, &probe_cnt, sizeof(probe_cnt));
+    if (probe == sizeof(probe_cnt)) {
+        LOGI("wait_fence: pre-poll drained count=%llu", probe_cnt);
+        return 0;
+    }
     struct pollfd pfd = { .fd = vdr2_bell, .events = POLLIN };
     int pr = poll(&pfd, 1, 5000);
     LOGI("wait_fence: bell_fd=%d poll_ret=%d errno=%d", vdr2_bell, pr, errno);
