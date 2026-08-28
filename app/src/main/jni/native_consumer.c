@@ -199,10 +199,11 @@ static int collect_buffers(struct consumer *c)
         if (is_dup) continue;
         if (reg_fd < 0) continue;
 
+        LOGI("  registering: dup_fd=%d (orig fd=%d) → kpatch add_buf", reg_fd, fd);
         int ret = kpatch_ctl0("add_buf=%d", reg_fd);
         close(reg_fd);
         if (ret != 0) {
-            LOGE("add_buf failed fd=%d ret=%d", fd, ret);
+            LOGE("add_buf failed fd=%d ret=%d (fd may not have survived su fork)", fd, ret);
             continue;
         }
 
@@ -494,6 +495,12 @@ Java_com_vdrm_consumer_Native_nativeStop(JNIEnv *env, jclass clazz, jlong handle
         c->running = false;
         pthread_join(c->thread, NULL);
     }
+
+    /* Notify KPM to stop signaling (sets eventfd_ctx to NULL, stops vblank writes) */
+    if (c->event_fd >= 0) {
+        kpatch_ctl0("set_eventfd=0");
+    }
+
     LOGI("stopped");
 }
 
