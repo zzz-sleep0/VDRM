@@ -3,6 +3,7 @@ package com.vdrm.consumer;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
@@ -128,6 +129,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         Native.nativeStop(nativeHandle);
+    }
+
+    /** 小窗↔全屏 等配置变化：键盘来不及重排（约 0.5s 延迟），干脆先收起来，
+     *  等画面稳定后用户再按 BACK 唤出。*/
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (keyboardView != null && keyboardView.getVisibility() == View.VISIBLE) {
+            keyboardView.setVisibility(View.GONE);
+            Log.i(TAG, "config changed -> hide keyboard");
+        }
     }
 
     /* ---- Key interception ---- */

@@ -1,0 +1,9 @@
+# SDK 已提供 / 与 BTF 冲突的名字，自动生成
+__s64
+__u64
+atomic64_t
+atomic_t
+bool
+callback_head
+hlist_node
+list_head

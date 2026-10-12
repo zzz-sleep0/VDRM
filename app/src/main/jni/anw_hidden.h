@@ -36,6 +36,49 @@ typedef struct ANativeWindowBuffer {
     void *reserved_proc[8 - (sizeof(uint64_t) / sizeof(void *))];
 } ANativeWindowBuffer;
 
+/* perform() ops / API ids (AOSP system/window.h). */
+enum {
+    ANW_API_CONNECT    = 13,
+    ANW_API_DISCONNECT = 14,
+    ANW_API_CPU        = 2,
+};
+
+/* Full ANativeWindow op table. dequeueBuffer needs the window connected to an
+ * API first via perform(ANW_API_CONNECT, api); perform() has no exported C
+ * wrapper, so reach it through the struct. Layout must match the platform ABI
+ * exactly (verbatim from AOSP system/window.h). */
+struct anw_window {
+    android_native_base_t common;
+    const uint32_t flags;
+    const int   minSwapInterval;
+    const int   maxSwapInterval;
+    const float xdpi;
+    const float ydpi;
+    intptr_t    oem[4];
+    int (*setSwapInterval)(struct anw_window *, int);
+    int (*dequeueBuffer_DEPRECATED)(struct anw_window *, ANativeWindowBuffer **);
+    int (*lockBuffer_DEPRECATED)(struct anw_window *, ANativeWindowBuffer *);
+    int (*queueBuffer_DEPRECATED)(struct anw_window *, ANativeWindowBuffer *);
+    int (*query)(const struct anw_window *, int, int *);
+    int (*perform)(struct anw_window *, int, ...);
+    int (*cancelBuffer_DEPRECATED)(struct anw_window *, ANativeWindowBuffer *);
+    int (*dequeueBuffer)(struct anw_window *, ANativeWindowBuffer **, int *fenceFd);
+    int (*queueBuffer)(struct anw_window *, ANativeWindowBuffer *, int fenceFd);
+    int (*cancelBuffer)(struct anw_window *, ANativeWindowBuffer *, int fenceFd);
+};
+
+static inline int anw_api_connect(ANativeWindow *w, int api)
+{
+    struct anw_window *aw = (struct anw_window *)w;
+    return aw->perform(aw, ANW_API_CONNECT, api);
+}
+
+static inline int anw_api_disconnect(ANativeWindow *w, int api)
+{
+    struct anw_window *aw = (struct anw_window *)w;
+    return aw->perform(aw, ANW_API_DISCONNECT, api);
+}
+
 typedef int (*pfn_ANativeWindow_setBufferCount)(ANativeWindow *, size_t);
 typedef int (*pfn_ANativeWindow_query)(const ANativeWindow *, int, int *);
 typedef int (*pfn_ANativeWindow_dequeueBuffer)(ANativeWindow *, ANativeWindowBuffer **, int *);

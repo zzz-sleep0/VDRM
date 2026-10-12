@@ -15,6 +15,12 @@ public class VirtualKeyboardView extends View {
     private int pressedKey = -1;
     private boolean fnMode = false;
     private boolean shiftMode = false;
+    private boolean shiftLock = false;   /* 双击 Shift 锁定 */
+    private boolean capsMode = false;    /* Caps 状态（仅用于显示；实际 lock 由合成器处理）*/
+    /* 粘滞修饰键：软键盘单指按不住组合键，改成 tap 锁定，一次性作用于下一个键 */
+    private boolean ctrlLatch = false, altLatch = false, superLatch = false;
+    private int     pressedMods = 0;     /* 当前键已发出的修饰键位：1=Shift 2=Ctrl 4=Alt 8=Super */
+    private long    lastShiftTap = 0;
 
     private static final int BAR_W = 24;
     private static final int CTRL_GAP = 20;
@@ -84,6 +90,10 @@ public class VirtualKeyboardView extends View {
          "Alt","56",null,null,
          "     Space     ","57",null,null,
          "Alt","56",null,null,  "Fn","-1",null,null},
+        {"Esc","1",null,null,  "←","105",null,null,  "↑","103",null,null,
+         "↓","108",null,null,  "→","106",null,null,  "Home","102",null,null,
+         "End","107",null,null,  "PgUp","104",null,null,  "PgDn","109",null,null,
+         "Del","111",null,null,  "Ins","110",null,null},
     };
 
     private static final int KEY_GAP = 3;
@@ -293,11 +303,19 @@ public class VirtualKeyboardView extends View {
                 RectF rect = keyRects[r][i / 4];
                 if (rect == null) continue;
 
-                canvas.drawRoundRect(rect, 5, 5, idx == pressedKey ? pressPaint : keyPaint);
+                boolean lit = idx == pressedKey
+                        || (label.equals("Shift") && shiftMode)
+                        || (label.equals("Caps") && capsMode)
+                        || (label.equals("Ctrl") && ctrlLatch)
+                        || (label.equals("Alt") && altLatch)
+                        || (label.equals("Super") && superLatch);
+                canvas.drawRoundRect(rect, 5, 5, lit ? pressPaint : keyPaint);
 
                 String display = label;
                 if (isFnKey) {
                     display = FN_ROW0[c * 2];
+                } else if (isLetter(label)) {
+                    display = (shiftMode != capsMode) ? label.toUpperCase() : label.toLowerCase();
                 } else if (shiftMode && shiftLabel != null) {
                     display = shiftLabel;
                 }
@@ -327,29 +345,87 @@ public class VirtualKeyboardView extends View {
         return -1;
     }
 
+    private static boolean isModifierCode(int code) {
+        return code == 29 || code == 97 || code == 56 || code == 100
+                || code == 125 || code == 126 || code == 58;
+    }
+
+    private static boolean isLetter(String s) {
+        return s.length() == 1 && Character.isLetter(s.charAt(0));
+    }
+
     private void sendKeyDown(int hit) {
         if (hit < 0) return;
         int r = hit / 20;
         int col = hit % 20;
         String baseCode = KEYS[r][col * 4 + 1];
 
-        if (baseCode.equals("-1")) {
+        if (baseCode.equals("-1")) {           /* Fn */
             fnMode = !fnMode;
             shiftMode = false;
+            shiftLock = false;
+            ctrlLatch = altLatch = superLatch = false;
             updatePressedKey(hit);
             invalidate();
             return;
         }
-        if (baseCode.equals("-2")) {
-            shiftMode = !shiftMode;
+        if (baseCode.equals("-2")) {           /* Shift：单击一次性，双击锁定 */
+            long now = System.currentTimeMillis();
+            if (now - lastShiftTap < 300) {
+                shiftLock = !shiftLock;
+                shiftMode = shiftLock;
+            } else if (shiftMode && !shiftLock) {
+                shiftMode = false;
+                shiftLock = false;
+            } else {
+                shiftMode = true;
+                shiftLock = false;
+            }
+            lastShiftTap = now;
             updatePressedKey(hit);
             invalidate();
             return;
         }
 
         int code = resolveCode(r, col, baseCode);
+
+        /* 修饰键：粘滞(latch)，不直接发键；下次按普通键时带上 */
+        if (code == 29)  { ctrlLatch  = !ctrlLatch;  updatePressedKey(hit); invalidate(); return; }
+        if (code == 56)  { altLatch   = !altLatch;   updatePressedKey(hit); invalidate(); return; }
+        if (code == 125) { superLatch = !superLatch; updatePressedKey(hit); invalidate(); return; }
+
+        if (code == 58)                        /* Caps：本地记显示 */
+            capsMode = !capsMode;
+
+        /* 按固定顺序发：Shift, Ctrl, Alt, Super 的 down，再发键本身 */
+        pressedMods = 0;
+        if (shiftMode)  { Native.nativeSendKey(42,  true); pressedMods |= 1; }
+        if (ctrlLatch)  { Native.nativeSendKey(29,  true); pressedMods |= 2; }
+        if (altLatch)   { Native.nativeSendKey(56,  true); pressedMods |= 4; }
+        if (superLatch) { Native.nativeSendKey(125, true); pressedMods |= 8; }
         Native.nativeSendKey(code, true);
         updatePressedKey(hit);
+        invalidate();
+    }
+
+    /* 松开当前键：补发修饰键 up，并处理一次性 latch 的自动关闭 */
+    private void releaseKey(int r, int col) {
+        String baseCode = KEYS[r][col * 4 + 1];
+        if (baseCode.equals("-1") || baseCode.equals("-2"))
+            return;
+        int code = resolveCode(r, col, baseCode);
+        if (code == 29 || code == 56 || code == 125)   /* Ctrl/Alt/Super：松手不能清 latch */
+            return;
+        Native.nativeSendKey(code, false);
+        if (pressedMods != 0) {
+            if ((pressedMods & 1) != 0) Native.nativeSendKey(42,  false);
+            if ((pressedMods & 2) != 0) Native.nativeSendKey(29,  false);
+            if ((pressedMods & 4) != 0) Native.nativeSendKey(56,  false);
+            if ((pressedMods & 8) != 0) Native.nativeSendKey(125, false);
+            pressedMods = 0;
+        }
+        if (shiftMode && !shiftLock) shiftMode = false;   /* 一次性 Shift */
+        ctrlLatch = altLatch = superLatch = false;        /* 一次性 latch */
         invalidate();
     }
 
@@ -394,13 +470,7 @@ public class VirtualKeyboardView extends View {
             isAdjustingAlpha = false;
         }
         if (pressedKey >= 0) {
-            int r = pressedKey / 20;
-            int col = pressedKey % 20;
-            String baseCode = KEYS[r][col * 4 + 1];
-            if (!baseCode.equals("-1") && !baseCode.equals("-2")) {
-                int code = resolveCode(r, col, baseCode);
-                Native.nativeSendKey(code, false);
-            }
+            releaseKey(pressedKey / 20, pressedKey % 20);
             clearPressedKey();
             invalidate();
         }
@@ -512,13 +582,7 @@ public class VirtualKeyboardView extends View {
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     if (pressedKey >= 0 && hit != pressedKey) {
-                        int oldR = pressedKey / 20;
-                        int oldCol = pressedKey % 20;
-                        String oldBase = KEYS[oldR][oldCol * 4 + 1];
-                        if (!oldBase.equals("-1") && !oldBase.equals("-2")) {
-                            int oldCode = resolveCode(oldR, oldCol, oldBase);
-                            Native.nativeSendKey(oldCode, false);
-                        }
+                        releaseKey(pressedKey / 20, pressedKey % 20);
                         clearPressedKey();
                         sendKeyDown(hit);
                     } else if (pressedKey < 0) {
@@ -527,13 +591,7 @@ public class VirtualKeyboardView extends View {
                     return true;
                 case MotionEvent.ACTION_UP:
                     if (pressedKey >= 0) {
-                        int pr = pressedKey / 20;
-                        int pCol = pressedKey % 20;
-                        String pBase = KEYS[pr][pCol * 4 + 1];
-                        if (!pBase.equals("-1") && !pBase.equals("-2")) {
-                            int pCode = resolveCode(pr, pCol, pBase);
-                            Native.nativeSendKey(pCode, false);
-                        }
+                        releaseKey(pressedKey / 20, pressedKey % 20);
                         clearPressedKey();
                         invalidate();
                     }
@@ -541,13 +599,7 @@ public class VirtualKeyboardView extends View {
             }
         } else {
             if (action == MotionEvent.ACTION_MOVE && pressedKey >= 0) {
-                int pr = pressedKey / 20;
-                int pCol = pressedKey % 20;
-                String pBase = KEYS[pr][pCol * 4 + 1];
-                if (!pBase.equals("-1") && !pBase.equals("-2")) {
-                    int pCode = resolveCode(pr, pCol, pBase);
-                    Native.nativeSendKey(pCode, false);
-                }
+                releaseKey(pressedKey / 20, pressedKey % 20);
                 clearPressedKey();
                 invalidate();
             }

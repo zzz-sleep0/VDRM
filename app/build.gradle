@@ -16,12 +16,7 @@ android {
         ndk {
             abiFilters 'arm64-v8a'
         }
-        externalNativeBuild {
-            cmake {
-                cppFlags ''
-                arguments '-DANDROID_STL=none'
-            }
-        }
+        // Package the prebuilt library from src/main/jniLibs.
     }
 
     buildTypes {
@@ -31,9 +26,5 @@ android {
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path 'src/main/jni/CMakeLists.txt'
-        }
-    }
+    // Native sources/CMakeLists.txt remain for manual native rebuilds.
 }

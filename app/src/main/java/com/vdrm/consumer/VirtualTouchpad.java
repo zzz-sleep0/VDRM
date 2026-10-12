@@ -4,265 +4,222 @@ import android.content.Context;
 import android.view.MotionEvent;
 import android.view.ViewConfiguration;
 
+/**
+ * 相对触控板（位移处理参考 anland 的 Touchpad，去掉手势转发等非核心部分）。
+ *
+ *   1 指拖动       → 光标相对移动：平滑(死区 + IIR + 累积) × 加速曲线
+ *   1 指轻点       → 左键单击
+ *   1 指长按 500ms → 拖拽（左键按住，跟随手指）
+ *   2 指拖动       → 滚动
+ *   2 指轻点       → 右键单击
+ *
+ * 加速曲线（同 anland）：
+ *   scale = 1 + (ACCEL-1) * (speed/(1+speed))，clamp[0.3, 10]
+ *   ACCEL = 1.0 → 不提速（位移 1:1）；ACCEL > 1 → "非 1:1"（手指移 1px 光标移更多）。
+ *   ACCEL 就是唯一的灵敏度旋钮，以后可接设置滑块。
+ */
 public final class VirtualTouchpad {
 
     private static final int STATE_IDLE = 0;
-    private static final int STATE_ONE_FINGER = 1;
-    private static final int STATE_TWO_FINGER = 2;
-    private static final int STATE_DRAGGING = 3;
-    private int currentState = STATE_IDLE;
+    private static final int STATE_ONE  = 1;
+    private static final int STATE_TWO  = 2;
+    private static final int STATE_DRAG = 3;
 
-    private float lastX1, lastY1;
-    private float startX1, startY1;
-    private float lastX2, lastY2;
-    private long downTime1;
+    private static final long  LONG_PRESS_MS = 500;
+    private static final long  TAP_MS        = 300;
+    private static final int   BTN_LEFT  = 0x110;   /* 272 */
+    private static final int   BTN_RIGHT = 0x111;   /* 273 */
+
+    /* ---- 位移处理（与 anland 数值一致）---- */
+    private static final float DEAD_ZONE        = 0.3f;
+    private static final float SMOOTHING_FACTOR = 0.45f;
+    private static final float ACCUM_THRESHOLD  = 0.1f;
+    private static final float ACCEL            = 2.0f;   /* 灵敏度：>1 即非 1:1 */
+    private static final float SCROLL_SPEED     = 0.5f;  /* 双指位移 → 滚动量 */
+
+    private int state = STATE_IDLE;
+    private float startX, startY, lastX, lastY, lastX2, lastY2;
+    private long downTime;
+    private boolean tapCandidate, twoTapCandidate, dragging, multi;
     private final float touchSlop;
 
-    private boolean isSingleTapCandidate = false;
-    private boolean isTwoFingerTapCandidate = false;
-    private boolean isDraggingActive = false;
-    private boolean isMultiFinger = false;
-
-    private static final long TOUCH_LONG_PRESS_TIMEOUT = 500;
-    private boolean hasLongPressed = false;
-    private boolean isLongPressPossible = false;
-
-    private float mouseAccelStrength = 1.0f;
-
-    /* Smoothing parameters */
-    private static final float DEAD_ZONE = 0.3f;
-    private static final float SMOOTHING_FACTOR = 0.45f;
-    private static final float ACCUMULATED_THRESHOLD = 0.1f;
-
-    private float smoothedDx = 0f;
-    private float smoothedDy = 0f;
-    private float accumulatedX = 0f;
-    private float accumulatedY = 0f;
-    private boolean smoothInitialized = false;
+    /* 平滑/累积状态 */
+    private float smoothedDx, smoothedDy;
+    private float accumX, accumY;       /* 平滑后的累积（阈值 0.1 才放行）*/
+    private float moveAccX, moveAccY;   /* 加速后再累积，避免 (int) 丢精度 */
+    private boolean smoothInit;
 
     VirtualTouchpad(Context context) {
         touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
     }
 
-    void setAccelStrength(float strength) {
-        mouseAccelStrength = Math.max(0.5f, Math.min(10.0f, strength));
-    }
-
     boolean onTouch(MotionEvent event) {
-        int action = event.getActionMasked();
-        int pointerCount = event.getPointerCount();
+        switch (event.getActionMasked()) {
+        case MotionEvent.ACTION_DOWN:
+            startX = lastX = event.getX();
+            startY = lastY = event.getY();
+            downTime = event.getEventTime();
+            tapCandidate = true;
+            twoTapCandidate = false;
+            dragging = false;
+            multi = false;
+            state = STATE_ONE;
+            resetSmoothing();
+            break;
 
-        switch (action) {
-            case MotionEvent.ACTION_DOWN: {
+        case MotionEvent.ACTION_POINTER_DOWN:
+            multi = true;
+            tapCandidate = false;
+            if (dragging) {
+                Native.nativeSendBtn(BTN_LEFT, false);
+                dragging = false;
+            }
+            if (event.getPointerCount() == 2) {
+                state = STATE_TWO;
+                twoTapCandidate = true;
+                lastX  = event.getX(0); lastY  = event.getY(0);
+                lastX2 = event.getX(1); lastY2 = event.getY(1);
+            }
+            break;
+
+        case MotionEvent.ACTION_MOVE:
+            if (event.getPointerCount() == 1 && !multi) {
                 float x = event.getX();
                 float y = event.getY();
-                startX1 = lastX1 = x;
-                startY1 = lastY1 = y;
-                downTime1 = event.getEventTime();
-                hasLongPressed = false;
-                isLongPressPossible = true;
-                isSingleTapCandidate = true;
-                isTwoFingerTapCandidate = false;
-                isDraggingActive = false;
-                isMultiFinger = false;
-                currentState = STATE_ONE_FINGER;
-                resetSmoothing();
-                break;
-            }
-            case MotionEvent.ACTION_POINTER_DOWN: {
-                isMultiFinger = true;
-                isSingleTapCandidate = false;
-                isLongPressPossible = false;
-                if (currentState == STATE_DRAGGING) {
-                    Native.nativeSendBtn(0x110, false);
-                    isDraggingActive = false;
-                }
-                if (pointerCount == 2) {
-                    currentState = STATE_TWO_FINGER;
-                    isTwoFingerTapCandidate = true;
-                    lastX1 = event.getX(0);
-                    lastY1 = event.getY(0);
-                    lastX2 = event.getX(1);
-                    lastY2 = event.getY(1);
-                }
-                break;
-            }
-            case MotionEvent.ACTION_MOVE: {
-                if (pointerCount == 1 && !isMultiFinger) {
-                    float x = event.getX();
-                    float y = event.getY();
-                    float rawDx = x - lastX1;
-                    float rawDy = y - lastY1;
-                    float dist = (float) Math.hypot(x - startX1, y - startY1);
+                float rawDx = x - lastX;
+                float rawDy = y - lastY;
+                if (Math.hypot(x - startX, y - startY) > touchSlop)
+                    tapCandidate = false;
 
-                    if (dist > touchSlop) {
-                        isLongPressPossible = false;
-                        isSingleTapCandidate = false;
-                    }
-
-                    if (isLongPressPossible && !hasLongPressed &&
-                            (event.getEventTime() - downTime1) >= TOUCH_LONG_PRESS_TIMEOUT) {
-                        hasLongPressed = true;
-                        currentState = STATE_DRAGGING;
-                        isDraggingActive = true;
-                        Native.nativeSendBtn(0x110, true);
-                        resetSmoothing();
-                        break;
-                    }
-
-                    float[] smoothed = applySmoothing(rawDx, rawDy);
-                    float smoothDx = smoothed[0];
-                    float smoothDy = smoothed[1];
-
-                    if (smoothDx != 0f || smoothDy != 0f) {
-                        float distance = (float) Math.hypot(smoothDx, smoothDy);
-                        float speedFactor = distance / 10.0f;
-                        float dynamicScale = 1.0f + (mouseAccelStrength - 1.0f) * (speedFactor / (1.0f + speedFactor));
-                        dynamicScale = Math.max(0.3f, Math.min(10.0f, dynamicScale));
-
-                        int moveX = (int)(smoothDx * dynamicScale);
-                        int moveY = (int)(smoothDy * dynamicScale);
-                        Native.nativeSendMotion(moveX, moveY);
-                    }
-
-                    lastX1 = x;
-                    lastY1 = y;
-
-                } else if (pointerCount == 2) {
-                    if (currentState == STATE_TWO_FINGER) {
-                        float x1 = event.getX(0);
-                        float y1 = event.getY(0);
-                        float x2 = event.getX(1);
-                        float y2 = event.getY(1);
-                        float avgDx = ((x1 - lastX1) + (x2 - lastX2)) / 2;
-                        float avgDy = ((y1 - lastY1) + (y2 - lastY2)) / 2;
-
-                        if (Math.abs(avgDx) > 1 || Math.abs(avgDy) > 1) {
-                            isTwoFingerTapCandidate = false;
-                            if (Math.abs(avgDy) > Math.abs(avgDx) * 0.5) {
-                                Native.nativeSendScroll(0, -(int)(avgDy * 0.5f));
-                            }
-                            if (Math.abs(avgDx) > Math.abs(avgDy) * 0.5) {
-                                Native.nativeSendScroll(1, (int)(avgDx * 0.5f));
-                            }
-                            lastX1 = x1;
-                            lastY1 = y1;
-                            lastX2 = x2;
-                            lastY2 = y2;
+                if (tapCandidate && !dragging
+                        && event.getEventTime() - downTime >= LONG_PRESS_MS) {
+                    dragging = true;
+                    state = STATE_DRAG;
+                    Native.nativeSendBtn(BTN_LEFT, true);
+                    resetSmoothing();
+                } else {
+                    float[] s = applySmoothing(rawDx, rawDy);
+                    if (s[0] != 0f || s[1] != 0f) {
+                        float distance = (float) Math.hypot(s[0], s[1]);
+                        float speed = distance / 10.0f;
+                        float scale = 1.0f + (ACCEL - 1.0f) * (speed / (1.0f + speed));
+                        if (scale < 0.3f) scale = 0.3f;
+                        else if (scale > 10.0f) scale = 10.0f;
+                        moveAccX += s[0] * scale;
+                        moveAccY += s[1] * scale;
+                        int mx = (int) moveAccX;
+                        int my = (int) moveAccY;
+                        if (mx != 0 || my != 0) {
+                            moveAccX -= mx;
+                            moveAccY -= my;
+                            Native.nativeSendMotion(mx, my);
                         }
                     }
                 }
-                break;
+                lastX = x;
+                lastY = y;
+            } else if (event.getPointerCount() == 2 && state == STATE_TWO) {
+                float x0 = event.getX(0), y0 = event.getY(0);
+                float x1 = event.getX(1), y1 = event.getY(1);
+                float adx = ((x0 - lastX) + (x1 - lastX2)) / 2f;
+                float ady = ((y0 - lastY) + (y1 - lastY2)) / 2f;
+                if (Math.abs(adx) > 1f || Math.abs(ady) > 1f) {
+                    twoTapCandidate = false;
+                    /* 自然方向：手指上滑 → 内容下滑 */
+                    if (Math.abs(ady) > Math.abs(adx) * 0.5f)
+                        Native.nativeSendScroll(0, -(int) (ady * SCROLL_SPEED));
+                    if (Math.abs(adx) > Math.abs(ady) * 0.5f)
+                        Native.nativeSendScroll(1,  (int) (adx * SCROLL_SPEED));
+                    lastX = x0; lastY = y0;
+                    lastX2 = x1; lastY2 = y1;
+                }
             }
-            case MotionEvent.ACTION_POINTER_UP: {
-                int remaining = pointerCount - 1;
-                if (remaining == 1) {
-                    isMultiFinger = false;
-                    isSingleTapCandidate = false;
-                    isLongPressPossible = false;
-                    int idx = (event.getActionIndex() == 0) ? 1 : 0;
-                    lastX1 = event.getX(idx);
-                    lastY1 = event.getY(idx);
-                    startX1 = lastX1;
-                    startY1 = lastY1;
-                    downTime1 = event.getEventTime();
-                    hasLongPressed = false;
-                    currentState = STATE_ONE_FINGER;
-                    resetSmoothing();
-                }
-                break;
-            }
-            case MotionEvent.ACTION_UP: {
-                long duration = event.getEventTime() - downTime1;
-                boolean isQuickTap = duration < 300;
+            break;
 
-                if (isDraggingActive) {
-                    Native.nativeSendBtn(0x110, false);
-                    isDraggingActive = false;
-                    resetState();
-                    resetSmoothing();
-                    return true;
-                }
-
-                if (isTwoFingerTapCandidate && isQuickTap) {
-                    Native.nativeSendBtn(0x111, true);
-                    Native.nativeSendBtn(0x111, false);
-                    resetState();
-                    resetSmoothing();
-                    return true;
-                }
-
-                if (currentState == STATE_ONE_FINGER && isSingleTapCandidate && isQuickTap) {
-                    Native.nativeSendBtn(0x110, true);
-                    Native.nativeSendBtn(0x110, false);
-                    resetState();
-                    resetSmoothing();
-                    return true;
-                }
-                resetState();
+        case MotionEvent.ACTION_POINTER_UP:
+            if (event.getPointerCount() - 1 == 1) {
+                /* 回到单指：以剩下那根手指为基线 */
+                multi = false;
+                tapCandidate = false;
+                int idx = (event.getActionIndex() == 0) ? 1 : 0;
+                startX = lastX = event.getX(idx);
+                startY = lastY = event.getY(idx);
+                downTime = event.getEventTime();
+                state = STATE_ONE;
                 resetSmoothing();
-                break;
             }
-            case MotionEvent.ACTION_CANCEL: {
-                if (isDraggingActive) {
-                    Native.nativeSendBtn(0x110, false);
-                    isDraggingActive = false;
-                }
-                resetState();
-                resetSmoothing();
-                break;
+            break;
+
+        case MotionEvent.ACTION_UP:
+            long dur = event.getEventTime() - downTime;
+            if (dragging) {
+                Native.nativeSendBtn(BTN_LEFT, false);
+                dragging = false;
+            } else if (twoTapCandidate && dur < TAP_MS) {
+                Native.nativeSendBtn(BTN_RIGHT, true);
+                Native.nativeSendBtn(BTN_RIGHT, false);
+            } else if (state == STATE_ONE && tapCandidate && dur < TAP_MS) {
+                Native.nativeSendBtn(BTN_LEFT, true);
+                Native.nativeSendBtn(BTN_LEFT, false);
             }
+            reset();
+            break;
+
+        case MotionEvent.ACTION_CANCEL:
+            if (dragging) {
+                Native.nativeSendBtn(BTN_LEFT, false);
+                dragging = false;
+            }
+            reset();
+            break;
         }
         return true;
     }
 
-    private void resetState() {
-        currentState = STATE_IDLE;
-        isSingleTapCandidate = false;
-        isTwoFingerTapCandidate = false;
-        hasLongPressed = false;
-        isDraggingActive = false;
-        isLongPressPossible = false;
-        isMultiFinger = false;
+    private void reset() {
+        state = STATE_IDLE;
+        tapCandidate = false;
+        twoTapCandidate = false;
+        dragging = false;
+        multi = false;
+        resetSmoothing();
     }
 
     private void resetSmoothing() {
-        smoothedDx = 0f;
-        smoothedDy = 0f;
-        accumulatedX = 0f;
-        accumulatedY = 0f;
-        smoothInitialized = false;
+        smoothedDx = smoothedDy = 0f;
+        accumX = accumY = 0f;
+        moveAccX = moveAccY = 0f;
+        smoothInit = false;
     }
 
+    /** 死区 → IIR 平滑 → 阈值累积（与 anland 一致）。返回本次放行的位移。 */
     private float[] applySmoothing(float rawDx, float rawDy) {
         float deadDx = Math.abs(rawDx) < DEAD_ZONE ? 0f : rawDx;
         float deadDy = Math.abs(rawDy) < DEAD_ZONE ? 0f : rawDy;
 
-        if (deadDx == 0f && deadDy == 0f) {
+        if (deadDx == 0f && deadDy == 0f)
             return new float[]{0f, 0f};
-        }
 
-        if (!smoothInitialized) {
+        if (!smoothInit) {
             smoothedDx = deadDx;
             smoothedDy = deadDy;
-            smoothInitialized = true;
+            smoothInit = true;
         } else {
             smoothedDx = SMOOTHING_FACTOR * deadDx + (1 - SMOOTHING_FACTOR) * smoothedDx;
             smoothedDy = SMOOTHING_FACTOR * deadDy + (1 - SMOOTHING_FACTOR) * smoothedDy;
         }
 
-        accumulatedX += smoothedDx;
-        accumulatedY += smoothedDy;
+        accumX += smoothedDx;
+        accumY += smoothedDy;
 
-        float outX = 0f;
-        float outY = 0f;
-        if (Math.abs(accumulatedX) >= ACCUMULATED_THRESHOLD) {
-            outX = accumulatedX;
-            accumulatedX = 0f;
+        float outX = 0f, outY = 0f;
+        if (Math.abs(accumX) >= ACCUM_THRESHOLD) {
+            outX = accumX;
+            accumX = 0f;
         }
-        if (Math.abs(accumulatedY) >= ACCUMULATED_THRESHOLD) {
-            outY = accumulatedY;
-            accumulatedY = 0f;
+        if (Math.abs(accumY) >= ACCUM_THRESHOLD) {
+            outY = accumY;
+            accumY = 0f;
         }
         return new float[]{outX, outY};
     }

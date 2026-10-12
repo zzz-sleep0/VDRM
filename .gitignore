@@ -1,6 +1,21 @@
+# 构建产物
 *.apk
 *.so
 /build/
 app/build/
 app/.cxx/
+prebuilt/
+*.tar.gz
+
+# 本机配置
 local.properties
+
+# CodeAssist / AndroidIDE 工作区元数据（里面有本机绝对路径，不要提交）
+.platform/
+
+# 临时备份
+*.bak-*
+
+# Python 缓存
+__pycache__/
+*.pyc
