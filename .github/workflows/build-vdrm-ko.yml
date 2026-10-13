@@ -1,7 +1,8 @@
 name: Build vdrm.ko (DDK)
 
 # 照抄 _patchHarmony 的 matrix 形状：一个 KMI 一份产物。
-# 先只放 android14-6.1（本机设备的 KMI），跑通后再加别的档。
+# 掐头去尾：不要最老的 5.10、也不要最新的 6.18，取中间六档。
+# 只有 android14-6.1 是本机设备、能实测；其余五档以 CI 编过为准（给别人试）。
 # GitHub 只读仓库根的 .github/workflows，所以 workflow 放这儿，
 # 用 working-directory 指到 vdrm-ko-ddk/。
 
@@ -18,7 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         kmi:
-          - android14-6.1
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1     # 本机设备，唯一能实测的一档
+          - android15-6.6
+          - android16-6.12
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}
