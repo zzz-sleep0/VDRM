@@ -16,6 +16,16 @@ android {
         ndk {
             abiFilters 'arm64-v8a'
         }
+        externalNativeBuild {
+            cmake {
+                /* AGP 默认拿 minSdk 当 NDK 的编译 API 级别。NDK 头里
+                 * ASurfaceTransaction_setGeometry 的 C 版本被
+                 * __ANDROID_API__ >= 34 挡着，级别不够就只剩一个
+                 * const ARect& 的 C++ 重载 —— C 编不过（实测）。
+                 * 这里把【编译】级别抬到 34，minSdk 不动。*/
+                arguments '-DANDROID_PLATFORM=android-34'
+            }
+        }
     }
 
     buildTypes {

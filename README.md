@@ -26,7 +26,7 @@
 | 路径 | 是什么 |
 |---|---|
 | `app/` | **Android 应用** —— 显示消费端 + 输入注入。标准 Gradle 工程，`.github/workflows/build.yml` 会在推送时自动编 APK |
-| `vdrm-ko/` | **内核模块源码 + 移植教程**。核心在这儿，先读它的 `README.md` |
+| `vdrm-ko-ddk/` | **内核模块**。标准 kbuild，在 DDK 容器里按 KMI 编译；改动的来龙去脉见其中的 `CHANGES.md` |
 | `vendor-overlay/` | **屏蔽模块** —— 让 Android 的 InputReader 忽略 `vdrm-kbd` / `vdrm-ptr` |
 
 ---
@@ -44,14 +44,18 @@ Native 部分（`app/src/main/jni/`）在构建时由 CMake 现编，不需要�
 
 ### 2. 内核模块
 
-**这是唯一需要对设备做适配的一步。** 跟着 `vdrm-ko/README.md` 走，最快是在手机的
-Termux 里：
+**不需要目标设备在场。** 模块在 DDK 容器里按 KMI 编译，一个 KMI 出一份产物，
+通吃该 KMI 下所有厂商/机型：
 
 ```sh
-sh scripts/quickstart.sh
+# 本地（有 Docker）
+cd vdrm-ko-ddk && sh envsetup.sh          # 或用 .devcontainer / docker run
+
+# 或者交给 CI：推送后 .github/workflows/build-vdrm-ko.yml 自动出 vdrm.ko
 ```
 
-脚本自己装依赖、自己挑参考模块、自己调 `su` 完成快照与 CRC 采集，最后产出 `vdrm.ko`。
+内核树与工具链由 [DDK](https://github.com/Ylarod/ddk) 提供（每个 KMI 一套），
+模板照抄 [ddk-module-template](https://github.com/Ylarod/ddk-module-template)。
 
 ### 3. 屏蔽模块
 
@@ -87,7 +91,7 @@ insmod vdrm.ko  →  确认 /dev/input/event10,11  →  起容器  →  起合�
 
 ## 内核模块改了什么
 
-相对最初基线共四处，每项的根因、证据、修法见 `vdrm-ko/CHANGES.md`：
+相对最初基线共四处，每项的根因、证据、修法见 `vdrm-ko-ddk/CHANGES.md`：
 
 | # | 改动 | 解决 |
 |---|---|---|
@@ -103,7 +107,6 @@ insmod vdrm.ko  →  确认 /dev/input/event10,11  →  起容器  →  起合�
 - 池缓冲的导出 fd 若留在其它存活进程里，会话边界归还机制识别不了。正常整会话启停用不到。
 - `vdrm-kbd` 把 `KEY_MAX` 全设了，其中含 `BTN_*`，所以 udev 会把它同时标成
   Keyboard + Mouse（系统里等于有两个指针设备）。不影响使用。
-- `vdrm-ko/examples/reference/` 是特定已验证设备的复现资料，**换设备不要用它**。
 
 ---
 

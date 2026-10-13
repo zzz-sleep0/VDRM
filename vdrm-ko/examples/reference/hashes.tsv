@@ -1,9 +1,0 @@
-hrtimer_wakeup	0x72c1bba1
-drm_gem_shmem_dumb_create	0x9fe2dd4b
-drm_atomic_helper_check	0x70fc8e0a
-drm_ioctl	0xe01408cd
-drm_read	0xe866e2f4
-drm_poll	0x85e5a61e
-drm_release	0x8f07ca55
-drm_gem_dumb_map_offset	0xa4fbd373
-drm_gem_shmem_mmap	0x7e2e658d
