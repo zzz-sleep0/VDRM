@@ -16,7 +16,6 @@ android {
         ndk {
             abiFilters 'arm64-v8a'
         }
-        // Package the prebuilt library from src/main/jniLibs.
     }
 
     buildTypes {
@@ -26,5 +25,12 @@ android {
         }
     }
 
-    // Native sources/CMakeLists.txt remain for manual native rebuilds.
+    // native 从源码编：jni/ 是唯一真源，CI 顺带充当“源码能不能编过”的守门人。
+    // 产物直接打进 APK，不再需要预置 jniLibs/*.so。
+    externalNativeBuild {
+        cmake {
+            path 'src/main/jni/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
 }

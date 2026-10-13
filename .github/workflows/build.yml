@@ -3,9 +3,17 @@ name: Build APK
 on:
   push:
     branches: [ main ]
+    paths:                      # 只有 app 相关变了才跑；推 vdrm-ko/ 不会触发
+      - 'app/**'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradle.properties'
+      - '.github/workflows/build.yml'
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
+    paths:
+      - 'app/**'
+  workflow_dispatch:            # 手动触发
 
 jobs:
   build:
@@ -22,30 +30,27 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'          # AGP 8.2 要求 Gradle >= 8.2
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept licenses
-        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-
-      - name: Install NDK
+      # ubuntu-22.04 runner 自带 Android SDK（ANDROID_SDK_ROOT 已配好），
+      # 所以不用 android-actions/setup-android —— 那一步正是上次失败的原因。
+      # 注意 runner 上 cmdline-tools 的目录名不一定是 latest，动态找。
+      - name: Install NDK + CMake
         run: |
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" --sdk_root=$ANDROID_HOME
+          SDKM=$(command -v sdkmanager || ls "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | head -1)
+          echo "sdkmanager = $SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" "ndk;25.2.9519653" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Create local.properties
-        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
-      - name: Clean (force rebuild native libs)
-        run: |
-          gradle clean --no-daemon
-          rm -rf app/.cxx 2>/dev/null || true
-
-      - name: Build (disable build cache to pick up native source changes)
-        run: gradle assembleRelease --no-daemon --no-build-cache
+      - name: Build
+        run: gradle assembleRelease --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: vdrm-consumer-apk
+          name: vdrm-apk
           path: app/build/outputs/apk/release/app-release-unsigned.apk

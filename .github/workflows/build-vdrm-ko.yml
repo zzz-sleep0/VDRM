@@ -1,0 +1,49 @@
+name: Build vdrm.ko (DDK)
+
+# 照抄 _patchHarmony 的 matrix 形状：一个 KMI 一份产物。
+# 先只放 android14-6.1（本机设备的 KMI），跑通后再加别的档。
+# GitHub 只读仓库根的 .github/workflows，所以 workflow 放这儿，
+# 用 working-directory 指到 vdrm-ko-ddk/。
+
+on:
+  push:
+    paths:
+      - 'vdrm-ko-ddk/**'
+      - '.github/workflows/build-vdrm-ko.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android14-6.1
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}
+      options: --privileged
+    defaults:
+      run:
+        working-directory: vdrm-ko-ddk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.kmi }}
+        run: |
+          make KDIR=/opt/ddk/kdir/${{ matrix.kmi }} 2>&1 | tee build.log
+          test -f vdrm.ko
+
+      - name: Show vermagic
+        run: |
+          modinfo -F vermagic vdrm.ko 2>/dev/null \
+            || strings vdrm.ko | grep '^vermagic='
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vdrm-${{ matrix.kmi }}
+          path: |
+            vdrm-ko-ddk/vdrm.ko
+            vdrm-ko-ddk/build.log
+          if-no-files-found: warn

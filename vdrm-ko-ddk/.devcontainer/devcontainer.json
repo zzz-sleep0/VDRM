@@ -1,0 +1,13 @@
+{
+  "name": "vdrm-ddk-dev",
+  "image": "ghcr.io/ylarod/ddk:android14-6.1",
+  "remoteUser": "root",
+  "postCreateCommand": "echo Devcontainer ready",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "llvm-vs-code-extensions.vscode-clangd"
+      ]
+    }
+  }
+}
