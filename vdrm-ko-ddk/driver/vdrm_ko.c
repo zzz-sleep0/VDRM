@@ -1735,3 +1735,8 @@ module_exit(vdrm_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("vdrm: virtual DRM device (card1) for container compositor");
+
+/* dma_buf_* 导在 DMA_BUF 命名空间里，不声明这个内核会拒载
+ * （实测：Unknown symbol dma_buf_get (err -22)）。
+ * 旧 kit 是靠手搓 modinfo 里的 import_ns 实现的，kbuild 下要用标准宏。*/
+MODULE_IMPORT_NS(DMA_BUF);
