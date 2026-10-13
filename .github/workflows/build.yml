@@ -46,6 +46,14 @@ jobs:
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
+      - name: Dump surface_control.h (临时诊断)
+        run: |
+          H=/usr/local/lib/android/sdk/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/surface_control.h
+          echo "--- 文件: $H"
+          grep -n "ASurfaceTransaction_setGeometry\|ASurfaceTransaction_setCrop\|__ANDROID_API__\|__cplusplus\|ARect&\|ARect \*" $H | head -40
+          echo "--- 385..415 ---"
+          sed -n '383,415p' $H
+
       - name: Build
         run: gradle assembleRelease --no-daemon
 
