@@ -5,7 +5,7 @@ plugins {
 android {
     namespace 'com.vdrm.consumer'
     compileSdk 34
-    ndkVersion '25.2.9519653'
+    ndkVersion '27.2.12479018'   // r27c：r25 的 surface_control.h 缺 __cplusplus 保护，C 编不过
 
     defaultConfig {
         applicationId 'com.vdrm.consumer'

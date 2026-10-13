@@ -41,7 +41,7 @@ jobs:
           SDKM=$(command -v sdkmanager || ls "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | head -1)
           echo "sdkmanager = $SDKM"
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
-          "$SDKM" "ndk;25.2.9519653" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+          "$SDKM" "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
