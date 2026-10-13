@@ -110,6 +110,12 @@ insmod vdrm.ko  →  确认 /dev/input/event10,11  →  起容器  →  起合�
 
 ---
 
+## 鸣谢
+# Dare3141，提供了项目普适化的必要工具以及解决问题的思路
+# Goldzxcbug，Superturtlee，项目引路人，引导我思考安卓上关于DRM master的归属问题以及解决方法
+# anland项目，提供了初期思路以及大部分键鼠触控优化方法
+
+
 ## 许可
 
 GPL-2.0
