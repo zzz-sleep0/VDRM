@@ -20,6 +20,7 @@
  *   alloc / modecfg / register / unregister / status / lookup <sym>
  */
 #include <linux/module.h>
+#include <linux/version.h>	/* KERNEL_VERSION() —— 下面几处跨 KMI 的守卫要用 */
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -76,7 +77,6 @@
 
 /* 有了内核头，这些不再需要手抄数值 —— 名字保留，省得改动调用点 */
 #define VDRM_DRIVER_FEATURES     (DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC)
-#define VDRM_GFP_KERNEL_ZERO     (GFP_KERNEL | __GFP_ZERO)
 
 #define VDRM_FMT_XRGB8888        DRM_FORMAT_XRGB8888
 #define VDRM_FMT_ARGB8888        DRM_FORMAT_ARGB8888
@@ -312,7 +312,10 @@ static void out_s(char *__user dst, const char *s)
 
 static void *vdrm_kzalloc(size_t n)
 {
-	return __kmalloc(n, VDRM_GFP_KERNEL_ZERO);
+	/* 用 kzalloc 而不是裸 __kmalloc：6.12 起 __kmalloc 对模块不再可见
+	 * （改叫 __kmalloc_noprof，只有 alloc_hooks 包装）。kzalloc(n, GFP_KERNEL)
+	 * 与原先的 __kmalloc(n, GFP_KERNEL|__GFP_ZERO) 完全等价。 */
+	return kzalloc(n, GFP_KERNEL);
 }
 
 /* ============= M5: 池 / /dev/vdrm 实现 ============= */
@@ -642,8 +645,14 @@ static void vdrm_frame_push(u32 id, u64 user_data)
 	}
 
 	/* App 信令②：踢 eventfd */
-	if (g_eventfd)
+	if (g_eventfd) {
+		/* v6.10 起 eventfd_signal() 去掉了计数参数，只剩 ctx */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+		eventfd_signal(g_eventfd);
+#else
 		eventfd_signal(g_eventfd, 1);
+#endif
+	}
 
 	/* 本 KPM 自己的 read/poll 通道 */
 	__wake_up(&g_frame_wq, 3 /* TASK_NORMAL */, 1, NULL);
@@ -1087,7 +1096,12 @@ static void vdrm_setup_driver(void)
 	 * 不设这两个，PRIME 全废（实测 rc=-1 ENOSYS）。 */
 	g_driver.prime_handle_to_fd        = drm_gem_prime_handle_to_fd;
 	g_driver.prime_fd_to_handle        = drm_gem_prime_fd_to_handle;
+	/* 6.6 起 struct drm_driver 里没有 gem_prime_mmap 了 —— DRM core 直接调
+	 * drm_gem_prime_mmap()。原先赋的也正是这个默认值，所以 6.6+ 不赋值即可，
+	 * 行为不变。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	g_driver.gem_prime_mmap            = drm_gem_prime_mmap;
+#endif
 	g_driver.gem_prime_import          = drm_gem_prime_import;
 	g_driver.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table;
 }
@@ -1464,8 +1478,8 @@ static int vdrm_conn_get_modes(struct drm_connector *connector)
 	 * （否则合成器选到别的 mode，dumb_create 就和池对不上）。 */
 	/* 手工 CVT：drm_cvt_mode 不在导出表里（CRC 也对不上），用它等价公式
 	 * （1920x1080@60 算出来就是 clock=148500, htotal=2200, vtotal=1125 ✓）
-	 * 分配走本文件已有的 vdrm_kzalloc（= __kmalloc + GFP_ZERO，符号已验证 ✓）；
-	 * kzalloc 是内核 inline、不导出，所以不能直接用。*/
+	 * 分配走本文件已有的 vdrm_kzalloc（= kzalloc(GFP_KERNEL)，
+	 * 6.1–6.12 全档可用）。*/
 	m = vdrm_kzalloc(sizeof(*m));
 	if (m) {
 		m->clock       = ((g_mode_w + 280) * (g_mode_h + 45) * 60) / 1000;
