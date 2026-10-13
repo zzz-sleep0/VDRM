@@ -33,86 +33,55 @@
 
 ## 怎么跑起来
 
-### 1. App
+- 1.根据`先看我.md`中提到的，从你的设备上提取`excluded-input-devices.xml`文件，加上
 
-```sh
-gradle assembleRelease          # 产物 app/build/outputs/apk/release/
-```
+`<device name="vdrm-kbd"/>`
 
-或用仓库里的 GitHub Actions（推送即编）。装到手机上即可。
-Native 部分（`app/src/main/jni/`）在构建时由 CMake 现编，不需要预置 `.so`。
+`<device name="vdrm-ptr"/>`
 
-### 2. 内核模块
+两行补丁，之后修改`vdrm-input-overlay.zip`模块中的文件，安装元模块并刷入`vdrm-input-overlay`模块
 
-**不需要目标设备在场。** 模块在 DDK 容器里按 KMI 编译，一个 KMI 出一份产物，
-通吃该 KMI 下所有厂商/机型：
+- 2.下载安装app，下载内核模块，之后执行
 
-```sh
-# 本地（有 Docker）
-cd vdrm-ko-ddk && sh envsetup.sh          # 或用 .devcontainer / docker run
+`insmod /path/to/your/file/vdrm*.ko`
 
-# 或者交给 CI：推送后 .github/workflows/build-vdrm-ko.yml 自动出 vdrm.ko
-```
+- 3.下载lxc容器镜像并安装到DroidSpaces中(lxc images中下载即可，如果想立即体验，推荐Arch，以下以Arch为例)(注：这之后带*的步骤可以省略，不过可能会丢失硬件加速)
 
-内核树与工具链由 [DDK](https://github.com/Ylarod/ddk) 提供（每个 KMI 一套），
-模板照抄 [ddk-module-template](https://github.com/Ylarod/ddk-module-template)。
+  容器配置中需要
 
-### 3. 屏蔽模块
+  **配置环境变量**
+  
+  `XDG_RUNTIME_DIR=/home/alarm/.xdg`
 
-`vendor-overlay/` 是个 Magisk / KernelSU 模块，装上它让 Android 不去认那对虚拟键鼠。
-**里面的排除表不一定通用**，按 `先看我.md` 的说明把你机器上对应文件 patch 一下。
+  `LIBSEAT_BACKEND=noop`
 
-### 4. 容器侧前置条件
+  `AQ_DRM_DEVICES=/dev/dri/card1`
 
-三者缺一不可，否则合成器**连光标都不会画**：
+  `MESA_LOADER_DRIVER_OVERRIDE=kgsl`
 
-| 项 | 值 |
-|---|---|
-| 完整硬件访问 | 开（`enable_hw_access=1`） |
-| 特权模式 | `nomask` |
-| 按节点绑定 | `/dev/input/event10`、`/dev/input/event11` 逐个绑进容器 |
+  (注：此处环境变量仅在hyprland，niri和kde合成器上得到验证，其他合成器请自行探索)
 
-**为什么**：systemd 的冷插拔靠往 `/sys/<设备>/uevent` 写字来重放事件，`/sys` 只读时
-这一步**全部失败且不报错**。而容器 udev 又收不到宿主 netns 发出的 uevent ——
-两条路都堵死，容器启动前就存在的设备它永远不认识，libinput 一个设备都拿不到。
+  **挂载对应设备节点**
+  `/dev/dri/card1→/dev/dri/card1`→虚拟DRM设备
+  `/dev/input/event10→/dev/input/event10`→虚拟键盘
+  `/dev/input/event10→/dev/input/event11`→虚拟鼠标
 
-> 这跟**文件权限无关**：libinput 只认 udev 数据库里的 `ID_INPUT`，拿 root 跑也绕不过去。
+  *在容器中打上`lfdevs`大佬的`mesa-for-android-container`对应你容器的驱动
 
-### 5. 启动顺序（是死的）
+  **在容器中安装相应vdrm后端**(此处仅仅适用于Arch！其他系统请自行查找！)
+  在容器的/usr/lib/gbm目录下放置`vdrm_gbm.so`
 
-```
-insmod vdrm.ko  →  确认 /dev/input/event10,11  →  起容器  →  起合成器
-```
+  
+- 4.打开一次app，这个是加载`vdrm*.ko`后需要先做的一个时序性问题，否则合成器可以正常启动，但是app无法显示合成器的画面，为黑屏表现，后续app可以随便关停，无需在意(时序问题做反已经黑屏了？没问题，关掉合成器再重新打开即可)
 
-按节点绑是绑**文件**，源节点必须在容器启动那一刻就存在。
-代价：模块重载后节点被重建，容器里那个绑定会指向已删除的 inode —— **模块一重载就得重启容器**。
+- 5.安装合成器，随后就可以快乐玩耍了
 
----
-
-## 内核模块改了什么
-
-相对最初基线共四处，每项的根因、证据、修法见 `vdrm-ko-ddk/CHANGES.md`：
-
-| # | 改动 | 解决 |
-|---|---|---|
-| 一 | 池槽改为**会话边界归还** | 消除同一物理内存被发两次；合成器可反复启停 |
-| 二 | `atomic_check` 去掉**自锁等待** | 原门控每次白等 ~420ms，拖拽时帧率塌陷 |
-| 三 | vblank 网格改为**连续** | 原写法每帧白等满一整个周期才拿到 flip-done |
-| 四 | 虚拟键鼠**搬进内核** | 原先设备随用户态守护进程存亡，App 一退就被销毁 → 输入永久失效 |
-
----
-
-## 已知限制
-
-- 池缓冲的导出 fd 若留在其它存活进程里，会话边界归还机制识别不了。正常整会话启停用不到。
-- `vdrm-kbd` 把 `KEY_MAX` 全设了，其中含 `BTN_*`，所以 udev 会把它同时标成
-  Keyboard + Mouse（系统里等于有两个指针设备）。不影响使用。
 
 ---
 
 ## 鸣谢
 
-- Goldzxcbug，Superturtlee，项目引路人以及参考项目的开发者，引导我思考安卓上关于DRM master的归属问题以及解决方法
+- Goldzxcbug，Superturtlee，项目引路人以及参考项目的开发者
 
 - Dare3141，提供了项目普适化的必要工具以及解决问题的思路
  
