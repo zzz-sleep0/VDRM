@@ -68,7 +68,7 @@
 
   *在容器中打上`lfdevs`大佬的`mesa-for-android-container`对应你容器的驱动
 
-  **在容器中安装相应vdrm后端**(此处仅仅适用于Arch！其他系统请自行查找！)
+  **在容器中安装相应vdrm后端**(此处存放路径仅仅适用于Arch！其他系统请自行查找！)
   在容器的/usr/lib/gbm目录下放置`vdrm_gbm.so`(看release，一起下发)
 
   
