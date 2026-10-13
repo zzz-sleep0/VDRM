@@ -69,7 +69,7 @@
   *在容器中打上`lfdevs`大佬的`mesa-for-android-container`对应你容器的驱动
 
   **在容器中安装相应vdrm后端**(此处仅仅适用于Arch！其他系统请自行查找！)
-  在容器的/usr/lib/gbm目录下放置`vdrm_gbm.so`
+  在容器的/usr/lib/gbm目录下放置`vdrm_gbm.so`(看release，一起下发)
 
   
 - 4.打开一次app，这个是加载`vdrm*.ko`后需要先做的一个时序性问题，否则合成器可以正常启动，但是app无法显示合成器的画面，为黑屏表现，后续app可以随便关停，无需在意(时序问题做反已经黑屏了？没问题，关掉合成器再重新打开即可)
