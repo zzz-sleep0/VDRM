@@ -112,15 +112,15 @@ insmod vdrm.ko  →  确认 /dev/input/event10,11  →  起容器  →  起合�
 
 ## 鸣谢
 
- Dare3141，提供了项目普适化的必要工具以及解决问题的思路
+- Goldzxcbug，Superturtlee，项目引路人以及参考项目的开发者，引导我思考安卓上关于DRM master的归属问题以及解决方法
+
+- Dare3141，提供了项目普适化的必要工具以及解决问题的思路
  
- Goldzxcbug，Superturtlee，项目引路人以及参考项目的开发者，引导我思考安卓上关于DRM master的归属问题以及解决方法
+-lfdevs大佬，该项目想要拥有硬件加速需要打他的驱动
  
- lfdevs大佬，该项目想要拥有硬件加速需要打他的驱动
+-anland项目，提供了初期思路以及大部分键鼠触控优化方法
  
- anland项目，提供了初期思路以及大部分键鼠触控优化方法
- 
- mesa-for-android-container项目，该项目硬件加速所需要的驱动来源于此
+-mesa-for-android-container项目，该项目硬件加速所需要的驱动来源于此
 
 
 ## 许可
