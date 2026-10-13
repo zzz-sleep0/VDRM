@@ -52,6 +52,7 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_probe_helper.h>
 #include <drm/drm_mode_config.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -82,7 +83,7 @@
 #define VDRM_FMT_XBGR8888        DRM_FORMAT_XBGR8888
 #define VDRM_FMT_ABGR8888        DRM_FORMAT_ABGR8888
 
-#define VDRM_CONNECTOR_VIRTUAL   DRM_MODE_CONNECTOR_Virtual
+#define VDRM_CONNECTOR_VIRTUAL   DRM_MODE_CONNECTOR_VIRTUAL
 
 static struct platform_device *g_pdev;
 static struct drm_device       *g_dev;
@@ -455,7 +456,8 @@ static int vdrm_heap_dumb_create(struct drm_file *file, struct drm_device *dev,
 	dma_heap_put(heap);
 	if (!buf || (unsigned long)buf >= (unsigned long)-4095) {
 		long e = (long)buf;
-		pr_err("vdrm: heap alloc %u bytes failed (%ld)\n", args->size, e);
+		pr_err("vdrm: heap alloc %llu bytes failed (%ld)\n",
+		       (unsigned long long)args->size, e);
 		return buf ? (int)e : -ENOMEM;
 	}
 
