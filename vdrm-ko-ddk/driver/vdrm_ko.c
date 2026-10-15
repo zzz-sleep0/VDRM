@@ -1612,11 +1612,19 @@ static void vdrm_input_teardown(void)
  * 另外 kernel_execve / commit_creds / user_mode_thread 在这台内核上都没有
  * __ksymtab_ 条目（GKI 裁过 ksymtab），不能直接调，只能按名字拿地址再走函数
  * 指针 —— 类型必须是内核自己的，否则间接调用点的 kCFI 哈希对不上，直接 brk。
+ *
+ * 3) user_mode_thread() 是 v6.1 才进内核的（umh 重构那一批），5.10/5.15 上
+ *      连声明都没有 —— 写 typeof(&user_mode_thread) 老 KMI 直接编不过
+ *      （实测：undeclared identifier）。所以这里照内核原型自己定义一个等价的
+ *      函数指针类型；kCFI 认的是原型哈希，等价写法同号。老核上 kprobe 照样
+ *      解析不到，走降级路径，不影响编译产物。
  */
 static const struct cred *g_pool_cred;
 static typeof(&kernel_execve) g_kernel_execve;
 static typeof(&commit_creds) g_commit_creds;
-static typeof(&user_mode_thread) g_user_mode_thread;
+/* 与 v6.1 kernel/fork.c 的 pid_t user_mode_thread(int (*)(void *), void *, unsigned long) 同型 */
+typedef pid_t (*vdrm_user_mode_thread_fn)(int (*fn)(void *), void *arg, unsigned long flags);
+static vdrm_user_mode_thread_fn g_user_mode_thread;
 
 /* 按名字取符号地址：kallsyms_lookup_name 没导出，kprobe 是唯一的平价入口 */
 static void *vdrm_sym(const char *name)
