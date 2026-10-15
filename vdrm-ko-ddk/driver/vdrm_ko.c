@@ -1591,13 +1591,14 @@ static void vdrm_input_teardown(void)
  * 这条路在本机实测过：源域=ksu 的 type_transition 是 0 条，所以 exec 之后域
  * 不被打回；entrypoint 也够（平时 App 的 su -c vdrm_mkpool 就是这么跑的）。
  *
- * kernel_execve 在这台内核上没有 __ksymtab_ 条目（GKI 裁过 ksymtab），不能
- * 直接调，只能按名字拿地址再走函数指针 —— 类型必须是内核自己的，否则间接
- * 调用点的 kCFI 哈希对不上，直接 brk。
+ * kernel_execve 和 commit_creds 在这台内核上都没有 __ksymtab_ 条目（GKI 裁过
+ * ksymtab），不能直接调，只能按名字拿地址再走函数指针 —— 类型必须是内核自己
+ * 的，否则间接调用点的 kCFI 哈希对不上，直接 brk。
  */
 static const struct cred *g_pool_cred;
 static struct task_struct *g_mkpool_task;
 static typeof(&kernel_execve) g_kernel_execve;
+static typeof(&commit_creds) g_commit_creds;
 
 /* 按名字取符号地址：kallsyms_lookup_name 没导出，kprobe 是唯一的平价入口 */
 static void *vdrm_sym(const char *name)
@@ -1624,19 +1625,29 @@ static const char *const vdrm_mkpool_envp[] = {
 
 static int vdrm_mkpool_thread(void *arg)
 {
-	const struct cred *old;
 	int ret;
 
-	/* 借加载方的域。exec 成功就再也回不来了——那时这里已经是用户态进程 */
-	old = override_creds(g_pool_cred);
+	/*
+	 * 必须是 commit_creds，不是 override_creds —— 这是这里最容易改错的地方。
+	 *
+	 * exec 走 prepare_exec_creds() -> prepare_creds()，而 prepare_creds()
+	 * 复制的是【客观】凭据（real_cred），不是主观的那份（cred）。
+	 * override_creds 只改主观的那个，exec 这条路根本看不见它 —— 于是检查
+	 * 仍然以 u:r:kernel 的身份做：内核域对 system_data_root_file 没有
+	 * entrypoint，被拒；而内核域的拒绝在 AOSP 里是 dontaudit 掉的，dmesg
+	 * 里连一条 AVC 都不留，只看到一个没头没尾的失败。umh 自己也是
+	 * commit_creds，原因就在这里。
+	 *
+	 * 引用交给任务，模块不再持有；exec 成功的话这个任务就变成用户态进程了。
+	 */
+	g_commit_creds((struct cred *)get_cred(g_pool_cred));
+
 	ret = g_kernel_execve(vdrm_mkpool_argv[0], vdrm_mkpool_argv,
 			      vdrm_mkpool_envp);
-	if (ret < 0) {
-		revert_creds(old);
-		/* 错误码要留着：-ENOENT 是路径/命名空间，-EACCES 是权限或标签，
-		 * -EPERM 是策略，-ENOEXEC 是解释器——四种原因的修法完全不同 */
+	if (ret < 0)
+		/* -ENOENT 路径/命名空间、-EACCES 权限或标签、-EPERM 策略、
+		 * -ENOEXEC 解释器 —— 四种原因的修法完全不同，所以留着 */
 		pr_err("vdrm: mkpool exec failed: %d\n", ret);
-	}
 
 	return 0;
 }
@@ -1649,8 +1660,9 @@ static int vdrm_mkpool_bringup(void)
 	}
 
 	g_kernel_execve = vdrm_sym("kernel_execve");
-	if (!g_kernel_execve) {
-		pr_info("vdrm: kernel_execve unresolvable, pool stays app-driven\n");
+	g_commit_creds   = vdrm_sym("commit_creds");
+	if (!g_kernel_execve || !g_commit_creds) {
+		pr_info("vdrm: kernel_execve/commit_creds unresolvable, pool stays app-driven\n");
 		return -ENOENT;
 	}
 
@@ -1676,6 +1688,7 @@ static void vdrm_mkpool_teardown(void)
 	/* exec 成功后那个线程已经是用户态进程，不归 kthread 管，不 stop */
 	g_mkpool_task = NULL;
 	g_kernel_execve = NULL;
+	g_commit_creds = NULL;
 }
 
 static int vdrm_init(void)
