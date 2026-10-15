@@ -29,6 +29,8 @@
 #include <linux/list.h>
 #include <linux/fs.h>
 #include <linux/kthread.h>
+#include <linux/sched/task.h>
+#include <linux/signal.h>
 #include <linux/cred.h>
 #include <linux/kprobes.h>
 #include <linux/binfmts.h>
@@ -1588,17 +1590,33 @@ static void vdrm_input_teardown(void)
  * 它够到 gralloc（binder + allocator HAL）。所以先把加载方（KernelSU，
  * u:r:ksu）的凭据装上去，再 exec，域就跟着过去了。
  *
- * 这条路在本机实测过：源域=ksu 的 type_transition 是 0 条，所以 exec 之后域
+ * 这一步在本机实测过：源域=ksu 的 type_transition 是 0 条，所以 exec 之后域
  * 不被打回；entrypoint 也够（平时 App 的 su -c vdrm_mkpool 就是这么跑的）。
  *
- * kernel_execve 和 commit_creds 在这台内核上都没有 __ksymtab_ 条目（GKI 裁过
- * ksymtab），不能直接调，只能按名字拿地址再走函数指针 —— 类型必须是内核自己
- * 的，否则间接调用点的 kCFI 哈希对不上，直接 brk。
+ * 下面两个坑都实测踩过，写在这儿免得被"简化"回去：
+ *
+ *   1) exec 必须由【用户态线程】发起，不能是内核线程。kernel_execve() 头一句
+ *      就是 "It is non-sense for kernel threads to call execve"，PF_KTHREAD
+ *      直接 -EINVAL。内核自己的办法是 user_mode_thread()（umh 就是
+ *      user_mode_thread(call_usermodehelper_exec_async, ...) 起的）。而且
+ *      必须在【没有 mm】的上下文里叫它：user_mode_thread 内部带 CLONE_VM，
+ *      creator 若有 mm，新任务会共享它，而 exec 的 exec_mmap() 会把它拆掉
+ *      —— 那是拆调用者自己的地址空间。所以我们先占一个普通 kthread 来叫。
+ *
+ *   2) 不能用 kthread_run() 直接跑 exec。kthread() 这个包装在 threadfn 返回后
+ *      无条件 kthread_exit()，而 kernel_execve 成功时恰恰就是"返回 0"
+ *      （umh 原文：retval = kernel_execve(...); if (!retval) return 0;）。
+ *      实测现象：exec 其实成功了（comm 已经变成 vdrm_mkpool），进程随即被
+ *      kthread_exit() 收走，只剩一条 WARN 和 Call trace，池一个字没有。
+ *
+ * 另外 kernel_execve / commit_creds / user_mode_thread 在这台内核上都没有
+ * __ksymtab_ 条目（GKI 裁过 ksymtab），不能直接调，只能按名字拿地址再走函数
+ * 指针 —— 类型必须是内核自己的，否则间接调用点的 kCFI 哈希对不上，直接 brk。
  */
 static const struct cred *g_pool_cred;
-static struct task_struct *g_mkpool_task;
 static typeof(&kernel_execve) g_kernel_execve;
 static typeof(&commit_creds) g_commit_creds;
+static typeof(&user_mode_thread) g_user_mode_thread;
 
 /* 按名字取符号地址：kallsyms_lookup_name 没导出，kprobe 是唯一的平价入口 */
 static void *vdrm_sym(const char *name)
@@ -1623,34 +1641,15 @@ static const char *const vdrm_mkpool_envp[] = {
 	NULL,
 };
 
-static int vdrm_mkpool_thread(void *arg)
+/* 跑在 user_mode_thread 造出来的线程里 —— 去 exec 的是它 */
+static int vdrm_mkpool_exec(void *arg)
 {
 	int ret;
 
 	/*
-	 * PF_KTHREAD 必须先清掉 —— kernel_execve() 头一句就是它：
-	 *
-	 *     // It is non-sense for kernel threads to call execve
-	 *     if (WARN_ON_ONCE(current->flags & PF_KTHREAD))
-	 *             return -EINVAL;
-	 *
-	 * 内核自己绕过去的办法是 user_mode_thread()：它用 kernel_clone 造一个
-	 * 【不带】PF_KTHREAD 的线程，umh 就是靠它（见 kernel/umh.c 里
-	 * user_mode_thread(call_usermodehelper_exec_async, ...)）。而那个标志在
-	 * fork.c 里只有一处赋值：
-	 *     p->flags &= ~PF_KTHREAD;  if (args->kthread) p->flags |= PF_KTHREAD;
-	 * 所以事后清掉与 user_mode_thread 等价，且不分 KMI。
-	 */
-	current->flags &= ~PF_KTHREAD;
-
-	/*
 	 * commit_creds 而不是 override_creds —— 和 umh 一致：我们不是"临时借用"
-	 * 一会儿还要还回去，而是要【变成】那个身份交给 exec，所以 real_cred 也一起改。
-	 * （顺带纠正上一笔提交里的说法：prepare_creds() 复制的是 task->cred，
-	 * 也就是主观凭据，override_creds 本来就能带过 exec。这里换掉是为了语义，
-	 * 不是因为 override_creds 看不见。）
-	 *
-	 * 引用交给任务，模块不再持有；exec 成功的话这个任务就变成用户态进程了。
+	 * 一会儿还要还回去，而是要【变成】那个身份交给 exec，所以 real_cred 也
+	 * 一起改。引用交给任务，模块不再持有。
 	 */
 	g_commit_creds((struct cred *)get_cred(g_pool_cred));
 
@@ -1661,28 +1660,47 @@ static int vdrm_mkpool_thread(void *arg)
 		 * -ENOEXEC 解释器 —— 四种原因的修法完全不同，所以留着 */
 		pr_err("vdrm: mkpool exec failed: %d\n", ret);
 
+	/* 能走到这里只有一种情况：exec 失败 */
+	return 0;
+}
+
+/*
+ * 普通 kthread，只干一件事：在【没有 mm】的上下文里把 user_mode_thread
+ * 叫起来（umh 是从 unbound workqueue 里叫的，同理）。它自己不出 exec，
+ * 所以正常返回、正常走 kthread_exit。
+ */
+static int vdrm_mkpool_spawn(void *arg)
+{
+	pid_t pid = g_user_mode_thread(vdrm_mkpool_exec, NULL, SIGCHLD);
+
+	if (pid < 0)
+		pr_err("vdrm: user_mode_thread failed: %d\n", (int)pid);
+
 	return 0;
 }
 
 static int vdrm_mkpool_bringup(void)
 {
+	struct task_struct *t;
+
 	if (!g_pool_cred) {
 		pr_info("vdrm: no loader credentials, pool stays app-driven\n");
 		return -EINVAL;
 	}
 
-	g_kernel_execve = vdrm_sym("kernel_execve");
-	g_commit_creds   = vdrm_sym("commit_creds");
-	if (!g_kernel_execve || !g_commit_creds) {
-		pr_info("vdrm: kernel_execve/commit_creds unresolvable, pool stays app-driven\n");
+	g_kernel_execve    = vdrm_sym("kernel_execve");
+	g_commit_creds     = vdrm_sym("commit_creds");
+	g_user_mode_thread = vdrm_sym("user_mode_thread");
+	if (!g_kernel_execve || !g_commit_creds || !g_user_mode_thread) {
+		pr_info("vdrm: kernel_execve/commit_creds/user_mode_thread unresolvable, pool stays app-driven\n");
 		return -ENOENT;
 	}
 
-	g_mkpool_task = kthread_run(vdrm_mkpool_thread, NULL, "vdrm-mkpool");
-	if (IS_ERR(g_mkpool_task)) {
-		int err = PTR_ERR(g_mkpool_task);
+	/* 这个 kthread 是短命的：拉起用户态线程自己就退 */
+	t = kthread_run(vdrm_mkpool_spawn, NULL, "vdrm-mkpool");
+	if (IS_ERR(t)) {
+		int err = PTR_ERR(t);
 
-		g_mkpool_task = NULL;
 		pr_err("vdrm: no mkpool thread: %d\n", err);
 		return err;
 	}
@@ -1697,10 +1715,9 @@ static void vdrm_mkpool_teardown(void)
 		put_cred(g_pool_cred);
 		g_pool_cred = NULL;
 	}
-	/* exec 成功后那个线程已经是用户态进程，不归 kthread 管，不 stop */
-	g_mkpool_task = NULL;
 	g_kernel_execve = NULL;
 	g_commit_creds = NULL;
+	g_user_mode_thread = NULL;
 }
 
 static int vdrm_init(void)
