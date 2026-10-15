@@ -1,23 +1,9 @@
 /*
  * vdrm.c — 虚拟 DRM 设备 (card1)
  *
- * ─────────────────────────────────────────────────────────────
- * 为什么用 workqueue？
- *
- * KPatch 的 ctl0 调用链持有 RCU 读锁（实测内核栈：
- *   invoke_syscall -> KPatch -> 我们的 ctl0 -> drm_dev_register
- *   -> drm_minor_register -> device_add -> devtmpfs_create_node
- *   -> wait_for_completion -> schedule
- *   => WARN_ONCE(!preempt && rcu_preempt_depth() > 0,
- *        "Voluntary context switch within RCU read-side critical section!")）
- *
- * 所以：**ctl0 里绝对不能睡眠**。而 DRM 的操作几乎都会睡眠。
- * 解法：ctl0 只 set 命令 + schedule_work()，真正的活由 kworker
- *       线程在干净上下文里做。ctl0 用有上限的 __udelay 忙等结果。
- * ─────────────────────────────────────────────────────────────
- *
- * ctl0 命令：
- *   alloc / modecfg / register / unregister / status / lookup <sym>
+ * 一个普通的可加载模块：insmod 进来就建 card1 + /dev/vdrm + 两个虚拟输入设备，
+ * rmmod 撤掉。没有谁在别的上下文里替它做事 —— 所有路径都跑在模块自己的初始化和
+ * ioctl 里。
  */
 #include <linux/module.h>
 #include <linux/version.h>	/* KERNEL_VERSION() —— 下面几处跨 KMI 的守卫要用 */
@@ -34,7 +20,6 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
-#include <linux/eventfd.h>
 #include <linux/miscdevice.h>
 #include <linux/platform_device.h>
 #include <linux/input.h>
@@ -43,6 +28,11 @@
 #include <linux/mm.h>
 #include <linux/list.h>
 #include <linux/fs.h>
+#include <linux/kthread.h>
+#include <linux/cred.h>
+#include <linux/kprobes.h>
+#include <linux/binfmts.h>
+#include <linux/umh.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -117,7 +107,7 @@ static volatile u64   g_vblank_period_ns = 16666666ULL; /* 60Hz 兜底（pipe en
  * 用来分辨“合成器跟不上”是 vblank 定拍造成的，还是它自己渲染慢。*/
 #define VDRM_VBLANK_HZ_FORCE 0
 
-/* ============= M5: App <-> KPM 契约（见 CONTRACT.md v1） ============= */
+/* ============= App <-> 模块 的契约（ioctl 结构体，两边必须逐字节一致）============= */
 
 #define VDRM_ABI_VERSION 1
 #define VDRM_POOL_MAX    16
@@ -158,9 +148,6 @@ struct vdrm_handle_req {
 	VDRM_IOC(1, 'V', 0x02, sizeof(struct vdrm_handle_req))
 #define VDRM_IOCTL_UNREGISTER \
 	VDRM_IOC(1, 'V', 0x03, sizeof(struct vdrm_handle_req))
-/* arg = fd（0 表示清除）。对齐旧 App 的 set_eventfd / set_shm */
-#define VDRM_IOCTL_SET_EVENTFD VDRM_IOC(1, 'V', 0x04, sizeof(int))
-#define VDRM_IOCTL_SET_SHM     VDRM_IOC(1, 'V', 0x05, sizeof(int))
 
 /* 注入一个输入事件。设备由驱动自己注册（见文件后部），所以这里只是
  * "把事件塞进内核 input 子系统"，不需要任何用户态守护进程。 */
@@ -245,10 +232,6 @@ static struct drm_file    *g_drm_file;
 
 /* 固定输出几何（唯一 connector 的 preferred 1920x1080 XRGB8888） */
 static u32 g_mode_w = 1920, g_mode_h = 1080, g_mode_pitch = 1920 * 4;
-static unsigned long (*vdrm_copy_from_user)(void *to, const void *from,
-					    unsigned long n);
-static unsigned long (*vdrm_copy_to_user)(void *to, const void *from,
-					  unsigned long n);
 
 /* ---- M5: 帧就绪通知队列（App 用 read/poll 取）---- */
 #define VDRM_FRAME_QMAX 16
@@ -263,52 +246,6 @@ static int                    g_frame_head, g_frame_tail;
 static volatile u32           g_frame_seq;
 static struct spinlock        g_frame_lock;   /* 静态清零 = 解锁 */
 static struct wait_queue_head g_frame_wq;
-
-/* ---- M5: App 信令（eventfd + memfd shm，对齐旧 App）---- */
-static struct eventfd_ctx *g_eventfd;
-static struct file        *g_shm_file;
-
-/* 与旧 App native_consumer.c 的 struct vdr2_frame_info 一致 */
-struct vdr2_frame_info {
-	u32 slot;
-	u32 width;
-	u32 height;
-	u32 format;
-	u32 seq;
-	u32 valid;
-	u32 reserved[2];
-};
-
-/* ---------------- 输出小工具 ---------------- */
-
-static void out_kv(char *__user out_msg, const char *k, unsigned long v)
-{
-	char buf[96];
-	int i, n = 0;
-
-	while (*k && n < 44)
-		buf[n++] = *k++;
-	buf[n++] = '=';
-	buf[n++] = '0';
-	buf[n++] = 'x';
-	for (i = 0; i < 16; i++) {
-		unsigned long d = (v >> (60 - i * 4)) & 0xf;
-		buf[n++] = (d < 10) ? (char)('0' + d) : (char)('a' + d - 10);
-	}
-	buf[n] = 0;
-	copy_to_user(out_msg, buf, n + 1);
-}
-
-static void out_s(char *__user dst, const char *s)
-{
-	char buf[128];
-	int n = 0;
-
-	while (*s && n < 120)
-		buf[n++] = *s++;
-	buf[n] = 0;
-	copy_to_user(dst, buf, n + 1);
-}
 
 static void *vdrm_kzalloc(size_t n)
 {
@@ -435,7 +372,7 @@ static int vdrm_atomic_check(struct drm_device *dev,
  * A 路线：dumb_create 的回退从“自持 shmem”改成“从 qcom,system dma-heap 分配”。
  * 为什么：qcom,system 就是 gralloc 用的那个堆（App 的 AHB 就在它上面），
  * 显示管线认；而 drm_gem_shmem 是另一种内存，App 伪造后上屏会炸。
- * 这样池天生就是 KPM 的、内存可显示 → 合成器先起 / App 重启都不用换 buffer。
+ * 这样池天生就是模块的、内存可显示 → 合成器先起 / App 重启都不用换 buffer。
  */
 static int vdrm_heap_dumb_create(struct drm_file *file, struct drm_device *dev,
 				 struct drm_mode_create_dumb *args)
@@ -627,34 +564,7 @@ static void vdrm_frame_push(u32 id, u64 user_data)
 	}
 	_raw_spin_unlock_irqrestore(&g_frame_lock.rlock, flags);
 
-	/* App 信令①：写 shm（与旧 App 结构体一致，App render loop 不用改）*/
-	if (g_shm_file) {
-		struct vdr2_frame_info fi;
-		loff_t pos = 0;
-
-		fi.slot    = id;
-		fi.width   = g_mode_w;
-		fi.height  = g_mode_h;
-		fi.format  = VDRM_FMT_XRGB8888;
-		fi.seq     = ev.sequence;
-		fi.valid   = 1;
-		fi.reserved[0] = fi.reserved[1] = 0;
-		/* shm 写出需要 kernel_write（CRC 对不上）；App 现在读 /dev/vdrm，
-		 * 这条路径不需要了 —— 留着结构体填充，不再落盘。*/
-		(void)g_shm_file;
-	}
-
-	/* App 信令②：踢 eventfd */
-	if (g_eventfd) {
-		/* v6.10 起 eventfd_signal() 去掉了计数参数，只剩 ctx */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
-		eventfd_signal(g_eventfd);
-#else
-		eventfd_signal(g_eventfd, 1);
-#endif
-	}
-
-	/* 本 KPM 自己的 read/poll 通道 */
+	/* 帧事件只有一条出口：/dev/vdrm 自己的 read/poll 队列 */
 	__wake_up(&g_frame_wq, 3 /* TASK_NORMAL */, 1, NULL);
 }
 
@@ -682,7 +592,7 @@ static ssize_t vdrm_misc_read(struct file *file, char __user *buf,
 		return -EINVAL;
 	if (vdrm_frame_pop(&ev))
 		return -EAGAIN;
-	if (vdrm_copy_to_user((void *)buf, &ev, sizeof(ev)))
+	if (copy_to_user((void *)buf, &ev, sizeof(ev)))
 		return -EFAULT;
 	return sizeof(ev);
 }
@@ -711,10 +621,7 @@ static __poll_t vdrm_misc_poll(struct file *file,
  * 这是"自愈"的关键——不依赖 App 主动 UNREGISTER，进程崩了也能复位。 */
 static int vdrm_misc_release(struct inode *inode, struct file *file)
 {
-	pr_info("vdrm: misc release (池不清 —— 池归 KPM，App 重启不影响)\n");
-
-	if (g_eventfd) { eventfd_ctx_put(g_eventfd); g_eventfd = NULL; }
-	if (g_shm_file) { fput(g_shm_file); g_shm_file = NULL; }
+	pr_info("vdrm: misc release (池不清 —— 池归模块，App 重启不影响)\n");
 
 	/* 清帧事件环：否则新 App 会读到上一实例遗留的旧事件 */
 	g_frame_head = g_frame_tail = 0;
@@ -749,7 +656,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			(int)sizeof(struct vdrm_info), info.abi_version, info.width,
 			info.height, info.format, info.pitch, info.pool_capacity,
 			(void *)arg);
-		if (vdrm_copy_to_user((void *)arg, (const void *)&info, sizeof(info)))
+		if (copy_to_user((void *)arg, (const void *)&info, sizeof(info)))
 			return -EFAULT;
 		return 0;
 	}
@@ -803,7 +710,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		g_pool_list.count = (u32)n;
 		mutex_unlock(&g_pool_lock);
 		pr_info("vdrm: GET_POOL -> %d entries\n", n);
-		if (vdrm_copy_to_user((void *)arg, &g_pool_list,
+		if (copy_to_user((void *)arg, &g_pool_list,
 				      sizeof(g_pool_list)))
 			return -EFAULT;
 		return 0;
@@ -814,11 +721,11 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		struct drm_gem_object *obj;
 		int i, k, slot = -1;
 
-		if (vdrm_copy_from_user(&req, (const void *)arg, sizeof(req)))
+		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
 			return -EFAULT;
 		if (!g_dev)
 			return -ENODEV;
-		/* 几何由 KPM 决定（ctl0 "mode <w>x<h>"），App 不参与。
+		/* 几何由模块决定（g_mode_w/g_mode_h），App 不参与。
 		 * 这里只用 App buffer 的尺寸登记池项，不改 g_mode_*。*/
 
 		dbuf = dma_buf_get(req.fd);
@@ -895,7 +802,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 
 		pr_info("vdrm: REGISTER id=%u %ux%u pitch=%u size=%zu\n",
 			req.id, req.width, req.height, req.pitch, obj->size);
-		if (vdrm_copy_to_user((void *)arg, &req, sizeof(req))) {
+		if (copy_to_user((void *)arg, &req, sizeof(req))) {
 			/* 回传失败：把已入池的 slot 退掉 */
 			mutex_lock(&g_pool_lock);
 			memset(&g_pool[slot], 0, sizeof(g_pool[slot]));
@@ -912,7 +819,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		u64 timestamp = 0;
 		struct drm_gem_object *obj = NULL;
 
-		if (vdrm_copy_from_user(&req, (const void *)arg, sizeof(req)))
+		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
 			return -EFAULT;
 		mutex_lock(&g_pool_lock);
 		for (i = 0; i < VDRM_POOL_MAX; i++) {
@@ -943,7 +850,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		struct drm_gem_object *obj = NULL;
 		int i;
 
-		if (vdrm_copy_from_user(&req, (const void *)arg, sizeof(req)))
+		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
 			return -EFAULT;
 		mutex_lock(&g_pool_lock);
 
@@ -983,44 +890,10 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		vdrm_gem_put(obj);
 		return 0;
 	}
-	case VDRM_IOCTL_SET_EVENTFD: {
-		struct eventfd_ctx *ctx;
-		int fd = (int)arg;
-
-		if (fd <= 0) {  /* 0 = 清除 */
-			if (g_eventfd) { eventfd_ctx_put(g_eventfd); g_eventfd = NULL; }
-			return 0;
-		}
-		/* eventfd_ctx_fdget 的 CRC 对不上；App 走 /dev/vdrm 队列，不需要 eventfd */
-		(void)fd;
-		return 0;
-		if (g_eventfd)
-			eventfd_ctx_put(g_eventfd);
-		g_eventfd = ctx;
-		pr_info("vdrm: SET_EVENTFD fd=%d ctx=%px\n", fd, ctx);
-		return 0;
-	}
-	case VDRM_IOCTL_SET_SHM: {
-		struct file *f;
-		int fd = (int)arg;
-
-		if (fd <= 0) {  /* 0 = 清除 */
-			if (g_shm_file) { fput(g_shm_file); g_shm_file = NULL; }
-			return 0;
-		}
-		f = fget((unsigned int)fd);
-		if (!f)
-			return -EBADF;
-		if (g_shm_file)
-			fput(g_shm_file);
-		g_shm_file = f;
-		pr_info("vdrm: SET_SHM fd=%d file=%px\n", fd, f);
-		return 0;
-	}
 	case VDRM_IOCTL_INPUT: {
 		struct vdrm_input_event ie;
 
-		if (vdrm_copy_from_user(&ie, (const void *)arg, sizeof(ie)))
+		if (copy_from_user(&ie, (const void *)arg, sizeof(ie)))
 			return -EFAULT;
 		vdrm_input_inject(ie.type, ie.code, ie.value);
 		return 0;
@@ -1207,7 +1080,7 @@ static int vdrm_do_register(void)
 	g_registered = 1;
 	pr_info("vdrm: registered\n");
 
-	/* 建 /dev/vdrm（App <-> KPM 接口）。失败不致命。 */
+	/* 建 /dev/vdrm（App <-> 模块 接口）。失败不致命。 */
 	if (!g_misc_registered) {
 		memset(&g_misc, 0, sizeof(g_misc));
 		g_misc_fops.owner          = THIS_MODULE;
@@ -1250,8 +1123,6 @@ static void vdrm_do_unregister(void)
 		g_misc_registered = 0;
 		pr_info("vdrm: /dev/vdrm deregistered\n");
 	}
-	if (g_eventfd) { eventfd_ctx_put(g_eventfd); g_eventfd = NULL; }
-	if (g_shm_file) { fput(g_shm_file); g_shm_file = NULL; }
 	{
 		int i;
 
@@ -1705,15 +1576,109 @@ static void vdrm_input_teardown(void)
 	pr_info("vdrm: input down\n");
 }
 
+/* ================== 借域建池：insmod 时由 KO 自己把池建起来 ==================
+ *
+ * 池必须早于合成器第一次 dumb_create 就绪。合成器只分配一次缓冲然后一直用，
+ * 池空时 dumb_create 走 heap 回退，那批缓冲不在池里，pipe_update 匹配不上，
+ * App 一个帧事件都收不到 —— 就是"黑屏、关掉合成器再开就好"的那个时序。
+ * 让 App 来建池，等于把这件事押在"用户先开一次 App"上。
+ *
+ * 这里改成 KO 自己拉：mkpool 是用户态程序，槽要带 gralloc 出身（fd1 + ints），
+ * 内核造不出来，所以只能把它 exec 起来 —— 而内核线程是 u:r:kernel，策略不许
+ * 它够到 gralloc（binder + allocator HAL）。所以先把加载方（KernelSU，
+ * u:r:ksu）的凭据装上去，再 exec，域就跟着过去了。
+ *
+ * 这条路在本机实测过：源域=ksu 的 type_transition 是 0 条，所以 exec 之后域
+ * 不被打回；entrypoint 也够（平时 App 的 su -c vdrm_mkpool 就是这么跑的）。
+ *
+ * kernel_execve 在这台内核上没有 __ksymtab_ 条目（GKI 裁过 ksymtab），不能
+ * 直接调，只能按名字拿地址再走函数指针 —— 类型必须是内核自己的，否则间接
+ * 调用点的 kCFI 哈希对不上，直接 brk。
+ */
+static const struct cred *g_pool_cred;
+static struct task_struct *g_mkpool_task;
+static typeof(&kernel_execve) g_kernel_execve;
+
+/* 按名字取符号地址：kallsyms_lookup_name 没导出，kprobe 是唯一的平价入口 */
+static void *vdrm_sym(const char *name)
+{
+	struct kprobe kp;
+	void *addr;
+
+	memset(&kp, 0, sizeof(kp));
+	kp.symbol_name = name;
+	if (register_kprobe(&kp))
+		return NULL;
+	addr = (void *)kp.addr;
+	unregister_kprobe(&kp);
+	return addr;
+}
+
+static char *vdrm_mkpool_argv[] = { "/data/wayland/vdrm_mkpool", NULL };
+static char *vdrm_mkpool_envp[] = {
+	"PATH=/system/bin:/system/xbin",
+	"ANDROID_ROOT=/system",
+	"ANDROID_DATA=/data",
+	NULL,
+};
+
+static int vdrm_mkpool_thread(void *arg)
+{
+	const struct cred *old;
+
+	/* 借加载方的域。exec 成功就再也回不来了——那时这里已经是用户态进程 */
+	old = override_creds(g_pool_cred);
+	if (g_kernel_execve(vdrm_mkpool_argv[0], vdrm_mkpool_argv,
+			    vdrm_mkpool_envp) < 0) {
+		revert_creds(old);
+		pr_err("vdrm: mkpool exec failed\n");
+	}
+
+	return 0;
+}
+
+static int vdrm_mkpool_bringup(void)
+{
+	if (!g_pool_cred) {
+		pr_info("vdrm: no loader credentials, pool stays app-driven\n");
+		return -EINVAL;
+	}
+
+	g_kernel_execve = vdrm_sym("kernel_execve");
+	if (!g_kernel_execve) {
+		pr_info("vdrm: kernel_execve unresolvable, pool stays app-driven\n");
+		return -ENOENT;
+	}
+
+	g_mkpool_task = kthread_run(vdrm_mkpool_thread, NULL, "vdrm-mkpool");
+	if (IS_ERR(g_mkpool_task)) {
+		int err = PTR_ERR(g_mkpool_task);
+
+		g_mkpool_task = NULL;
+		pr_err("vdrm: no mkpool thread: %d\n", err);
+		return err;
+	}
+
+	pr_info("vdrm: mkpool spawned under the loader's credentials\n");
+	return 0;
+}
+
+static void vdrm_mkpool_teardown(void)
+{
+	if (g_pool_cred) {
+		put_cred(g_pool_cred);
+		g_pool_cred = NULL;
+	}
+	/* exec 成功后那个线程已经是用户态进程，不归 kthread 管，不 stop */
+	g_mkpool_task = NULL;
+	g_kernel_execve = NULL;
+}
+
 static int vdrm_init(void)
 {
 	int rc;
 
 	pr_info("vdrm: stage=enter\n");
-
-	/* 这两个是内核导出的用户拷贝接口（arm64 上是 _copy_*_user）*/
-	vdrm_copy_to_user   = (void *)copy_to_user;
-	vdrm_copy_from_user = (void *)copy_from_user;
 
 	pr_info("vdrm: .ko init\n");
 
@@ -1730,6 +1695,14 @@ static int vdrm_init(void)
 	if (rc) goto err;
 	pr_info("vdrm: stage=input-ok\n");
 
+	/* 池归 KO：insmod 就是唯一一次"跑在加载方上下文里"的机会，凭据在这时抓，
+	 * 之后 mkpool 必须早于合成器，所以在这里就把它拉起来。 */
+	g_pool_cred = get_task_cred(current);
+	if (vdrm_mkpool_bringup())
+		pr_info("vdrm: pool will have to be built by the app\n");
+	else
+		pr_info("vdrm: stage=mkpool-ok\n");
+
 	pr_info("vdrm: bring-up ok (dev=%px)\n", g_dev);
 	return 0;
 err:
@@ -1739,6 +1712,7 @@ err:
 
 static void vdrm_exit(void)
 {
+	vdrm_mkpool_teardown();
 	vdrm_input_teardown();
 	vdrm_do_unregister();
 	pr_info("vdrm: exit ok (dev=%px)\n", g_dev);
