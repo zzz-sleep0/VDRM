@@ -1625,13 +1625,17 @@ static const char *const vdrm_mkpool_envp[] = {
 static int vdrm_mkpool_thread(void *arg)
 {
 	const struct cred *old;
+	int ret;
 
 	/* 借加载方的域。exec 成功就再也回不来了——那时这里已经是用户态进程 */
 	old = override_creds(g_pool_cred);
-	if (g_kernel_execve(vdrm_mkpool_argv[0], vdrm_mkpool_argv,
-			    vdrm_mkpool_envp) < 0) {
+	ret = g_kernel_execve(vdrm_mkpool_argv[0], vdrm_mkpool_argv,
+			      vdrm_mkpool_envp);
+	if (ret < 0) {
 		revert_creds(old);
-		pr_err("vdrm: mkpool exec failed\n");
+		/* 错误码要留着：-ENOENT 是路径/命名空间，-EACCES 是权限或标签，
+		 * -EPERM 是策略，-ENOEXEC 是解释器——四种原因的修法完全不同 */
+		pr_err("vdrm: mkpool exec failed: %d\n", ret);
 	}
 
 	return 0;
