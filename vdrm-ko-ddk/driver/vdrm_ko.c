@@ -1614,8 +1614,8 @@ static void *vdrm_sym(const char *name)
 	return addr;
 }
 
-static char *vdrm_mkpool_argv[] = { "/data/wayland/vdrm_mkpool", NULL };
-static char *vdrm_mkpool_envp[] = {
+static const char *const vdrm_mkpool_argv[] = { "/data/wayland/vdrm_mkpool", NULL };
+static const char *const vdrm_mkpool_envp[] = {
 	"PATH=/system/bin:/system/xbin",
 	"ANDROID_ROOT=/system",
 	"ANDROID_DATA=/data",
