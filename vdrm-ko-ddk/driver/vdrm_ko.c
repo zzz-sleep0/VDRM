@@ -1628,15 +1628,27 @@ static int vdrm_mkpool_thread(void *arg)
 	int ret;
 
 	/*
-	 * 必须是 commit_creds，不是 override_creds —— 这是这里最容易改错的地方。
+	 * PF_KTHREAD 必须先清掉 —— kernel_execve() 头一句就是它：
 	 *
-	 * exec 走 prepare_exec_creds() -> prepare_creds()，而 prepare_creds()
-	 * 复制的是【客观】凭据（real_cred），不是主观的那份（cred）。
-	 * override_creds 只改主观的那个，exec 这条路根本看不见它 —— 于是检查
-	 * 仍然以 u:r:kernel 的身份做：内核域对 system_data_root_file 没有
-	 * entrypoint，被拒；而内核域的拒绝在 AOSP 里是 dontaudit 掉的，dmesg
-	 * 里连一条 AVC 都不留，只看到一个没头没尾的失败。umh 自己也是
-	 * commit_creds，原因就在这里。
+	 *     // It is non-sense for kernel threads to call execve
+	 *     if (WARN_ON_ONCE(current->flags & PF_KTHREAD))
+	 *             return -EINVAL;
+	 *
+	 * 内核自己绕过去的办法是 user_mode_thread()：它用 kernel_clone 造一个
+	 * 【不带】PF_KTHREAD 的线程，umh 就是靠它（见 kernel/umh.c 里
+	 * user_mode_thread(call_usermodehelper_exec_async, ...)）。而那个标志在
+	 * fork.c 里只有一处赋值：
+	 *     p->flags &= ~PF_KTHREAD;  if (args->kthread) p->flags |= PF_KTHREAD;
+	 * 所以事后清掉与 user_mode_thread 等价，且不分 KMI。
+	 */
+	current->flags &= ~PF_KTHREAD;
+
+	/*
+	 * commit_creds 而不是 override_creds —— 和 umh 一致：我们不是"临时借用"
+	 * 一会儿还要还回去，而是要【变成】那个身份交给 exec，所以 real_cred 也一起改。
+	 * （顺带纠正上一笔提交里的说法：prepare_creds() 复制的是 task->cred，
+	 * 也就是主观凭据，override_creds 本来就能带过 exec。这里换掉是为了语义，
+	 * 不是因为 override_creds 看不见。）
 	 *
 	 * 引用交给任务，模块不再持有；exec 成功的话这个任务就变成用户态进程了。
 	 */
