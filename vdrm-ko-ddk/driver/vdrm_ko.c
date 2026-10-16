@@ -28,13 +28,6 @@
 #include <linux/mm.h>
 #include <linux/list.h>
 #include <linux/fs.h>
-#include <linux/kthread.h>
-#include <linux/sched/task.h>
-#include <linux/signal.h>
-#include <linux/cred.h>
-#include <linux/kprobes.h>
-#include <linux/binfmts.h>
-#include <linux/umh.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -1578,183 +1571,26 @@ static void vdrm_input_teardown(void)
 	pr_info("vdrm: input down\n");
 }
 
-/* ================== 借域建池：insmod 时由 KO 自己把池建起来 ==================
+/* ===================== 池不由内核建 =====================
  *
- * 池必须早于合成器第一次 dumb_create 就绪。合成器只分配一次缓冲然后一直用，
+ * 池必须早于合成器第一次 dumb_create 就绪：合成器只分配一次缓冲然后一直用，
  * 池空时 dumb_create 走 heap 回退，那批缓冲不在池里，pipe_update 匹配不上，
  * App 一个帧事件都收不到 —— 就是"黑屏、关掉合成器再开就好"的那个时序。
- * 让 App 来建池，等于把这件事押在"用户先开一次 App"上。
  *
- * 这里改成 KO 自己拉：mkpool 是用户态程序，槽要带 gralloc 出身（fd1 + ints），
- * 内核造不出来，所以只能把它 exec 起来 —— 而内核线程是 u:r:kernel，策略不许
- * 它够到 gralloc（binder + allocator HAL）。所以先把加载方（KernelSU，
- * u:r:ksu）的凭据装上去，再 exec，域就跟着过去了。
+ * 而池里的槽必须带 gralloc 出身（fd0 + fd1 metadata blob + ints），内核造不出来：
+ * gralloc 分配是 binder 到 allocator HAL 的事。所以"建池"这一步天然属于用户态。
  *
- * 这一步在本机实测过：源域=ksu 的 type_transition 是 0 条，所以 exec 之后域
- * 不被打回；entrypoint 也够（平时 App 的 su -c vdrm_mkpool 就是这么跑的）。
+ * 曾经试过让 KO 在 insmod 时自己把它拉起来：借加载方的 ksu 域（get_task_cred +
+ * commit_creds）→ user_mode_thread（内核线程不能 exec）→ chroot /proc/1/root
+ * （内核线程活在初始 mount ns，那里没有 statsd APEX）。能跑，但那是拿一百多行
+ * 最脆的内核代码去伪造一个用户态上下文，还得按名字 kprobe 解析三个没导出的符号。
  *
- * 下面两个坑都实测踩过，写在这儿免得被"简化"回去：
+ * 现在换成模块脚本：installer 的 service.sh 在 insmod 之后直接跑 vdrm_mkpool ——
+ * 那个 shell 本来就是 root、就在正确的域和挂载树里，上面前三样绕法一样都不需要。
  *
- *   1) exec 必须由【用户态线程】发起，不能是内核线程。kernel_execve() 头一句
- *      就是 "It is non-sense for kernel threads to call execve"，PF_KTHREAD
- *      直接 -EINVAL。内核自己的办法是 user_mode_thread()（umh 就是
- *      user_mode_thread(call_usermodehelper_exec_async, ...) 起的）。而且
- *      必须在【没有 mm】的上下文里叫它：user_mode_thread 内部带 CLONE_VM，
- *      creator 若有 mm，新任务会共享它，而 exec 的 exec_mmap() 会把它拆掉
- *      —— 那是拆调用者自己的地址空间。所以我们先占一个普通 kthread 来叫。
- *
- *   2) 不能用 kthread_run() 直接跑 exec。kthread() 这个包装在 threadfn 返回后
- *      无条件 kthread_exit()，而 kernel_execve 成功时恰恰就是"返回 0"
- *      （umh 原文：retval = kernel_execve(...); if (!retval) return 0;）。
- *      实测现象：exec 其实成功了（comm 已经变成 vdrm_mkpool），进程随即被
- *      kthread_exit() 收走，只剩一条 WARN 和 Call trace，池一个字没有。
- *
- * 另外 kernel_execve / commit_creds / user_mode_thread 在这台内核上都没有
- * __ksymtab_ 条目（GKI 裁过 ksymtab），不能直接调，只能按名字拿地址再走函数
- * 指针 —— 类型必须是内核自己的，否则间接调用点的 kCFI 哈希对不上，直接 brk。
- *
- * 3) user_mode_thread() 是 v6.1 才进内核的（umh 重构那一批），5.10/5.15 上
- *      连声明都没有 —— 写 typeof(&user_mode_thread) 老 KMI 直接编不过
- *      （实测：undeclared identifier）。所以这里照内核原型自己定义一个等价的
- *      函数指针类型；kCFI 认的是原型哈希，等价写法同号。老核上 kprobe 照样
- *      解析不到，走降级路径，不影响编译产物。
- *
- *   4) 挂载树！exec 成功、链接器也正常，helper 还是可能当场死掉 —— 因为内核
- *      线程活在【初始 mount namespace】里（kthreadd 那套），而 Android 的 init
- *      早就 unshare 出了自己的一套。两台树的 /apex 不一样：初始树里只有启动
- *      早期挂上的 runtime/i18n/tzdata/vndk/virt 几个，statsd 之类的根本没有。
- *      于是 ld.config.txt 里 namespace.default.links = com_android_os_statsd
- *      那条规则查无可查，症状是用户态的：
- *        CANNOT LINK EXECUTABLE: library "libstatssocket.so" not found:
- *        needed by /system/lib64/libostatslog.so in namespace (default)
- *      （kernel_execve 返回 0，所以模块侧一句错误都打不出来，只有 logcat 有。）
- *
- *      只切 mount namespace 是没用的：绝对路径从 fs->root 出发解析，不看
- *      nsproxy。真正管用的是 chroot —— 它改的就是 fs->root。所以这里让内核
- *      直接 exec【/system/bin/chroot /proc/1/root <helper>】：toybox 的 chroot
- *      会 chdir("/") 再 exec，helper 拿到的根就是系统的 /。实测这么跑，helper
- *      链接通过并且真的干活（REGISTER id=1..6 共 6 个 buffer）。
- *
- *      为什么不在模块里自己做、少依赖一个用户态程序？试过了：`get_fs_root()`
- *      的 inline 体里调 `path_get()`，而 path_get/path_put 是 fs/namespace.c 里
- *      的真函数、没导出 —— 一用就 "Unknown symbol path_get (err -2)"，模块根本
- *      加载不了。set_fs_root/set_fs_pwd/kern_path/filp_open 同样没导出。
- *      chroot 这条路零新符号，而且 toybox chroot 是 /system/bin 常驻 applet。
+ * 所以这里什么都不做：池由 helper（模块脚本跑的，或 App 的 ensure_pool_spawn
+ * 兜底拉起的）经 VDRM_IOCTL_REGISTER 注册进来，内核只负责持有、匹配、清理。
  */
-static const struct cred *g_pool_cred;
-static typeof(&kernel_execve) g_kernel_execve;
-static typeof(&commit_creds) g_commit_creds;
-/* 与 v6.1 kernel/fork.c 的 pid_t user_mode_thread(int (*)(void *), void *, unsigned long) 同型 */
-typedef pid_t (*vdrm_user_mode_thread_fn)(int (*fn)(void *), void *arg, unsigned long flags);
-static vdrm_user_mode_thread_fn g_user_mode_thread;
-
-/* 按名字取符号地址：kallsyms_lookup_name 没导出，kprobe 是唯一的平价入口 */
-static void *vdrm_sym(const char *name)
-{
-	struct kprobe kp;
-	void *addr;
-
-	memset(&kp, 0, sizeof(kp));
-	kp.symbol_name = name;
-	if (register_kprobe(&kp))
-		return NULL;
-	addr = (void *)kp.addr;
-	unregister_kprobe(&kp);
-	return addr;
-}
-
-/*
- * 不直接 exec helper，而是先过一道 /system/bin/chroot（toybox）把它 chroot 到
- * pid 1 的 / 里 —— 原因见上面注释 4。helper 自己的 argv[0] 不变。
- */
-static const char *const vdrm_mkpool_argv[] = {
-	"/system/bin/chroot", "/proc/1/root", "/data/wayland/vdrm_mkpool", NULL
-};
-static const char *const vdrm_mkpool_envp[] = {
-	"PATH=/system/bin:/system/xbin",
-	"ANDROID_ROOT=/system",
-	"ANDROID_DATA=/data",
-	NULL,
-};
-
-/* 跑在 user_mode_thread 造出来的线程里 —— 去 exec 的是它 */
-static int vdrm_mkpool_exec(void *arg)
-{
-	int ret;
-
-	/*
-	 * commit_creds 而不是 override_creds —— 和 umh 一致：我们不是"临时借用"
-	 * 一会儿还要还回去，而是要【变成】那个身份交给 exec，所以 real_cred 也
-	 * 一起改。引用交给任务，模块不再持有。
-	 */
-	g_commit_creds((struct cred *)get_cred(g_pool_cred));
-
-	ret = g_kernel_execve(vdrm_mkpool_argv[0], vdrm_mkpool_argv,
-			      vdrm_mkpool_envp);
-	if (ret < 0)
-		/* -ENOENT 路径/命名空间、-EACCES 权限或标签、-EPERM 策略、
-		 * -ENOEXEC 解释器 —— 四种原因的修法完全不同，所以留着 */
-		pr_err("vdrm: mkpool exec failed: %d\n", ret);
-
-	/* 能走到这里只有一种情况：exec 失败 */
-	return 0;
-}
-
-/*
- * 普通 kthread，只干一件事：在【没有 mm】的上下文里把 user_mode_thread
- * 叫起来（umh 是从 unbound workqueue 里叫的，同理）。它自己不出 exec，
- * 所以正常返回、正常走 kthread_exit。
- */
-static int vdrm_mkpool_spawn(void *arg)
-{
-	pid_t pid = g_user_mode_thread(vdrm_mkpool_exec, NULL, SIGCHLD);
-
-	if (pid < 0)
-		pr_err("vdrm: user_mode_thread failed: %d\n", (int)pid);
-
-	return 0;
-}
-
-static int vdrm_mkpool_bringup(void)
-{
-	struct task_struct *t;
-
-	if (!g_pool_cred) {
-		pr_info("vdrm: no loader credentials, pool stays app-driven\n");
-		return -EINVAL;
-	}
-
-	g_kernel_execve    = vdrm_sym("kernel_execve");
-	g_commit_creds     = vdrm_sym("commit_creds");
-	g_user_mode_thread = vdrm_sym("user_mode_thread");
-	if (!g_kernel_execve || !g_commit_creds || !g_user_mode_thread) {
-		pr_info("vdrm: kernel_execve/commit_creds/user_mode_thread unresolvable, pool stays app-driven\n");
-		return -ENOENT;
-	}
-
-	/* 这个 kthread 是短命的：拉起用户态线程自己就退 */
-	t = kthread_run(vdrm_mkpool_spawn, NULL, "vdrm-mkpool");
-	if (IS_ERR(t)) {
-		int err = PTR_ERR(t);
-
-		pr_err("vdrm: no mkpool thread: %d\n", err);
-		return err;
-	}
-
-	pr_info("vdrm: mkpool spawned under the loader's credentials\n");
-	return 0;
-}
-
-static void vdrm_mkpool_teardown(void)
-{
-	if (g_pool_cred) {
-		put_cred(g_pool_cred);
-		g_pool_cred = NULL;
-	}
-	g_kernel_execve = NULL;
-	g_commit_creds = NULL;
-	g_user_mode_thread = NULL;
-}
 
 static int vdrm_init(void)
 {
@@ -1777,14 +1613,7 @@ static int vdrm_init(void)
 	if (rc) goto err;
 	pr_info("vdrm: stage=input-ok\n");
 
-	/* 池归 KO：insmod 就是唯一一次"跑在加载方上下文里"的机会，凭据在这时抓，
-	 * 之后 mkpool 必须早于合成器，所以在这里就把它拉起来。 */
-	g_pool_cred = get_task_cred(current);
-	if (vdrm_mkpool_bringup())
-		pr_info("vdrm: pool will have to be built by the app\n");
-	else
-		pr_info("vdrm: stage=mkpool-ok\n");
-
+	/* 池不在这里建，见上面"池不由内核建" */
 	pr_info("vdrm: bring-up ok (dev=%px)\n", g_dev);
 	return 0;
 err:
@@ -1794,7 +1623,6 @@ err:
 
 static void vdrm_exit(void)
 {
-	vdrm_mkpool_teardown();
 	vdrm_input_teardown();
 	vdrm_do_unregister();
 	pr_info("vdrm: exit ok (dev=%px)\n", g_dev);
