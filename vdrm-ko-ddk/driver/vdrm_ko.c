@@ -35,10 +35,6 @@
 #include <linux/kprobes.h>
 #include <linux/binfmts.h>
 #include <linux/umh.h>
-#include <linux/fs_struct.h>
-#include <linux/sched.h>	/* find_task_by_vpid() 声明在这儿 */
-#include <linux/path.h>
-#include <linux/rcupdate.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -1632,10 +1628,18 @@ static void vdrm_input_teardown(void)
  *        CANNOT LINK EXECUTABLE: library "libstatssocket.so" not found:
  *        needed by /system/lib64/libostatslog.so in namespace (default)
  *      （kernel_execve 返回 0，所以模块侧一句错误都打不出来，只有 logcat 有。）
- *      切 ns 没用：绝对路径从 fs->root 出发解析，不看 nsproxy。实测
- *      `chroot /proc/1/root` 之后同一份二进制立刻链接通过 —— chroot 干的正是
- *      set_fs_root(current->fs, ...)。所以这里把 pid 1 的 fs->root/pwd 借过来
- *      当自己的根，等价于 chroot 到系统的 /。
+ *
+ *      只切 mount namespace 是没用的：绝对路径从 fs->root 出发解析，不看
+ *      nsproxy。真正管用的是 chroot —— 它改的就是 fs->root。所以这里让内核
+ *      直接 exec【/system/bin/chroot /proc/1/root <helper>】：toybox 的 chroot
+ *      会 chdir("/") 再 exec，helper 拿到的根就是系统的 /。实测这么跑，helper
+ *      链接通过并且真的干活（REGISTER id=1..6 共 6 个 buffer）。
+ *
+ *      为什么不在模块里自己做、少依赖一个用户态程序？试过了：`get_fs_root()`
+ *      的 inline 体里调 `path_get()`，而 path_get/path_put 是 fs/namespace.c 里
+ *      的真函数、没导出 —— 一用就 "Unknown symbol path_get (err -2)"，模块根本
+ *      加载不了。set_fs_root/set_fs_pwd/kern_path/filp_open 同样没导出。
+ *      chroot 这条路零新符号，而且 toybox chroot 是 /system/bin 常驻 applet。
  */
 static const struct cred *g_pool_cred;
 static typeof(&kernel_execve) g_kernel_execve;
@@ -1659,7 +1663,13 @@ static void *vdrm_sym(const char *name)
 	return addr;
 }
 
-static const char *const vdrm_mkpool_argv[] = { "/data/wayland/vdrm_mkpool", NULL };
+/*
+ * 不直接 exec helper，而是先过一道 /system/bin/chroot（toybox）把它 chroot 到
+ * pid 1 的 / 里 —— 原因见上面注释 4。helper 自己的 argv[0] 不变。
+ */
+static const char *const vdrm_mkpool_argv[] = {
+	"/system/bin/chroot", "/proc/1/root", "/data/wayland/vdrm_mkpool", NULL
+};
 static const char *const vdrm_mkpool_envp[] = {
 	"PATH=/system/bin:/system/xbin",
 	"ANDROID_ROOT=/system",
@@ -1667,58 +1677,10 @@ static const char *const vdrm_mkpool_envp[] = {
 	NULL,
 };
 
-/*
- * 借根：把 pid 1 的 / 当成自己的根，等价于 chroot /proc/1/root（见上面注释 4）。
- *
- * 只能在 user_mode_thread 造出来的那个线程里叫 —— 它的 fs 是 copy 出来的私有
- * 副本。绝不能在那个 kthread 里叫：kthread 的 fs 和 kthreadd 【共享】
- * （kthread_create 带 CLONE_FS），改它的 root 等于改 kthreadd 的 root，全内核
- * 线程一起遭殃。
- *
- * 也不需要 fs->lock/seq —— 这份 fs 是刚 copy 出来的、只有一个线程在用；
- * 将来若改成多线程再调，就得补上锁和 seqcount。
- */
-static void vdrm_adopt_system_root(void)
-{
-	struct task_struct *init;
-	struct fs_struct *fs = current->fs;
-	struct path root = { };
-	struct path old_root, old_pwd;
-
-	if (!fs)
-		return;
-
-	rcu_read_lock();
-	init = find_task_by_vpid(1);
-	if (init && init->fs)
-		get_fs_root(init->fs, &root);	/* 顺带 path_get 了一份引用 */
-	rcu_read_unlock();
-
-	if (!root.dentry) {
-		pr_warn("vdrm: init's root unavailable, staying in the kthread mount ns\n");
-		return;
-	}
-
-	old_root = fs->root;
-	old_pwd = fs->pwd;
-	path_get(&root);	/* pwd 也要占一份引用 */
-	fs->root = root;	/* 用掉 get_fs_root 那份 */
-	fs->pwd = root;
-	if (old_root.dentry)
-		path_put(&old_root);
-	if (old_pwd.dentry)
-		path_put(&old_pwd);
-
-	pr_info("vdrm: adopted init's root for the helper\n");
-}
-
 /* 跑在 user_mode_thread 造出来的线程里 —— 去 exec 的是它 */
 static int vdrm_mkpool_exec(void *arg)
 {
 	int ret;
-
-	/* 先借根，再 exec（见上面注释 4） */
-	vdrm_adopt_system_root();
 
 	/*
 	 * commit_creds 而不是 override_creds —— 和 umh 一致：我们不是"临时借用"
