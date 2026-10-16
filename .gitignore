@@ -6,6 +6,7 @@ app/build/
 app/.cxx/
 prebuilt/
 *.tar.gz
+vdrm-mkpool/vdrm_mkpool
 
 # 本机配置
 local.properties
