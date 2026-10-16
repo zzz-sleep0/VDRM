@@ -1145,7 +1145,12 @@ Java_com_vdrm_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong han
 }
 
 /* App 只负责一件事：池不存在时把 mkpool 拉起来（其余不管）。
- * mkpool 跑完就退，池由 KPM 持住；起不来/失败都不阻塞 App。*/
+ * mkpool 跑完就退，池由内核持住；起不来/失败都不阻塞 App。
+ *
+ * 路径就是模块目录里的那份（模块 id 固定为 vdrm-lkm）—— 二进制内嵌在模块里，
+ * 不再往 /data/wayland 拷第二份（那是守护进程时代留下的路径，已退役）。*/
+#define VDRM_MKPOOL "/data/adb/modules/vdrm-lkm/vdrm_mkpool"
+
 static void ensure_pool_spawn(void)
 {
     struct vdrm_pool_list lst;
@@ -1161,8 +1166,7 @@ static void ensure_pool_spawn(void)
     LOGI("ensure_pool: 池不可用(n=%d usable=%d) -> 拉起 mkpool", n, usable);
     pid = fork();
     if (pid == 0) {
-        execl("/system/bin/su", "su", "-c", "/data/wayland/vdrm_mkpool",
-              (char *)NULL);
+        execl("/system/bin/su", "su", "-c", VDRM_MKPOOL, (char *)NULL);
         _exit(127);
     }
 }

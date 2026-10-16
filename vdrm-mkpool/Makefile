@@ -14,7 +14,11 @@
 #     在【同名路径】下编，否则 md5 必然不同。这条对 App 的 .so 同样成立。
 #
 # 自校验（在某个目录下 `cd` 进去再编，源码叫 mkpool.c）：
-#   md5sum vdrm_mkpool  →  ffd57b46d465c71bd733aa3ccffc7794
+#   md5sum vdrm_mkpool  →  8f7cf89bc6d5531c6e482512c2d8bdde   (10144 B)
+#
+# 这个值随源码变。上一版是 ffd57b46…（9640 B）—— 日志位置从写死的
+# /data/wayland/mkpool.log 改成"用 /proc/self/exe 反查自己旁边"，路径变了、
+# 二进制就变了。改了 mkpool.c 记得重跑一次、把这里更新掉。
 
 CC      ?= aarch64-linux-android-clang
 API     ?= 36

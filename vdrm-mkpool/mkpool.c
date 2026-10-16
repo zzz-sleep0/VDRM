@@ -1,11 +1,11 @@
 /*
- * mkpool.c — 用户态"造池"程序（由 vdrm.sh up 拉起，跑完就退）
+ * mkpool.c — 用户态"造池"程序（模块的 service.sh 在 boot 时拉起，跑完就退）
  *
  * 1) 用 gralloc 分配 N 块模式尺寸 AHB（真货，显示管线认）
- * 2) 每块取出 {fd0(像素), fd1(blob), ints} → REGISTER 进 KPM
- *    （KPM 会 fget 住这两个 fd 并持住池，所以本进程退出后池依旧在）
+ * 2) 每块取出 {fd0(像素), fd1(blob), ints} → REGISTER 进池
+ *    （池由内核持住那两个 fd，所以本进程退出后池依旧在）
  *
- * 编译（bionic）：aarch64-linux-android-clang ... -landroid -lnativewindow -llog
+ * 编译（bionic）：见同目录 Makefile —— aarch64-linux-android-clang，且不加 -O2
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -63,7 +63,25 @@ struct vdrm_register_req {
 
 int main(void)
 {
-    FILE *lg = fopen("/data/wayland/mkpool.log", "w");
+    /*
+     * 日志写在【自己旁边】—— 也就是模块目录里，跟着模块走（模块被卸掉日志一起没）。
+     * 位置用 /proc/self/exe 反查，所以不把模块名/id 写死在这儿：模块改名、换 id
+     * 都不用重编本程序。
+     */
+    char logpath[512];
+    char *slash = NULL;
+    ssize_t n = readlink("/proc/self/exe", logpath, sizeof(logpath) - 16);
+
+    if (n > 0) {
+        logpath[n] = '\0';
+        slash = strrchr(logpath, '/');
+    }
+    if (slash)
+        strcpy(slash + 1, "mkpool.log");
+    else
+        strcpy(logpath, "/data/local/tmp/vdrm-mkpool.log");
+
+    FILE *lg = fopen(logpath, "w");
     int fd, i, ok = 0;
     struct vdrm_info info;
     uint32_t w, h, fmt, pitch;
