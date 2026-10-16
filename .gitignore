@@ -6,7 +6,8 @@ app/build/
 app/.cxx/
 prebuilt/
 *.tar.gz
-vdrm-mkpool/vdrm_mkpool
+# 注意 vdrm-mkpool/vdrm_mkpool 【要入库】：KMI 无关的小二进制，
+# CI 装配 zip 时要拿它用（哈希见 vdrm-mkpool/Makefile）
 
 # 本机配置
 local.properties

@@ -10,6 +10,10 @@ on:
   push:
     paths:
       - 'vdrm-ko-ddk/**'
+      # 模块的文本变了、装配脚本变了，都得重出那个 zip
+      - 'module/**'
+      - 'make-module.py'
+      - 'vdrm-mkpool/**'
       - '.github/workflows/build-vdrm-ko.yml'
   workflow_dispatch:
 
@@ -52,7 +56,31 @@ jobs:
         if: always()
         with:
           name: vdrm-${{ matrix.kmi }}
-          path: |
-            vdrm-ko-ddk/vdrm-${{ matrix.kmi }}.ko
-            vdrm-ko-ddk/build.log
+          # 只传 .ko —— 文件名就是 KMI，是跟 service.sh 的契约。
+          # build.log 不传：六个都叫这个名字，合并下载时会互相盖；日志在 CI 的 run 里。
+          path: vdrm-ko-ddk/vdrm-${{ matrix.kmi }}.ko
           if-no-files-found: warn
+
+  # 六个 KMI 都编好之后，装配成"那个模块"——一个可直接安装的 zip。
+  # 用的就是仓库根的 make-module.py，跟本地同一个动作。
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vdrm-*
+          merge-multiple: true
+          path: vdrm-ko-ddk
+
+      - name: 装配模块 zip
+        run: |
+          ls -l vdrm-ko-ddk/
+          python3 make-module.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdrm-lkm-module
+          path: vdrm-lkm-*.zip

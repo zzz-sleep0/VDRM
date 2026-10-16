@@ -18,7 +18,10 @@
 #
 # 这个值随源码变。上一版是 ffd57b46…（9640 B）—— 日志位置从写死的
 # /data/wayland/mkpool.log 改成"用 /proc/self/exe 反查自己旁边"，路径变了、
-# 二进制就变了。改了 mkpool.c 记得重跑一次、把这里更新掉。
+# 二进制就变了。
+#
+# ⚠️ vdrm_mkpool 本身【要入库】（KMI 无关的小二进制，CI 装配模块 zip 时要用），
+#    所以改了 mkpool.c 之后：重编 → 更新上面这个哈希 → 把新产物一起提交。
 
 CC      ?= aarch64-linux-android-clang
 API     ?= 36
