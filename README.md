@@ -1,81 +1,142 @@
 # VDRM
 
 把一台 Android 手机变成**虚拟 DRM 显示器**（`/dev/vdrm`，虚拟 `card1`），
-让 Linux 合成器（KWin / Hyprland / sway …）跑在容器里、画面显示在手机屏幕上，
+让 Linux 合成器（KWin / niri / Hyprland / sway …）跑在容器里、画面显示在手机屏幕上，
 同时提供一套**通用**的虚拟键鼠。
 
 不是投屏，也不是 X11 转发 —— 容器里的合成器看到的就是一块真实的 DRM 卡。
 虚拟键鼠走**内核 evdev**，所以任何用 libinput 的合成器都通用，不需要为每个桌面环境写适配。
 
+**换句话说：在你自己的手机上，跑一个完整的 Linux 桌面。**
+
 ---
 
-## 三条链路
+## 它是怎么跑起来的
 
 ```
-① 显示   合成器（容器）──写池缓冲──► KO ──► App 用 AHB 重建 ──► SurfaceFlinger ──► 屏幕
-② 输入   App 触控板/键盘 ──ioctl(/dev/vdrm)──► KO ──input_event()──► evdev ──► 合成器
+① 显示   合成器（容器）──写池缓冲──► 内核模块 ──► App 用 AHB 重建 ──► SurfaceFlinger ──► 屏幕
+② 输入   App 触控板/键盘 ──ioctl(/dev/vdrm)──► 内核模块 ──input_event()──► evdev ──► 合成器
 ③ 屏蔽   虚拟键鼠是内核级设备，Android 侧也会认到 → 用排除表按设备名屏蔽掉
 ```
 
-池由 KO 持有，App 重启不影响；虚拟键鼠由 KO 注册，生命周期绑在模块上。
+池由内核模块持有，App 重启不影响；虚拟键鼠由内核模块注册，生命周期绑在模块上。
 
 ---
 
-## 目录
+## 你需要准备什么
 
-| 路径 | 是什么 |
+| | |
 |---|---|
-| `app/` | **Android 应用** —— 显示消费端 + 输入注入。标准 Gradle 工程，`.github/workflows/build.yml` 会在推送时自动编 APK |
-| `vdrm-ko-ddk/` | **内核模块**。标准 kbuild，在 DDK 容器里按 KMI 编译；改动的来龙去脉见其中的 `CHANGES.md` |
-| `vendor-overlay/` | **屏蔽模块** —— 让 Android 的 InputReader 忽略 `vdrm-kbd` / `vdrm-ptr` |
+| **手机** | 已 root（KernelSU / Magisk / APatch），**并装了 metamodule** —— 模块的文件覆盖靠它 |
+| **容器** | [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS)（或任何能起 Linux 容器、能指定设备节点的方案） |
+| **合成器** | 容器里装一个。KWin 和 niri 都验过；其它用 libinput 的应该也能，环境变量照抄 |
 
 ---
 
-## 怎么跑起来
+## 这套东西由哪几块组成
 
-- 1.根据`先看我.md`中提到的，从你的设备上提取`excluded-input-devices.xml`文件，加上
+| 路径 | 是什么 | 怎么得到 |
+|---|---|---|
+| `module/` | **内核侧模块** `vdrm-lkm`：装 .ko、建池、把状态写进模块列表 | 装下面的 zip |
+| `vdrm-ko-ddk/` | 内核模块**源码**（按 KMI 编，六档一批） | CI（DDK） |
+| `vdrm-mkpool/` | **建池 helper**（用户态小程序，要 NDK 的 bionic clang） | 见其 `Makefile` |
+| `vdrm-gbm/` | **GBM 后端 shim**：让合成器在虚拟卡上分配缓冲 | 见其 `Makefile` |
+| `app/` | **Android 应用**：把池里的缓冲贴上屏 + 注入输入 | Gradle，CI 自动编 |
 
-`<device name="vdrm-kbd"/>`
+**正常情况下你只需要一个文件**：`vdrm-lkm-<version>.zip` —— 里面六个 KMI 的 `.ko`、
+helper、屏蔽表都齐了。要自己出这个 zip：
 
-`<device name="vdrm-ptr"/>`
+```sh
+python3 make-module.py          # 本地装配；或者推上去让 CI 出（artifact: vdrm-lkm-module）
+```
 
-两行补丁，之后修改`vdrm-input-overlay.zip`模块中的文件，安装元模块并刷入`vdrm-input-overlay`模块
+---
 
-- 2.下载安装app，下载内核模块，之后执行
+## 三步跑起来
 
-`insmod /path/to/your/file/vdrm*.ko`
+### 1. 装模块
 
-- 3.下载lxc容器镜像并安装到DroidSpaces中(lxc images中下载即可，如果想立即体验，推荐Arch，以下以Arch为例)(注：这之后带*的步骤可以省略，不过可能会丢失硬件加速)
+把 `vdrm-lkm-<version>.zip` **用管理器安装**（KernelSU / Magisk 里"从本地安装"）。
 
-  容器配置中需要
+> ⚠️ **别手工解压拷进 `/data/adb/modules/`** —— 管理器安装时会沿用被覆盖原文件的
+> SELinux 标签，手工拷不会。标签不对 → Android 读不到屏蔽表 → 它会把虚拟鼠标当成
+> 自己的，症状是屏幕上冒出个大鼠标在滑。
 
-  **配置环境变量**
-  
-  `XDG_RUNTIME_DIR=/home/alarm/.xdg`
+> ⚠️ **别的机型要改一下屏蔽表**：模块里那份 `excluded-input-devices.xml` 是拿**本机
+> ROM 的原文件**改的（在原文件上加 `vdrm-kbd` / `vdrm-ptr` 两行）。你的 ROM 里那份
+> 列的设备不一样，直接套用会丢掉它自己的排除项 —— 把这两行补进**你自己**的
+> `/vendor/etc/excluded-input-devices.xml`，再按这个改模块里的那份。**并且要装
+> metamodule**，文件覆盖才生效。
 
-  `LIBSEAT_BACKEND=noop`
+装完**重启**。模块在开机时会自己：
 
-  `AQ_DRM_DEVICES=/dev/dri/card1`
+- 按本机 KMI 找对应的 `.ko` 装上（**文件名就是 KMI**，如 `vdrm-android14-6.1.ko`）
+- 建好缓冲池（必须早于合成器第一次分配缓冲）
+- 把状态写进 `module.prop`，于是管理器里直接显示三段，不用点任何东西：
 
-  `MESA_LOADER_DRIVER_OVERRIDE=kgsl`
+```
+Virtual keyboard & mouse: 🟢 | Kernel: android14-6.1 | VDRM: ready 😋
+```
 
-  (注：此处环境变量仅在hyprland，niri和kde合成器上得到验证，其他合成器请自行探索)
+### 2. 起容器，把两个设备交给它
 
-  **挂载对应设备节点**
-  `/dev/dri/card1→/dev/dri/card1`→虚拟DRM设备
-  `/dev/input/event10→/dev/input/event10`→虚拟键盘
-  `/dev/input/event10→/dev/input/event11`→虚拟鼠标
+容器配置里（以 Droidspaces 为例）：
 
-  *在容器中打上`lfdevs`大佬的`mesa-for-android-container`对应你容器的驱动
+**环境变量**
 
-  **在容器中安装相应vdrm后端**(此处存放路径仅仅适用于Arch！其他系统请自行查找！)
-  在容器的/usr/lib/gbm目录下放置`vdrm_gbm.so`(看release，一起下发)
+```
+XDG_RUNTIME_DIR=/home/alarm/.xdg
+LIBSEAT_BACKEND=noop
+MESA_LOADER_DRIVER_OVERRIDE=msm
+```
 
-  
-- 4.打开一次app，这个是加载`vdrm*.ko`后需要先做的一个时序性问题，否则合成器可以正常启动，但是app无法显示合成器的画面，为黑屏表现，后续app可以随便关停，无需在意(时序问题做反已经黑屏了？没问题，关掉合成器再重新打开即可)
+**设备挂载**
 
-- 5.安装合成器，随后就可以快乐玩耍了
+```
+/dev/input        → /dev/input          # 整个目录
+/dev/dri/card1    → /dev/dri/card1      # 虚拟卡
+```
 
+> 输入**挂整个目录**，别逐个列 `eventN` —— 设备编号会变，写死就会一段时间后失灵。
+
+### 3. 在容器里装合成器
+
+- 打上 **`mesa-for-android-container`**（lfdevs 大佬那套）—— 硬件加速靠它
+- 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（Arch 是这路径，别的发行版自己找）
+  —— **必须**：没有它，合成器的缓冲不来自池，画面就出不来
+- niri 的配置加一句：
+
+```kdl
+debug {
+    render-drm-device "/dev/dri/renderD128"
+}
+```
+
+（其它合成器自行探索。KWin 是用 `AQ_DRM_DEVICES=/dev/dri/card1`。）
+
+---
+
+## 怎么确认成功了
+
+```sh
+# 容器里 —— 应该看到一块 1920x1080@60 的输出，且 Current mode 有值（已启用）
+niri msg outputs
+```
+
+- 管理器里模块那三行是 `🟢` / 有 KMI / `ready 😋`
+- 按一下虚拟键盘：**字进容器，不进 Android**
+
+---
+
+## 出问题先看这里
+
+| 症状 | 多半是 | 怎么办 |
+|---|---|---|
+| **全黑屏**，但合成器明明在跑 | 池没建起来。合成器只分配一次缓冲，抢在池之前以后就再也匹配不上 | 重启（模块在 boot 时建池）；或关掉合成器再开一次 |
+| **手机上冒出个大鼠标在滑** | 屏蔽表没生效，通常是模块被手工拷进去、丢了 SELinux 标签 | 用管理器装模块。已经拷了的话：<br>`chcon u:object_r:vendor_configs_file:s0 <模块>/system/vendor/etc/excluded-input-devices.xml` |
+| 合成器**起不来 / 说没有渲染器** | `MESA_LOADER_DRIVER_OVERRIDE=kgsl` 会被它误判成"软件渲染器"而拒绝 | 改成 `msm` |
+| 容器里**看不到虚拟卡 / 挂载全失败** | 只按名字给了 vdrm 卡，没给设备目录 | 按上面那样**整目录**挂 |
+| 模块状态还是 **Not checked yet** | 还没重启过，boot 脚本没跑 | 重启一次 |
 
 ---
 
@@ -84,13 +145,12 @@
 - Goldzxcbug，Superturtlee，项目引路人以及参考项目的开发者
 
 - Dere3046，提供了项目普适化的必要工具以及解决问题的思路
- 
-- lfdevs大佬，该项目想要拥有硬件加速需要打他的驱动
- 
-- anland项目，提供了初期思路以及大部分键鼠触控优化方法
- 
-- mesa-for-android-container项目，该项目硬件加速所需要的驱动来源于此
 
+- lfdevs大佬，该项目想要拥有硬件加速需要打他的驱动
+
+- anland项目，提供了初期思路以及大部分键鼠触控优化方法
+
+- mesa-for-android-container项目，该项目硬件加速所需要的驱动来源于此
 
 ## 许可
 
