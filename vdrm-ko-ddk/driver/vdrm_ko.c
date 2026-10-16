@@ -35,6 +35,10 @@
 #include <linux/kprobes.h>
 #include <linux/binfmts.h>
 #include <linux/umh.h>
+#include <linux/fs_struct.h>
+#include <linux/sched.h>	/* find_task_by_vpid() 声明在这儿 */
+#include <linux/path.h>
+#include <linux/rcupdate.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -1618,6 +1622,20 @@ static void vdrm_input_teardown(void)
  *      （实测：undeclared identifier）。所以这里照内核原型自己定义一个等价的
  *      函数指针类型；kCFI 认的是原型哈希，等价写法同号。老核上 kprobe 照样
  *      解析不到，走降级路径，不影响编译产物。
+ *
+ *   4) 挂载树！exec 成功、链接器也正常，helper 还是可能当场死掉 —— 因为内核
+ *      线程活在【初始 mount namespace】里（kthreadd 那套），而 Android 的 init
+ *      早就 unshare 出了自己的一套。两台树的 /apex 不一样：初始树里只有启动
+ *      早期挂上的 runtime/i18n/tzdata/vndk/virt 几个，statsd 之类的根本没有。
+ *      于是 ld.config.txt 里 namespace.default.links = com_android_os_statsd
+ *      那条规则查无可查，症状是用户态的：
+ *        CANNOT LINK EXECUTABLE: library "libstatssocket.so" not found:
+ *        needed by /system/lib64/libostatslog.so in namespace (default)
+ *      （kernel_execve 返回 0，所以模块侧一句错误都打不出来，只有 logcat 有。）
+ *      切 ns 没用：绝对路径从 fs->root 出发解析，不看 nsproxy。实测
+ *      `chroot /proc/1/root` 之后同一份二进制立刻链接通过 —— chroot 干的正是
+ *      set_fs_root(current->fs, ...)。所以这里把 pid 1 的 fs->root/pwd 借过来
+ *      当自己的根，等价于 chroot 到系统的 /。
  */
 static const struct cred *g_pool_cred;
 static typeof(&kernel_execve) g_kernel_execve;
@@ -1649,10 +1667,58 @@ static const char *const vdrm_mkpool_envp[] = {
 	NULL,
 };
 
+/*
+ * 借根：把 pid 1 的 / 当成自己的根，等价于 chroot /proc/1/root（见上面注释 4）。
+ *
+ * 只能在 user_mode_thread 造出来的那个线程里叫 —— 它的 fs 是 copy 出来的私有
+ * 副本。绝不能在那个 kthread 里叫：kthread 的 fs 和 kthreadd 【共享】
+ * （kthread_create 带 CLONE_FS），改它的 root 等于改 kthreadd 的 root，全内核
+ * 线程一起遭殃。
+ *
+ * 也不需要 fs->lock/seq —— 这份 fs 是刚 copy 出来的、只有一个线程在用；
+ * 将来若改成多线程再调，就得补上锁和 seqcount。
+ */
+static void vdrm_adopt_system_root(void)
+{
+	struct task_struct *init;
+	struct fs_struct *fs = current->fs;
+	struct path root = { };
+	struct path old_root, old_pwd;
+
+	if (!fs)
+		return;
+
+	rcu_read_lock();
+	init = find_task_by_vpid(1);
+	if (init && init->fs)
+		get_fs_root(init->fs, &root);	/* 顺带 path_get 了一份引用 */
+	rcu_read_unlock();
+
+	if (!root.dentry) {
+		pr_warn("vdrm: init's root unavailable, staying in the kthread mount ns\n");
+		return;
+	}
+
+	old_root = fs->root;
+	old_pwd = fs->pwd;
+	path_get(&root);	/* pwd 也要占一份引用 */
+	fs->root = root;	/* 用掉 get_fs_root 那份 */
+	fs->pwd = root;
+	if (old_root.dentry)
+		path_put(&old_root);
+	if (old_pwd.dentry)
+		path_put(&old_pwd);
+
+	pr_info("vdrm: adopted init's root for the helper\n");
+}
+
 /* 跑在 user_mode_thread 造出来的线程里 —— 去 exec 的是它 */
 static int vdrm_mkpool_exec(void *arg)
 {
 	int ret;
+
+	/* 先借根，再 exec（见上面注释 4） */
+	vdrm_adopt_system_root();
 
 	/*
 	 * commit_creds 而不是 override_creds —— 和 umh 一致：我们不是"临时借用"
