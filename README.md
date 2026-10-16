@@ -58,29 +58,17 @@ python3 make-module.py          # 本地装配；或者推上去让 CI 出（art
 
 把 `vdrm-lkm-<version>.zip` **用管理器安装**（KernelSU / Magisk 里"从本地安装"）。
 
-> ⚠️ **别手工解压拷进 `/data/adb/modules/`** —— 管理器安装时会沿用被覆盖原文件的
-> SELinux 标签，手工拷不会。标签不对 → Android 读不到屏蔽表 → 它会把虚拟鼠标当成
-> 自己的，症状是屏幕上冒出个大鼠标在滑。
-
 > ⚠️ **别的机型要改一下屏蔽表**：模块里那份 `excluded-input-devices.xml` 是拿**本机
 > ROM 的原文件**改的（在原文件上加 `vdrm-kbd` / `vdrm-ptr` 两行）。你的 ROM 里那份
 > 列的设备不一样，直接套用会丢掉它自己的排除项 —— 把这两行补进**你自己**的
 > `/vendor/etc/excluded-input-devices.xml`，再按这个改模块里的那份。**并且要装
 > metamodule**，文件覆盖才生效。
 
-装完**重启**。模块在开机时会自己：
-
-- 按本机 KMI 找对应的 `.ko` 装上（**文件名就是 KMI**，如 `vdrm-android14-6.1.ko`）
-- 建好缓冲池（必须早于合成器第一次分配缓冲）
-- 把状态写进 `module.prop`，于是管理器里直接显示三段，不用点任何东西：
-
-```
-Virtual keyboard & mouse: 🟢 | Kernel: android14-6.1 | VDRM: ready 😋
-```
+装完**重启**。
 
 ### 2. 起容器，把两个设备交给它
 
-容器配置里（以 Droidspaces 为例）：
+容器配置里（以 Droidspaces 和Arch为例）：
 
 **环境变量**
 
@@ -124,7 +112,7 @@ niri msg outputs
 ```
 
 - 管理器里模块那三行是 `🟢` / 有 KMI / `ready 😋`
-- 按一下虚拟键盘：**字进容器，不进 Android**
+- 按一下虚拟键盘：**在容器中打出字**
 
 ---
 
@@ -134,9 +122,7 @@ niri msg outputs
 |---|---|---|
 | **全黑屏**，但合成器明明在跑 | 池没建起来。合成器只分配一次缓冲，抢在池之前以后就再也匹配不上 | 重启（模块在 boot 时建池）；或关掉合成器再开一次 |
 | **手机上冒出个大鼠标在滑** | 屏蔽表没生效，通常是模块被手工拷进去、丢了 SELinux 标签 | 用管理器装模块。已经拷了的话：<br>`chcon u:object_r:vendor_configs_file:s0 <模块>/system/vendor/etc/excluded-input-devices.xml` |
-| 合成器**起不来 / 说没有渲染器** | `MESA_LOADER_DRIVER_OVERRIDE=kgsl` 会被它误判成"软件渲染器"而拒绝 | 改成 `msm` |
-| 容器里**看不到虚拟卡 / 挂载全失败** | 只按名字给了 vdrm 卡，没给设备目录 | 按上面那样**整目录**挂 |
-| 模块状态还是 **Not checked yet** | 还没重启过，boot 脚本没跑 | 重启一次 |
+| 合成器**起不来 / 说没有渲染器** | `MESA_LOADER_DRIVER_OVERRIDE=kgsl` 会被部分合成器(如niri)误判成"软件渲染器"而拒绝 | 改成 `msm` |
 
 ---
 
