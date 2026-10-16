@@ -89,6 +89,10 @@ MESA_LOADER_DRIVER_OVERRIDE=msm
 
 > 输入**挂整个目录**，别逐个列 `eventN` —— 设备编号会变，写死就会一段时间后失灵。
 
+**开放特殊权限**
+
+需要容器中开“完整硬件访问”和“nomask特权”，否则键鼠不识别
+
 ### 3. 在容器里装合成器
 
 - 打上 **`mesa-for-android-container`**（lfdevs 大佬那套）—— 硬件加速靠它
