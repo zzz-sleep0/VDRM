@@ -982,11 +982,34 @@ static void *audio_cap_thread(void *arg)
 static float g_in_mv[2];   /* 亚像素位移累积 */
 static float g_in_sc[2];   /* 滚轮累积（0=垂直 1=水平）*/
 
+/* g_vdrm_fd 是【进程级】的，而 vdrm_open() 只在 nativeStart() 里调 —— 于是一个
+ * Activity 实例的 onDestroy（nativeDestroy）会把还在前台干活的另一个实例的输入
+ * 一起关掉，而且没人会重开它（见 nativeDestroy 处的注释）。
+ * 这里自愈：只做一次轻量 open，不跑 su —— 权限/标签在首次 nativeStart 时已经设过，
+ * 设备节点没被重建就不需要再设一遍（重建过的话 nativeStart 会再走一遍完整流程）。
+ * 失败只报一次、不刷屏：原先这里是静默 return，正是"虚拟键鼠莫名不好使"的元凶。*/
+static int vdrm_open_lazy(void)
+{
+    if (g_vdrm_fd >= 0) return 0;
+    g_vdrm_fd = open(VDRM_DEV, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    if (g_vdrm_fd < 0) return -1;
+    LOGI("input: lazy re-open %s fd=%d", VDRM_DEV, g_vdrm_fd);
+    return 0;
+}
+
 static void in_emit(uint16_t type, uint16_t code, int32_t value)
 {
     struct vdrm_input_event ie;
-    if (g_vdrm_fd < 0)
+    static int warned;
+
+    if (g_vdrm_fd < 0 && vdrm_open_lazy() < 0) {
+        if (!warned) {
+            warned = 1;
+            LOGW("input: %s 打不开 err=%d —— 事件被丢弃", VDRM_DEV, errno);
+        }
         return;
+    }
+    warned = 0;
     ie.type = type; ie.code = code; ie.value = value;
     if (ioctl(g_vdrm_fd, VDRM_IOCTL_INPUT, &ie) < 0)
         LOGW("input: ioctl type=%u code=%u err=%d", type, code, errno);
@@ -1112,7 +1135,10 @@ Java_com_vdrm_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong han
     }
     free_buffers(c);        /* UNREGISTER 池槽 + release AHB */
     close_channels(c);
-    if (g_vdrm_fd >= 0) { close(g_vdrm_fd); g_vdrm_fd = -1; }
+    /* 这里【不】关 g_vdrm_fd：它是进程级的，可能还有别的 MainActivity 实例
+     * （manifest 是 standard/singleTask 之前可以并存多个）在用；而且它是输入
+     * 注入唯一的依赖 —— 关了就等于把别人正在用的输入一起掐了，还查不出来
+     * （in_emit 以前是静默 return）。进程退出时内核自然会收这个 fd。*/
     LOGI("instance %p destroyed", (void *)c);
     if (c->stop_fd >= 0) close(c->stop_fd);
     free(c);
