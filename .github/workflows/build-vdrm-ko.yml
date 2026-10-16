@@ -39,17 +39,20 @@ jobs:
         run: |
           make KDIR=/opt/ddk/kdir/${{ matrix.kmi }} 2>&1 | tee build.log
           test -f vdrm.ko
+          # 【文件名就是 KMI】—— 模块里的 service.sh 按这个名字精确匹配，是契约，
+          # 别改回 vdrm.ko，也别在别处再改名。
+          mv vdrm.ko vdrm-${{ matrix.kmi }}.ko
 
       - name: Show vermagic
         run: |
-          modinfo -F vermagic vdrm.ko 2>/dev/null \
-            || strings vdrm.ko | grep '^vermagic='
+          modinfo -F vermagic vdrm-${{ matrix.kmi }}.ko 2>/dev/null \
+            || strings vdrm-${{ matrix.kmi }}.ko | grep '^vermagic='
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: vdrm-${{ matrix.kmi }}
           path: |
-            vdrm-ko-ddk/vdrm.ko
+            vdrm-ko-ddk/vdrm-${{ matrix.kmi }}.ko
             vdrm-ko-ddk/build.log
           if-no-files-found: warn
