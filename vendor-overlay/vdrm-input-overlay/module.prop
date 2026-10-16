@@ -1,0 +1,6 @@
+id=excluded_input_devices
+name=Excluded Input Devices Override
+version=v1.0
+versionCode=1
+author=you
+description=以 systemless 方式覆盖 /vendor/etc/excluded-input-devices.xml，用于排除指定输入设备。支持 KernelSU / Magisk / APatch。
