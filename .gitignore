@@ -20,3 +20,7 @@ local.properties
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 装配产物 / 各组件编出来的载荷（都不入库）
+vdrm-lkm-*.zip
+vdrm-ko-ddk/*.ko
