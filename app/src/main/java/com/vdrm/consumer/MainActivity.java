@@ -20,6 +20,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final String TAG = "VDRM";
 
+    /* true  = 手机触摸当直接触摸屏（ABS_MT，经内核 vdrm-touch）
+     * false = 旧的触控板模拟（REL 鼠标，VirtualTouchpad）
+     * 目前是编译期开关；后面可以接成 UI 里的小按钮。 */
+    private static final boolean DIRECT_TOUCH = true;
+
     private SurfaceView surfaceView;
     private VirtualTouchpad touchpad;
     private VirtualKeyboardView keyboardView;
@@ -73,10 +78,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 RelativeLayout.LayoutParams.MATCH_PARENT,
                 RelativeLayout.LayoutParams.MATCH_PARENT));
 
-        /* Touchpad overlay — sits on top of surface, transparent */
+        /* Touch overlay — sits on top of surface, transparent */
         View touchOverlay = new View(this) {
             @Override
             public boolean onTouchEvent(MotionEvent event) {
+                if (DIRECT_TOUCH) return sendTouchFrame(event);
                 if (touchpad != null) return touchpad.onTouch(event);
                 return true;
             }
@@ -129,6 +135,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         Native.nativeStop(nativeHandle);
+    }
+
+    /** 直接触摸：把当前活动触点打包发给内核 vdrm-touch（ABS_MT）。
+     *  每帧一条 ioctl；内核负责自动 lift、BTN_TOUCH 和唯一 SYN。*/
+    private static boolean sendTouchFrame(MotionEvent event) {
+        int action = event.getActionMasked();
+        int skip = (action == MotionEvent.ACTION_POINTER_UP ||
+                    action == MotionEvent.ACTION_UP)
+                   ? event.getActionIndex() : -1;
+        int n = 0;
+
+        if (action != MotionEvent.ACTION_UP &&
+            action != MotionEvent.ACTION_CANCEL) {
+            for (int i = 0; i < event.getPointerCount(); i++)
+                if (i != skip) n++;
+        }
+
+        int[] ids = new int[n];
+        float[] xs = new float[n];
+        float[] ys = new float[n];
+        float[] ps = new float[n];
+        int k = 0;
+        for (int i = 0; i < event.getPointerCount() && k < n; i++) {
+            if (i == skip) continue;
+            ids[k] = event.getPointerId(i);
+            xs[k] = event.getX(i);
+            ys[k] = event.getY(i);
+            ps[k] = event.getPressure(i);
+            k++;
+        }
+        Native.nativeSendTouch(n, ids, xs, ys, ps);
+        return true;
     }
 
     /** 小窗↔全屏 等配置变化：键盘来不及重排（约 0.5s 延迟），干脆先收起来，

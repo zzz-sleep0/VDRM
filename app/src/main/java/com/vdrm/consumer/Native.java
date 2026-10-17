@@ -16,6 +16,12 @@ public class Native {
     public static native int nativeSendBtn(int btn, boolean pressed);
     public static native int nativeSendScroll(int axis, int val);
 
+    /* Direct touch (ABS_MT): active contacts packed per frame.
+     * count == 0 means "all lifted". */
+    public static native int nativeSendTouch(int count, int[] ids,
+                                             float[] xs, float[] ys,
+                                             float[] ps);
+
     /* Audio (reserved) */
     public static native void nativeStartAudio(long handle);
     public static native void nativeStopAudio(long handle);

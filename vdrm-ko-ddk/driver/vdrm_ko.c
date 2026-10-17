@@ -23,6 +23,7 @@
 #include <linux/miscdevice.h>
 #include <linux/platform_device.h>
 #include <linux/input.h>
+#include <linux/input/mt.h>	/* input_mt_init_slots / INPUT_MT_DIRECT */
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <linux/mm.h>
@@ -163,6 +164,29 @@ struct vdrm_input_event {
 	s32 value;
 };
 #define VDRM_IOCTL_INPUT       VDRM_IOC(1, 'V', 0x06, sizeof(struct vdrm_input_event))
+
+/* ---- 直接触摸屏（ABS_MT）----
+ * App 每帧把【当前所有活动触点】打包发过来；内核负责：
+ *   - 上一帧有、这一帧消失的 slot 自动发 TRACKING_ID=-1（抬起）
+ *   - BTN_TOUCH 只在 0↔1 变化时发
+ *   - 整帧结束只发一个 SYN_REPORT（MT 协议 B 不能每个事件一个 SYN）
+ * 坐标用归一化的 0..4095，跟输出分辨率解耦；App 负责把窗口坐标
+ * 按 letterbox 逆映射到 mode 后再归一化。*/
+#define VDRM_TOUCH_MAX        10
+#define VDRM_TOUCH_COORD_MAX  4095
+
+struct vdrm_touch_point {
+	s32 slot;      /* 0..VDRM_TOUCH_MAX-1 */
+	s32 tracking;  /* 触点身份，>=0；同一次触摸保持不变 */
+	s32 x, y;      /* 0..VDRM_TOUCH_COORD_MAX */
+	s32 pressure;  /* 0..255 */
+};
+struct vdrm_touch_frame {
+	u32 count;     /* 本帧活动触点数；0 = 全部抬起 */
+	u32 flags;     /* reserved, must be 0 */
+	struct vdrm_touch_point points[VDRM_TOUCH_MAX];
+};
+#define VDRM_IOCTL_TOUCH       VDRM_IOC(1, 'V', 0x09, sizeof(struct vdrm_touch_frame))
 
 /* Linux input 常量（取值自 include/uapi/linux/input-event-codes.h）*/
 #define VDRM_EV_SYN     0x00
@@ -736,6 +760,7 @@ static int vdrm_misc_release(struct inode *inode, struct file *file)
 }
 
 static void vdrm_input_inject(u32 type, u32 code, s32 value);   /* 定义见文件后部 */
+static int vdrm_touch_inject(const struct vdrm_touch_frame *f); /* 定义见文件后部 */
 
 /* /dev/vdrm ioctl */
 static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
@@ -1023,6 +1048,15 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			return -EFAULT;
 		vdrm_input_inject(ie.type, ie.code, ie.value);
 		return 0;
+	}
+	case VDRM_IOCTL_TOUCH: {
+		struct vdrm_touch_frame f;
+
+		if (copy_from_user(&f, (const void *)arg, sizeof(f)))
+			return -EFAULT;
+		if (f.flags)
+			return -EINVAL;
+		return vdrm_touch_inject(&f);
 	}
 	case VDRM_IOCTL_SET_MODE: {
 		struct vdrm_set_mode_req req;
@@ -1625,7 +1659,98 @@ static int vdrm_do_minmax(void)
  *
  * 附带好处：input minor 恒定 → /run/udev/data 里那份元数据写一次就永久有效。
  */
-static struct input_dev *g_kbd, *g_ptr;
+static struct input_dev *g_kbd, *g_ptr, *g_touch;
+/* 触摸屏上一帧状态（只由 /dev/vdrm ioctl 上下文读写） */
+static u32 g_touch_slots;                       /* 活动 slot 位图 */
+static s32 g_touch_tid[VDRM_TOUCH_MAX];         /* 各 slot 当前 tracking id */
+
+static struct input_dev *vdrm_touch_make(void)
+{
+	struct input_dev *d = input_allocate_device();
+	int i;
+
+	if (!d)
+		return NULL;
+	d->name = "vdrm-touch";
+	d->id.bustype = VDRM_BUS_USB;
+	d->id.vendor  = 0x1d6b;
+	d->id.product = 0x0102;
+	d->id.version = 1;
+
+	input_set_abs_params(d, ABS_MT_POSITION_X, 0, VDRM_TOUCH_COORD_MAX, 0, 0);
+	input_set_abs_params(d, ABS_MT_POSITION_Y, 0, VDRM_TOUCH_COORD_MAX, 0, 0);
+	input_set_abs_params(d, ABS_MT_PRESSURE, 0, 255, 0, 0);
+	input_set_capability(d, EV_KEY, BTN_TOUCH);
+	/* INPUT_MT_DIRECT 会设置 INPUT_PROP_DIRECT —— libinput 据此当触摸屏 */
+	if (input_mt_init_slots(d, VDRM_TOUCH_MAX, INPUT_MT_DIRECT)) {
+		input_free_device(d);
+		return NULL;
+	}
+	for (i = 0; i < VDRM_TOUCH_MAX; i++)
+		g_touch_tid[i] = -1;
+	g_touch_slots = 0;
+	return d;
+}
+
+/* 整帧注入：自动 lift 消失的 slot，只发一个 SYN_REPORT */
+static int vdrm_touch_inject(const struct vdrm_touch_frame *f)
+{
+	struct input_dev *d = g_touch;
+	u32 newmask = 0, oldmask;
+	u32 i;
+	int s;
+
+	if (!d)
+		return -ENODEV;
+	if (f->count > VDRM_TOUCH_MAX)
+		return -EINVAL;
+
+	for (i = 0; i < f->count; i++) {
+		const struct vdrm_touch_point *p = &f->points[i];
+
+		if (p->slot < 0 || p->slot >= VDRM_TOUCH_MAX ||
+		    p->tracking < 0 || (newmask & BIT(p->slot)))
+			return -EINVAL;
+		if (p->x < 0 || p->x > VDRM_TOUCH_COORD_MAX ||
+		    p->y < 0 || p->y > VDRM_TOUCH_COORD_MAX ||
+		    p->pressure < 0 || p->pressure > 255)
+			return -EINVAL;
+		newmask |= BIT(p->slot);
+	}
+
+	oldmask = g_touch_slots;
+
+	for (s = 0; s < VDRM_TOUCH_MAX; s++) {
+		if ((oldmask & BIT(s)) && !(newmask & BIT(s))) {
+			input_event(d, EV_ABS, ABS_MT_SLOT, s);
+			input_event(d, EV_ABS, ABS_MT_TRACKING_ID, -1);
+			g_touch_tid[s] = -1;
+		}
+	}
+
+	for (i = 0; i < f->count; i++) {
+		const struct vdrm_touch_point *p = &f->points[i];
+
+		input_event(d, EV_ABS, ABS_MT_SLOT, p->slot);
+		if (!(oldmask & BIT(p->slot)) ||
+		    g_touch_tid[p->slot] != p->tracking) {
+			input_event(d, EV_ABS, ABS_MT_TRACKING_ID, p->tracking);
+			g_touch_tid[p->slot] = p->tracking;
+		}
+		input_event(d, EV_ABS, ABS_MT_POSITION_X, p->x);
+		input_event(d, EV_ABS, ABS_MT_POSITION_Y, p->y);
+		input_event(d, EV_ABS, ABS_MT_PRESSURE, p->pressure);
+	}
+
+	if (newmask && !oldmask)
+		input_event(d, EV_KEY, BTN_TOUCH, 1);
+	else if (!newmask && oldmask)
+		input_event(d, EV_KEY, BTN_TOUCH, 0);
+
+	input_event(d, EV_SYN, VDRM_SYN_REPORT, 0);
+	g_touch_slots = newmask;
+	return 0;
+}
 
 static void vdrm_input_inject(u32 type, u32 code, s32 value)
 {
@@ -1700,12 +1825,32 @@ static int vdrm_input_setup(void)
 		return -EIO;
 	}
 
-	pr_info("vdrm: input up kbd=%px ptr=%px\n", g_kbd, g_ptr);
+	g_touch = vdrm_touch_make();
+	if (!g_touch) {
+		input_unregister_device(g_ptr);
+		g_ptr = NULL;
+		input_unregister_device(g_kbd);
+		g_kbd = NULL;
+		return -ENOMEM;
+	}
+	if (input_register_device(g_touch)) {
+		input_free_device(g_touch);
+		g_touch = NULL;
+		input_unregister_device(g_ptr);
+		g_ptr = NULL;
+		input_unregister_device(g_kbd);
+		g_kbd = NULL;
+		return -EIO;
+	}
+
+	pr_info("vdrm: input up kbd=%px ptr=%px touch=%px\n",
+		g_kbd, g_ptr, g_touch);
 	return 0;
 }
 
 static void vdrm_input_teardown(void)
 {
+	if (g_touch) { input_unregister_device(g_touch); g_touch = NULL; }
 	if (g_ptr) { input_unregister_device(g_ptr); g_ptr = NULL; }
 	if (g_kbd) { input_unregister_device(g_kbd); g_kbd = NULL; }
 	pr_info("vdrm: input down\n");

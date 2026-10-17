@@ -310,6 +310,23 @@ struct vdrm_set_mode_req {
 };
 #define VDRM_IOCTL_SET_MODE    VDRM_IOC(1, 'V', 0x08, sizeof(struct vdrm_set_mode_req))
 
+/* 直接触摸（必须与内核 struct vdrm_touch_frame 逐字节一致）。
+ * 每帧发送当前所有活动触点；内核负责自动 lift、BTN_TOUCH 和唯一 SYN。*/
+#define VDRM_TOUCH_MAX        10
+#define VDRM_TOUCH_COORD_MAX  4095
+struct vdrm_touch_point {
+    int32_t slot;
+    int32_t tracking;
+    int32_t x, y;
+    int32_t pressure;
+};
+struct vdrm_touch_frame {
+    uint32_t count;
+    uint32_t flags;
+    struct vdrm_touch_point points[VDRM_TOUCH_MAX];
+};
+#define VDRM_IOCTL_TOUCH       VDRM_IOC(1, 'V', 0x09, sizeof(struct vdrm_touch_frame))
+
 /* ---- shared memory layout (must match KPM struct vdr2_frame_info) ---- */
 struct vdr2_frame_info {
     uint32_t slot;       /* buffer pool slot index to display */
@@ -1088,6 +1105,49 @@ static void in_scroll(int axis, float v)
     }
 }
 
+/* ---- 直接触摸：窗口坐标 → mode 像素 → 0..4095 归一化 ----
+ * 和 sc_set_geometry 的 letterbox 用同一套公式；黑边区域的触点直接丢弃。
+ * 这些变量只在 Java UI 线程更新/读取（nativeStart / onTouchEvent）。*/
+static int g_touch_mw, g_touch_mh;   /* 当前 mode */
+static int g_touch_ww, g_touch_wh;   /* 当前窗口 */
+
+static void touch_update_geometry(int mw, int mh, int ww, int wh)
+{
+    g_touch_mw = mw;
+    g_touch_mh = mh;
+    g_touch_ww = ww;
+    g_touch_wh = wh;
+}
+
+static int touch_map_xy(int wx, int wy, int *ox, int *oy)
+{
+    int mw = g_touch_mw, mh = g_touch_mh, ww = g_touch_ww, wh = g_touch_wh;
+    double s, s2;
+    int dw, dh, dx, dy;
+
+    if (mw <= 0 || mh <= 0 || ww <= 0 || wh <= 0)
+        return -1;
+    s = (double)ww / (double)mw;
+    s2 = (double)wh / (double)mh;
+    if (s2 < s) s = s2;
+    if (s <= 0.0) return -1;
+    dw = (int)((double)mw * s + 0.5);
+    dh = (int)((double)mh * s + 0.5);
+    dx = (ww - dw) / 2;
+    dy = (wh - dh) / 2;
+    if (wx < dx || wx >= dx + dw || wy < dy || wy >= dy + dh)
+        return -1;   /* 黑边 */
+    *ox = (int)(((double)(wx - dx) / s) * VDRM_TOUCH_COORD_MAX /
+                (double)(mw > 1 ? mw - 1 : 1) + 0.5);
+    *oy = (int)(((double)(wy - dy) / s) * VDRM_TOUCH_COORD_MAX /
+                (double)(mh > 1 ? mh - 1 : 1) + 0.5);
+    if (*ox < 0) *ox = 0;
+    if (*ox > VDRM_TOUCH_COORD_MAX) *ox = VDRM_TOUCH_COORD_MAX;
+    if (*oy < 0) *oy = 0;
+    if (*oy > VDRM_TOUCH_COORD_MAX) *oy = VDRM_TOUCH_COORD_MAX;
+    return 0;
+}
+
 /* ======================== JNI (static: event helpers) ========================
  * 输入走内核注入（见上面的 in_key / in_motion / in_btn / in_scroll）。
  */
@@ -1122,6 +1182,80 @@ Java_com_vdrm_consumer_Native_nativeSendScroll(JNIEnv *env, jclass clazz, jint a
     (void)env; (void)clazz;
     in_scroll((int)axis, (float)val);
     return 0;
+}
+
+/* 直接触摸：Java 每帧把当前活动触点打包传进来（空 count = 全部抬起）。
+ * ids/xs/ys/ps 长度一致；ids 是 pointerId，作为 slot/tracking 的稳定身份。*/
+JNIEXPORT jint JNICALL
+Java_com_vdrm_consumer_Native_nativeSendTouch(JNIEnv *env, jclass clazz,
+                                              jint count, jintArray jids,
+                                              jfloatArray jxs, jfloatArray jys,
+                                              jfloatArray jps)
+{
+    struct vdrm_touch_frame f;
+    jint *ids = NULL;
+    jfloat *xs = NULL, *ys = NULL, *ps = NULL;
+    int i, n = (int)count;
+    int ret = 0;
+
+    (void)clazz;
+    if (n < 0) n = 0;
+    if (n > VDRM_TOUCH_MAX) n = VDRM_TOUCH_MAX;
+
+    memset(&f, 0, sizeof(f));
+    if (n > 0) {
+        jsize li = (*env)->GetArrayLength(env, jids);
+        jsize lx = (*env)->GetArrayLength(env, jxs);
+        jsize ly = (*env)->GetArrayLength(env, jys);
+        jsize lp = (*env)->GetArrayLength(env, jps);
+
+        if (n > li) n = (int)li;
+        if (n > lx) n = (int)lx;
+        if (n > ly) n = (int)ly;
+        if (n > lp) n = (int)lp;
+        if (n > 0) {
+            ids = (*env)->GetIntArrayElements(env, jids, NULL);
+            xs  = (*env)->GetFloatArrayElements(env, jxs, NULL);
+            ys  = (*env)->GetFloatArrayElements(env, jys, NULL);
+            ps  = (*env)->GetFloatArrayElements(env, jps, NULL);
+            if (!ids || !xs || !ys || !ps) {
+                ret = -1;
+                goto out;
+            }
+        }
+    }
+
+    for (i = 0; i < n; i++) {
+        int mx, my, pr;
+
+        if (touch_map_xy((int)(xs[i] + 0.5f), (int)(ys[i] + 0.5f), &mx, &my) < 0)
+            continue;   /* 落在黑边上 */
+        f.points[f.count].slot     = (int32_t)(ids[i] % VDRM_TOUCH_MAX);
+        f.points[f.count].tracking = (int32_t)ids[i];
+        f.points[f.count].x        = mx;
+        f.points[f.count].y        = my;
+        pr = (int)(ps[i] * 255.0f + 0.5f);
+        if (pr < 0) pr = 0;
+        if (pr > 255) pr = 255;
+        f.points[f.count].pressure = pr;
+        f.count++;
+    }
+
+    if (g_vdrm_fd < 0 && vdrm_open_lazy() < 0) {
+        ret = -1;
+        goto out;
+    }
+    if (ioctl(g_vdrm_fd, VDRM_IOCTL_TOUCH, &f) < 0) {
+        LOGW("touch: ioctl err=%d", errno);
+        ret = -1;
+    }
+
+out:
+    if (ids) (*env)->ReleaseIntArrayElements(env, jids, ids, JNI_ABORT);
+    if (xs)  (*env)->ReleaseFloatArrayElements(env, jxs, xs, JNI_ABORT);
+    if (ys)  (*env)->ReleaseFloatArrayElements(env, jys, ys, JNI_ABORT);
+    if (ps)  (*env)->ReleaseFloatArrayElements(env, jps, ps, JNI_ABORT);
+    return ret;
 }
 
 /* ======================== JNI (instance: lifecycle) ======================== */
@@ -1228,6 +1362,7 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
         c->screen_w = ANativeWindow_getWidth(c->win);
         c->screen_h = ANativeWindow_getHeight(c->win);
         sc_geometry(c->mode_w, c->mode_h, c->screen_w, c->screen_h);
+        touch_update_geometry(c->mode_w, c->mode_h, c->screen_w, c->screen_h);
         pthread_mutex_unlock(&g_geometry_lock);
         return;
     }
@@ -1320,6 +1455,8 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
             c->mode_h = c->screen_h;
             LOGW("GET_INFO failed, fallback window %dx%d", c->mode_w, c->mode_h);
         }
+        /* 触摸映射用同一套 mode/窗口几何 */
+        touch_update_geometry(c->mode_w, c->mode_h, c->screen_w, c->screen_h);
     }
 
     /* A cached AHB may already have been returned; wait for a fresh frame. */
