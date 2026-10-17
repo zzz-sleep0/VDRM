@@ -303,6 +303,13 @@ struct vdrm_pool_list {
 };
 #define VDRM_IOCTL_GET_POOL    VDRM_IOC(3, 'V', 0x07, sizeof(struct vdrm_pool_list))
 
+/* 运行时切换输出尺寸。内核先挂 pending，等 mkpool 注册够新尺寸缓冲才
+ * commit + hotplug；GET_INFO 在 pending 期间已经返回新尺寸。*/
+struct vdrm_set_mode_req {
+    uint32_t width, height, flags;
+};
+#define VDRM_IOCTL_SET_MODE    VDRM_IOC(1, 'V', 0x08, sizeof(struct vdrm_set_mode_req))
+
 /* ---- shared memory layout (must match KPM struct vdr2_frame_info) ---- */
 struct vdr2_frame_info {
     uint32_t slot;       /* buffer pool slot index to display */
@@ -409,6 +416,22 @@ static int vdrm_get_info(struct vdrm_info *info)
         return -1;
     if (ioctl(g_vdrm_fd, VDRM_IOCTL_GET_INFO, info) < 0) {
         LOGE("GET_INFO failed err=%d", errno);
+        return -1;
+    }
+    return 0;
+}
+
+static int vdrm_set_mode(int w, int h)
+{
+    struct vdrm_set_mode_req req;
+
+    if (g_vdrm_fd < 0)
+        return -1;
+    memset(&req, 0, sizeof(req));
+    req.width  = (uint32_t)w;
+    req.height = (uint32_t)h;
+    if (ioctl(g_vdrm_fd, VDRM_IOCTL_SET_MODE, &req) < 0) {
+        LOGW("SET_MODE %dx%d failed err=%d", w, h, errno);
         return -1;
     }
     return 0;
@@ -694,6 +717,16 @@ static int forge_pool(struct consumer *c)
     for (i = 0; i < n && i < VDR2_BUFS; i++) {
         if (lst.items[i].fd < 0)
             continue;
+        /* mode 切换过渡期：池里可能还留着旧尺寸的批次。只 forge 当前
+         * c->mode_* 的条目，否则 render loop 会把旧 id 当新帧、
+         * 卡在 "unknown frame slot" 上。*/
+        if (c->mode_w > 0 && c->mode_h > 0 &&
+            ((int)lst.items[i].width != c->mode_w ||
+             (int)lst.items[i].height != c->mode_h)) {
+            close(lst.items[i].fd);
+            if (lst.items[i].fd1 >= 0) close(lst.items[i].fd1);
+            continue;
+        }
         /* 中继重建：用 KPM 转发的【原始 fd0/fd1/ints】，不做任何伪造 */
         AHardwareBuffer *ahb = vdrm_ahb_rebuild(lst.items[i].fd,
                                                 lst.items[i].fd1,
@@ -1041,7 +1074,10 @@ static void in_scroll(int axis, float v)
     int idx = axis ? 1 : 0;
     uint16_t rel = axis ? IN_REL_HWHEEL : IN_REL_WHEEL;
 
-    g_in_sc[idx] += v;
+    /* 自然滚动（内容跟手）：Java 侧按手指位移方向发值，而 evdev 的
+     * REL_WHEEL/REL_HWHEEL 正方向与手指方向相反（+1 = 滚轮上/右滚），
+     * 所以这里统一取反再折算档位 —— 横向、纵向都翻，方向才是对的。*/
+    g_in_sc[idx] -= v;
     while (g_in_sc[idx] >= IN_SCROLL_PX_PER_NOTCH) {
         g_in_sc[idx] -= IN_SCROLL_PX_PER_NOTCH;
         in_emit(IN_EV_REL, rel, 1);
@@ -1151,7 +1187,7 @@ Java_com_vdrm_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong han
  * 不再往 /data/wayland 拷第二份（那是守护进程时代留下的路径，已退役）。*/
 #define VDRM_MKPOOL "/data/adb/modules/vdrm-lkm/vdrm_mkpool"
 
-static void ensure_pool_spawn(void)
+static void ensure_pool_spawn(int force)
 {
     struct vdrm_pool_list lst;
     int n, usable = 0, i;
@@ -1160,10 +1196,12 @@ static void ensure_pool_spawn(void)
     n = vdrm_get_pool(&lst);
     for (i = 0; i < n; i++)
         if (lst.items[i].fd >= 0) usable++;
-    if (usable > 0)
+    if (!force && usable > 0)
         return;   /* 有可用的真池（带原始 fd）就不管 */
-    /* 池空，或只剩 HEAP 回退登记的“无 fd”槽：都要重建（mkpool 会先清池）*/
-    LOGI("ensure_pool: 池不可用(n=%d usable=%d) -> 拉起 mkpool", n, usable);
+    /* 池空，或只剩 HEAP 回退登记的“无 fd”槽：都要重建（mkpool 会先清池）。
+     * force=1：mode 变了，旧池尺寸不对，必须重建。*/
+    LOGI("ensure_pool: %s(n=%d usable=%d) -> 拉起 mkpool",
+         force ? "强制重建" : "池不可用", n, usable);
     pid = fork();
     if (pid == 0) {
         execl("/system/bin/su", "su", "-c", VDRM_MKPOOL, (char *)NULL);
@@ -1243,6 +1281,25 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
 
     c->screen_w = ANativeWindow_getWidth(c->win);
     c->screen_h = ANativeWindow_getHeight(c->win);
+
+    /* 让虚拟输出跟随窗口尺寸：App 是唯一 setter。SET_MODE 只挂 pending，
+     * 真正的 commit + hotplug 由内核在 mkpool 注册够新尺寸缓冲后做。*/
+    int mode_change_requested = 0;
+    {
+        struct vdrm_info cur;
+        int want_w = c->screen_w, want_h = c->screen_h;
+
+        if (want_w >= 16 && want_h >= 16 && want_w <= 4096 && want_h <= 4096 &&
+            vdrm_get_info(&cur) == 0 &&
+            ((int)cur.width != want_w || (int)cur.height != want_h)) {
+            if (vdrm_set_mode(want_w, want_h) == 0) {
+                mode_change_requested = 1;
+                LOGI("SET_MODE -> %dx%d (was %ux%u)",
+                     want_w, want_h, cur.width, cur.height);
+            }
+        }
+    }
+
     /* 几何从 KPM 来（App 只跟随）；取不到就退回窗口尺寸 */
     {
         struct vdrm_info info;
@@ -1312,8 +1369,10 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
      * 由内核/ueventd 管理（注册时建、注销时删）。容器直接按节点绑定即可，
      * 不再需要 App 搬运 —— 也就不会留下悬空节点。*/
 
-    if (!same_surface || c->buf_count <= 0) {
-        ensure_pool_spawn();          /* 池空就先拉起 mkpool（异步，不等）*/
+    if (!same_surface || c->buf_count <= 0 || mode_change_requested) {
+        /* mode 变了必须强制重建：旧池的尺寸不对，mkpool 会按 GET_INFO
+         * 返回的新尺寸造一批（它自己先清池）。异步，不等。*/
+        ensure_pool_spawn(mode_change_requested);
         free_buffers(c);
         if (forge_pool(c) < 0)
             LOGE("forge_pool 暂不可用（池未就绪？）— 渲染循环会自动重试");

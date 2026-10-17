@@ -42,6 +42,7 @@
 #include <drm/drm_mode_config.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_probe_helper.h>   /* drm_kms_helper_hotplug_event */
 #include <drm/drm_vblank.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_simple_kms_helper.h>
@@ -144,6 +145,16 @@ struct vdrm_handle_req {
 #define VDRM_IOCTL_UNREGISTER \
 	VDRM_IOC(1, 'V', 0x03, sizeof(struct vdrm_handle_req))
 
+/* 运行时切换输出尺寸。GET_INFO 在 pending 期间返回【新】尺寸，让 mkpool/App
+ * 按新尺寸造缓冲；连接器的 mode 列表要等 commit 才变（见 REGISTER）。*/
+struct vdrm_set_mode_req {
+	u32 width;
+	u32 height;
+	u32 flags;      /* reserved, must be 0 */
+};
+#define VDRM_IOCTL_SET_MODE \
+	VDRM_IOC(1, 'V', 0x08, sizeof(struct vdrm_set_mode_req))
+
 /* 注入一个输入事件。设备由驱动自己注册（见文件后部），所以这里只是
  * "把事件塞进内核 input 子系统"，不需要任何用户态守护进程。 */
 struct vdrm_input_event {
@@ -225,8 +236,107 @@ static int                 g_misc_registered;
  * 合成器开卡时 dumb_create 会拿到 drm_file，存下来备用。*/
 static struct drm_file    *g_drm_file;
 
-/* 固定输出几何（唯一 connector 的 preferred 1920x1080 XRGB8888） */
+/* 输出几何（唯一 connector 的 preferred mode，XRGB8888）。
+ *
+ * 默认 1920x1080；加载时可以用 `insmod vdrm.ko mode=2376x1080` 覆盖。
+ * 改尺寸不用重编模块，但仍然要重载：池、mkpool、App 的 AHB 都从
+ * GET_INFO 拿尺寸，跟着这条 mode 走；连接器只有这一条 preferred 模式。*/
 static u32 g_mode_w = 1920, g_mode_h = 1080, g_mode_pitch = 1920 * 4;
+static char *g_mode_param;
+module_param_named(mode, g_mode_param, charp, 0444);
+MODULE_PARM_DESC(mode, "Virtual output mode WxH (default 1920x1080)");
+
+/* 解析 module_param mode。范围与 mode_config 的 max 一致（4096），
+ * 下限取 16 —— 再小 CVT 的 porch 都放不下。 */
+static int vdrm_parse_mode_param(void)
+{
+	unsigned int w, h;
+	char tail;
+
+	if (!g_mode_param || !*g_mode_param)
+		return 0;
+
+	/* 多一个字符就说明不是严格的 WxH（例如 1920x1080@60 会被拒绝）*/
+	if (sscanf(g_mode_param, "%ux%u%c", &w, &h, &tail) != 2) {
+		pr_err("vdrm: bad mode '%s' (expect WxH)\n", g_mode_param);
+		return -EINVAL;
+	}
+	if (w < 16 || h < 16 || w > 4096 || h > 4096) {
+		pr_err("vdrm: mode %ux%u out of range (16..4096)\n", w, h);
+		return -ERANGE;
+	}
+
+	g_mode_w     = w;
+	g_mode_h     = h;
+	g_mode_pitch = ALIGN(w * 4, 64);
+	pr_info("vdrm: mode param -> %ux%u pitch=%u\n",
+		g_mode_w, g_mode_h, g_mode_pitch);
+	return 0;
+}
+
+/* ---- 运行时 mode 切换（SET_MODE）----
+ * 两阶段：SET_MODE 只挂 pending；等池里出现 >= N 块【新尺寸】缓冲（REGISTER）
+ * 才 commit 并 hotplug。这样 hotplug 一定发生在缓冲就绪之后，不会重演
+ * “池没准备好 → dumb_create 回退 heap → 黑屏”。
+ * 之所以不能立刻改 g_mode_*：合成器可能随时 probe，看到新 mode 但没有
+ * 新尺寸缓冲；所以 GET_INFO 报 pending、连接器报 committed。*/
+#define VDRM_MODE_SWITCH_MIN_BUFS 2
+static u32 g_mode_pending_w, g_mode_pending_h, g_mode_pending_pitch;
+static int g_mode_pending;
+static int g_mode_pending_hits;
+
+static int vdrm_mode_commit(void)
+{
+	if (!g_mode_pending)
+		return 0;
+
+	g_mode_w = g_mode_pending_w;
+	g_mode_h = g_mode_pending_h;
+	g_mode_pitch = g_mode_pending_pitch;
+	g_mode_pending = 0;
+	g_mode_pending_hits = 0;
+
+	pr_info("vdrm: mode commit -> %ux%u pitch=%u (hotplug)\n",
+		g_mode_w, g_mode_h, g_mode_pitch);
+	if (g_registered && g_dev)
+		drm_kms_helper_hotplug_event(g_dev);
+	return 0;
+}
+
+static int vdrm_set_mode(u32 w, u32 h)
+{
+	int i, have = 0;
+
+	if (w < 16 || h < 16 || w > 4096 || h > 4096)
+		return -ERANGE;
+
+	if (w == g_mode_w && h == g_mode_h) {
+		if (g_mode_pending) {
+			pr_info("vdrm: SET_MODE %ux%u cancels pending\n", w, h);
+			g_mode_pending = 0;
+			g_mode_pending_hits = 0;
+		}
+		return 0;
+	}
+
+	mutex_lock(&g_pool_lock);
+	g_mode_pending_w = w;
+	g_mode_pending_h = h;
+	g_mode_pending_pitch = ALIGN(w * 4, 64);
+	g_mode_pending = 1;
+	g_mode_pending_hits = 0;
+	for (i = 0; i < VDRM_POOL_MAX; i++)
+		if (g_pool[i].used && g_pool[i].f0 &&
+		    g_pool[i].width == w && g_pool[i].height == h)
+			have++;
+	mutex_unlock(&g_pool_lock);
+
+	pr_info("vdrm: SET_MODE pending %ux%u (pool already has %d matching)\n",
+		w, h, have);
+	if (have >= VDRM_MODE_SWITCH_MIN_BUFS)
+		vdrm_mode_commit();
+	return 0;
+}
 
 /* ---- M5: 帧就绪通知队列（App 用 read/poll 取）---- */
 #define VDRM_FRAME_QMAX 16
@@ -642,10 +752,12 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		for (i = 0; i < sizeof(info) / sizeof(u32); i++)
 			((volatile u32 *)&info)[i] = 0;
 		info.abi_version   = VDRM_ABI_VERSION;
-		info.width         = g_mode_w;
-		info.height        = g_mode_h;
+		/* pending 期间报【新】尺寸：mkpool/App 据此造下一批缓冲。
+		 * 连接器仍然报 committed（见 vdrm_conn_get_modes）。*/
+		info.width         = g_mode_pending ? g_mode_pending_w : g_mode_w;
+		info.height        = g_mode_pending ? g_mode_pending_h : g_mode_h;
 		info.format        = VDRM_FMT_XRGB8888;
-		info.pitch         = g_mode_pitch;
+		info.pitch         = g_mode_pending ? g_mode_pending_pitch : g_mode_pitch;
 		info.pool_capacity = VDRM_POOL_MAX;
 		pr_info("vdrm: GET_INFO sizeof=%d abi=%u %ux%u fmt=%08x pitch=%u cap=%u arg=%px\n",
 			(int)sizeof(struct vdrm_info), info.abi_version, info.width,
@@ -805,6 +917,25 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			vdrm_gem_put(obj);
 			return -EFAULT;
 		}
+
+		/* mode 切换：新尺寸缓冲到货才计数。够 VDRM_MODE_SWITCH_MIN_BUFS
+		 * 块才 commit + hotplug —— 保证合成器重新 probe 时池里已经有货。*/
+		if (g_mode_pending &&
+		    req.width == g_mode_pending_w && req.height == g_mode_pending_h) {
+			int do_commit = 0;
+
+			mutex_lock(&g_pool_lock);
+			if (g_mode_pending &&
+			    req.width == g_mode_pending_w &&
+			    req.height == g_mode_pending_h) {
+				g_mode_pending_hits++;
+				if (g_mode_pending_hits >= VDRM_MODE_SWITCH_MIN_BUFS)
+					do_commit = 1;
+			}
+			mutex_unlock(&g_pool_lock);
+			if (do_commit)
+				vdrm_mode_commit();
+		}
 		return 0;
 	}
 	case VDRM_IOCTL_RETURN: {
@@ -892,6 +1023,15 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			return -EFAULT;
 		vdrm_input_inject(ie.type, ie.code, ie.value);
 		return 0;
+	}
+	case VDRM_IOCTL_SET_MODE: {
+		struct vdrm_set_mode_req req;
+
+		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
+			return -EFAULT;
+		if (req.flags)
+			return -EINVAL;
+		return vdrm_set_mode(req.width, req.height);
 	}
 	default:
 		return -ENOTTY;
@@ -1597,6 +1737,11 @@ static int vdrm_init(void)
 	int rc;
 
 	pr_info("vdrm: stage=enter\n");
+
+	/* 必须在 alloc/modecfg 之前：connector 的 get_modes、GET_INFO 都读它 */
+	rc = vdrm_parse_mode_param();
+	if (rc)
+		return rc;
 
 	pr_info("vdrm: .ko init\n");
 

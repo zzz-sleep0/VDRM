@@ -47,6 +47,7 @@ public final class VirtualTouchpad {
     private float smoothedDx, smoothedDy;
     private float accumX, accumY;       /* 平滑后的累积（阈值 0.1 才放行）*/
     private float moveAccX, moveAccY;   /* 加速后再累积，避免 (int) 丢精度 */
+    private float scrollAccX, scrollAccY;   /* 滚动的亚像素累积（截断前累加）*/
     private boolean smoothInit;
 
     VirtualTouchpad(Context context) {
@@ -125,11 +126,26 @@ public final class VirtualTouchpad {
                 float ady = ((y0 - lastY) + (y1 - lastY2)) / 2f;
                 if (Math.abs(adx) > 1f || Math.abs(ady) > 1f) {
                     twoTapCandidate = false;
-                    /* 自然方向：手指上滑 → 内容下滑 */
-                    if (Math.abs(ady) > Math.abs(adx) * 0.5f)
-                        Native.nativeSendScroll(0, -(int) (ady * SCROLL_SPEED));
-                    if (Math.abs(adx) > Math.abs(ady) * 0.5f)
-                        Native.nativeSendScroll(1,  (int) (adx * SCROLL_SPEED));
+                    /* 自然方向：手指上滑 → 内容下滑。
+                     * ★必须先累加再截断：每帧位移 × 0.5 常常不足 1（慢滑时
+                     * 1~2px 的步长整段落在死带），直接 (int) 就每个事件都归零。
+                     * 累积器保留小数部分，过 ±1 才发，慢滑才不丢。*/
+                    if (Math.abs(ady) > Math.abs(adx) * 0.5f) {
+                        scrollAccY -= ady * SCROLL_SPEED;
+                        int sy = (int) scrollAccY;
+                        if (sy != 0) {
+                            scrollAccY -= sy;
+                            Native.nativeSendScroll(0, sy);
+                        }
+                    }
+                    if (Math.abs(adx) > Math.abs(ady) * 0.5f) {
+                        scrollAccX += adx * SCROLL_SPEED;
+                        int sx = (int) scrollAccX;
+                        if (sx != 0) {
+                            scrollAccX -= sx;
+                            Native.nativeSendScroll(1, sx);
+                        }
+                    }
                     lastX = x0; lastY = y0;
                     lastX2 = x1; lastY2 = y1;
                 }
@@ -189,6 +205,7 @@ public final class VirtualTouchpad {
         smoothedDx = smoothedDy = 0f;
         accumX = accumY = 0f;
         moveAccX = moveAccY = 0f;
+        scrollAccX = scrollAccY = 0f;
         smoothInit = false;
     }
 
