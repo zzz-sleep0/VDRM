@@ -68,30 +68,15 @@ if [ -e /sys/module/vdrm/parameters/flip_done_immediate ]; then
     echo 0 > /sys/module/vdrm/parameters/flip_done_immediate
 fi
 
-# 2) /dev/vdrm 只放给 VDRM App（DAC + SELinux 标签）。
+# 2) /dev/vdrm：gpu_device 标签 + 0666。
 #
-#    以前是 666，任何 App 都能打开它 —— 既能向容器注入键鼠/触摸，也能用
-#    GET_POOL 把池缓冲的 dma-buf fd 装进自己进程。现在 chown 到 App 的
-#    uid 并保持 0600；mkpool 以 root 运行，不受影响。
-#
-#    UID 查询失败时保持 600 root-only（App 打不开，但绝不会误放行）。
-#    App 卸载重装若 uid 变了，重刷模块或重启一次即可。
+#    不做 chown：0666 让第一次安装/重装换 UID 都能直接 open，不需要查 UID、不需要
+#    重启。SELinux 边界是 gpu_device —— 有该权限的域能打开，没有的域打不开；
+#    不要求“只有 VDRM App 能开”。mkpool 以 root 运行，不受影响。
 if [ -e /dev/vdrm ]; then
-    APP_UID=$(cmd package list packages -U 2>/dev/null \
-              | sed -n 's/.*package:com\.vdrm\.consumer uid:\([0-9][0-9]*\).*/\1/p' \
-              | head -n1)
-    [ -z "$APP_UID" ] && APP_UID=$(stat -c '%u' /data/user/0/com.vdrm.consumer 2>/dev/null)
-    [ -z "$APP_UID" ] && APP_UID=$(stat -c '%u' /data/data/com.vdrm.consumer 2>/dev/null)
-
-    if [ -n "$APP_UID" ]; then
-        chown "$APP_UID:$APP_UID" /dev/vdrm
-        chmod 600 /dev/vdrm
-        log -t vdrm "vdrm perms: owner=$APP_UID mode=600"
-    else
-        chmod 600 /dev/vdrm
-        log -t vdrm "vdrm perms: app uid not found, root-only"
-    fi
+    chmod 666 /dev/vdrm
     chcon u:object_r:gpu_device:s0 /dev/vdrm
+    log -t vdrm "vdrm perms: 0666 gpu_device"
 fi
 
 # 3) 建池。mkpool 就在模块目录里，直接跑它 —— 不再往别处拷一份。

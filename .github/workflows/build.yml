@@ -1,7 +1,7 @@
 name: Build APK
 
 on:
-  push:
+  workflow_call:
   pull_request:
     branches: [ main ]
     paths:
@@ -14,6 +14,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 固定 debug 签名：AGP 首次会生成 ~/.android/debug.keystore；用 cache 把它
+      # 跨 run 留住，周与周之间的 APK 才能互相覆盖安装（cache 被驱逐才会换 key）。
+      - name: Cache debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: vdrm-debug-keystore-v1
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -40,10 +48,10 @@ jobs:
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
       - name: Build
-        run: gradle assembleRelease --no-daemon
+        run: gradle assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: vdrm-apk
-          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          path: app/build/outputs/apk/debug/app-debug.apk

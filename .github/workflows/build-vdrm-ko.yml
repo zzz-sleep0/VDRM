@@ -7,7 +7,7 @@ name: Build vdrm.ko (DDK)
 # 用 working-directory 指到 vdrm-ko-ddk/。
 
 on:
-  push:
+  workflow_call:
   workflow_dispatch:
 
 jobs:

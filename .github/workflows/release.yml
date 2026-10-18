@@ -1,0 +1,62 @@
+name: Weekly release
+
+# 每次 push 都跑；同一 ISO 周内所有 commit 覆盖同一个 release，
+# 跨周自动新建。资产固定三个：模块 zip、vdrm_gbm.so、debug APK。
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ko:
+    uses: ./.github/workflows/build-vdrm-ko.yml
+
+  apk:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: [ko, apk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download module zip
+        uses: actions/download-artifact@v4
+        with:
+          name: vdrm-lkm-module
+          path: assets
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: vdrm-apk
+          path: assets
+
+      - name: Collect assets
+        run: |
+          cp vdrm-gbm/vdrm_gbm.so assets/
+          cd assets
+          # 资产名固定，周内覆盖、跨周也能直接对比
+          mv app-debug.apk vdrm-debug.apk
+          sha256sum * > SHA256SUMS.txt
+          ls -l
+
+      - name: Publish weekly release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="weekly-$(date -u +%G-W%V)"
+          TITLE="Weekly ${TAG#weekly-}"
+          NOTES="Commit: ${{ github.sha }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Tested: android14-6.1 (OPlus), 120Hz virtual mode
+          Assets: vdrm-lkm module zip, vdrm_gbm.so (aarch64 glibc), debug APK"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" assets/* --title "$TITLE" --notes "$NOTES"
+          fi
