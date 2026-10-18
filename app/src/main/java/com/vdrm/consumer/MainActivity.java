@@ -32,6 +32,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private PowerManager.WakeLock wakeLock;
     private long lastBackTime;
 
+    /* 复用触摸数组，避免每个 MotionEvent 分配 4 个数组（120Hz 下很可观）。*/
+    private static final int TOUCH_MAX = 10;   /* = VDRM_TOUCH_MAX */
+    private final int[] touchIds = new int[TOUCH_MAX];
+    private final float[] touchXs = new float[TOUCH_MAX];
+    private final float[] touchYs = new float[TOUCH_MAX];
+    private final float[] touchPs = new float[TOUCH_MAX];
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -139,7 +146,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     /** 直接触摸：把当前活动触点打包发给内核 vdrm-touch（ABS_MT）。
      *  每帧一条 ioctl；内核负责自动 lift、BTN_TOUCH 和唯一 SYN。*/
-    private static boolean sendTouchFrame(MotionEvent event) {
+    private boolean sendTouchFrame(MotionEvent event) {
         int action = event.getActionMasked();
         int skip = (action == MotionEvent.ACTION_POINTER_UP ||
                     action == MotionEvent.ACTION_UP)
@@ -151,21 +158,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             for (int i = 0; i < event.getPointerCount(); i++)
                 if (i != skip) n++;
         }
+        if (n > TOUCH_MAX) n = TOUCH_MAX;
 
-        int[] ids = new int[n];
-        float[] xs = new float[n];
-        float[] ys = new float[n];
-        float[] ps = new float[n];
         int k = 0;
         for (int i = 0; i < event.getPointerCount() && k < n; i++) {
             if (i == skip) continue;
-            ids[k] = event.getPointerId(i);
-            xs[k] = event.getX(i);
-            ys[k] = event.getY(i);
-            ps[k] = event.getPressure(i);
+            touchIds[k] = event.getPointerId(i);
+            touchXs[k] = event.getX(i);
+            touchYs[k] = event.getY(i);
+            touchPs[k] = event.getPressure(i);
             k++;
         }
-        Native.nativeSendTouch(n, ids, xs, ys, ps);
+        Native.nativeSendTouch(n, touchIds, touchXs, touchYs, touchPs);
         return true;
     }
 

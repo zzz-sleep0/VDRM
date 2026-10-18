@@ -25,7 +25,7 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>	/* input_mt_init_slots / INPUT_MT_DIRECT */
 #include <linux/dma-buf.h>
-#include <linux/dma-heap.h>
+#include <linux/bitmap.h>
 #include <linux/mm.h>
 #include <linux/list.h>
 #include <linux/fs.h>
@@ -104,6 +104,14 @@ static volatile u64   g_vblank_period_ns = 16666666ULL; /* 60Hz 兜底（pipe en
  * 用来分辨“合成器跟不上”是 vblank 定拍造成的，还是它自己渲染慢。*/
 #define VDRM_VBLANK_HZ_FORCE 0
 
+/* 诊断旋钮：为 1 时 pipe_update 直接 send_vblank_event（flip-done 立即完成），
+ * 不 arm 到下一个 hrtimer vblank。虚拟显示没有真实扫描，这是更简单的等价路径；
+ * 默认 0 保持原有 arm 行为，方便同一个会话内 A/B。*/
+static bool g_flip_done_immediate = true;
+module_param_named(flip_done_immediate, g_flip_done_immediate, bool, 0644);
+MODULE_PARM_DESC(flip_done_immediate,
+		 "Complete page-flip events immediately instead of at the next virtual vblank");
+
 /* ============= App <-> 模块 的契约（ioctl 结构体，两边必须逐字节一致）============= */
 
 #define VDRM_ABI_VERSION 1
@@ -146,16 +154,6 @@ struct vdrm_handle_req {
 #define VDRM_IOCTL_UNREGISTER \
 	VDRM_IOC(1, 'V', 0x03, sizeof(struct vdrm_handle_req))
 
-/* 运行时切换输出尺寸。GET_INFO 在 pending 期间返回【新】尺寸，让 mkpool/App
- * 按新尺寸造缓冲；连接器的 mode 列表要等 commit 才变（见 REGISTER）。*/
-struct vdrm_set_mode_req {
-	u32 width;
-	u32 height;
-	u32 flags;      /* reserved, must be 0 */
-};
-#define VDRM_IOCTL_SET_MODE \
-	VDRM_IOC(1, 'V', 0x08, sizeof(struct vdrm_set_mode_req))
-
 /* 注入一个输入事件。设备由驱动自己注册（见文件后部），所以这里只是
  * "把事件塞进内核 input 子系统"，不需要任何用户态守护进程。 */
 struct vdrm_input_event {
@@ -164,6 +162,17 @@ struct vdrm_input_event {
 	s32 value;
 };
 #define VDRM_IOCTL_INPUT       VDRM_IOC(1, 'V', 0x06, sizeof(struct vdrm_input_event))
+
+/* 批量注入：一次 ioctl 发多个键/相对位移，内核每个设备只补一个 SYN。
+ * 指针移动的 X/Y、滚轮连发、修饰键组合都能合并，减少 syscall。*/
+#define VDRM_INPUT_BATCH_MAX 16
+struct vdrm_input_batch {
+	u32 count;
+	u32 flags;     /* reserved, must be 0 */
+	struct vdrm_input_event events[VDRM_INPUT_BATCH_MAX];
+};
+#define VDRM_IOCTL_INPUT_BATCH \
+	VDRM_IOC(1, 'V', 0x0b, sizeof(struct vdrm_input_batch))
 
 /* ---- 直接触摸屏（ABS_MT）----
  * App 每帧把【当前所有活动触点】打包发过来；内核负责：
@@ -243,22 +252,19 @@ struct vdrm_pool_entry {
 	u32 ints[VDRM_MAX_INTS];
 };
 
-/* Diagnostic counters persist across pool resets; no allocation semantics change. */
-static u32 g_diag_alloc[VDRM_POOL_MAX];
-static u32 g_diag_return[VDRM_POOL_MAX];
-static u32 g_diag_return_non_displ[VDRM_POOL_MAX];
 static struct vdrm_pool_entry g_pool[VDRM_POOL_MAX];
 static struct vdrm_pool_list  g_pool_list;   /* GET_POOL 用（避免内核栈上放 512B）*/
 static int                 g_pool_next_id = 1;
-static u32                 g_disp_hits;        /* DISPL 状态下又被翻的次数（竞态计数）*/
-static u32                 g_gate_hits;        /* atomic_check 里看到“想抢非 FREE buffer”的次数 */
 static struct mutex        g_pool_lock;        /* 静态清零 = 已解锁 */
+/* 只保护池槽的 used/state/obj 等少量字段，供提交路径（不能睡眠）读取。
+ * 大分配/导入仍由 g_pool_lock 串行化。*/
+static DEFINE_SPINLOCK(g_pool_state_lock);
 static struct miscdevice   g_misc;
 static struct file_operations g_misc_fops;
 static int                 g_misc_registered;
-/* GET_POOL 必须用【真正的 drm_file】——而不是 /dev/vdrm 那个 misc file！
- * 合成器开卡时 dumb_create 会拿到 drm_file，存下来备用。*/
-static struct drm_file    *g_drm_file;
+/* /dev/vdrm 的打开计数：只有最后一个使用者关闭时，才补发输入释放、
+ * 清帧队列、把 DISPL 槽还给池。mkpool 的短暂 open/close 不会打断 App。*/
+static atomic_t            g_misc_opens = ATOMIC_INIT(0);
 
 /* 输出几何（唯一 connector 的 preferred mode，XRGB8888）。
  *
@@ -298,81 +304,16 @@ static int vdrm_parse_mode_param(void)
 	return 0;
 }
 
-/* ---- 运行时 mode 切换（SET_MODE）----
- * 两阶段：SET_MODE 只挂 pending；等池里出现 >= N 块【新尺寸】缓冲（REGISTER）
- * 才 commit 并 hotplug。这样 hotplug 一定发生在缓冲就绪之后，不会重演
- * “池没准备好 → dumb_create 回退 heap → 黑屏”。
- * 之所以不能立刻改 g_mode_*：合成器可能随时 probe，看到新 mode 但没有
- * 新尺寸缓冲；所以 GET_INFO 报 pending、连接器报 committed。*/
-#define VDRM_MODE_SWITCH_MIN_BUFS 2
-static u32 g_mode_pending_w, g_mode_pending_h, g_mode_pending_pitch;
-static int g_mode_pending;
-static int g_mode_pending_hits;
-
-static int vdrm_mode_commit(void)
-{
-	if (!g_mode_pending)
-		return 0;
-
-	g_mode_w = g_mode_pending_w;
-	g_mode_h = g_mode_pending_h;
-	g_mode_pitch = g_mode_pending_pitch;
-	g_mode_pending = 0;
-	g_mode_pending_hits = 0;
-
-	pr_info("vdrm: mode commit -> %ux%u pitch=%u (hotplug)\n",
-		g_mode_w, g_mode_h, g_mode_pitch);
-	if (g_registered && g_dev)
-		drm_kms_helper_hotplug_event(g_dev);
-	return 0;
-}
-
-static int vdrm_set_mode(u32 w, u32 h)
-{
-	int i, have = 0;
-
-	if (w < 16 || h < 16 || w > 4096 || h > 4096)
-		return -ERANGE;
-
-	if (w == g_mode_w && h == g_mode_h) {
-		if (g_mode_pending) {
-			pr_info("vdrm: SET_MODE %ux%u cancels pending\n", w, h);
-			g_mode_pending = 0;
-			g_mode_pending_hits = 0;
-		}
-		return 0;
-	}
-
-	mutex_lock(&g_pool_lock);
-	g_mode_pending_w = w;
-	g_mode_pending_h = h;
-	g_mode_pending_pitch = ALIGN(w * 4, 64);
-	g_mode_pending = 1;
-	g_mode_pending_hits = 0;
-	for (i = 0; i < VDRM_POOL_MAX; i++)
-		if (g_pool[i].used && g_pool[i].f0 &&
-		    g_pool[i].width == w && g_pool[i].height == h)
-			have++;
-	mutex_unlock(&g_pool_lock);
-
-	pr_info("vdrm: SET_MODE pending %ux%u (pool already has %d matching)\n",
-		w, h, have);
-	if (have >= VDRM_MODE_SWITCH_MIN_BUFS)
-		vdrm_mode_commit();
-	return 0;
-}
-
-/* ---- M5: 帧就绪通知队列（App 用 read/poll 取）---- */
-#define VDRM_FRAME_QMAX 16
+/* ---- 帧就绪通知：只保留最新一帧（App 本来就是 latest-wins）---- */
 struct vdrm_frame_event {
 	u32 id;
 	u32 sequence;
 	u64 timestamp_ns;
 	u64 user_data;
 };
-static struct vdrm_frame_event g_frame_q[VDRM_FRAME_QMAX];
-static int                    g_frame_head, g_frame_tail;
-static volatile u32           g_frame_seq;
+static struct vdrm_frame_event g_frame_latest;
+static bool                   g_frame_has;
+static u32                    g_frame_seq;
 static struct spinlock        g_frame_lock;   /* 静态清零 = 解锁 */
 static struct wait_queue_head g_frame_wq;
 
@@ -410,13 +351,6 @@ static int vdrm_pool_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma
 	vma->vm_private_data = NULL;
 	vma->vm_ops = NULL;
 	ret = dma_buf_mmap(obj->import_attach->dmabuf, vma, 0);
-#if 0
-	/* 【实验】原代码在这里手动放一次引用（对应 drm_gem_mmap_obj 取的引用）。
-	 * 怀疑它在高频 mmap/unmap 时释放过早 → GPU 还在用的 buffer 被回收
-	 * → kgsl "CP: AHB bus error"。暂时注释掉：宁可漏引用，不可提前释放。*/
-	if (!ret)
-		vdrm_gem_put(obj);
-#endif
 	return ret;
 }
 
@@ -424,230 +358,47 @@ static int vdrm_pool_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma
  * dumb_create：优先从池里发 App 的 gralloc buffer（伪装成 card1 原生 dumb），
  * 池里没有匹配/空闲的，回退到自持 shmem（合成器永不卡死）。
  */
-/* 按底层 dma-buf 找到池项下标（池对象是 import，不能只比指针）*/
-static int vdrm_pool_idx_by_obj(struct drm_gem_object *gobj)
-{
-	struct dma_buf *fdb = (gobj && gobj->import_attach) ?
-		gobj->import_attach->dmabuf : NULL;
-	int i;
-
-	for (i = 0; i < VDRM_POOL_MAX; i++) {
-		struct drm_gem_object *po = g_pool[i].obj;
-		struct dma_buf *pdb = (po && po->import_attach) ?
-			po->import_attach->dmabuf : NULL;
-
-		if (!g_pool[i].used)
-			continue;
-		if (po == gobj || (fdb && pdb && fdb == pdb))
-			return i;
-	}
-	return -1;
-}
-
-/* BTF 里 __drm_planes_state 只有前置声明，按实测布局（见 btf/all_types.h）本地定义 */
-struct vdrm_planes_state {
-	struct drm_plane       *ptr;
-	struct drm_plane_state *state;
-	struct drm_plane_state *old_state;
-	struct drm_plane_state *new_state;
-};
-
-/* atomic_check：先让 helper 检查，再看这次提交想用哪块池 buffer。
- * 若那块还被 SF/App 占用（非 FREE），说明合成器想改写正在显示的 buffer
- * ——正是“重播”的根源。第一步先只记录，不阻断。 */
-static int vdrm_atomic_check(struct drm_device *dev,
-			     struct drm_atomic_state *state)
-{
-	int rc, i;
-
-	rc = drm_atomic_helper_check(dev, state);
-	if (rc)
-		return rc;
-
-	if (state && state->planes) {
-		int n = dev->mode_config.num_total_plane;
-		struct vdrm_planes_state *pl =
-			(struct vdrm_planes_state *)state->planes;
-
-		for (i = 0; i < n; i++) {
-			struct drm_plane_state *ps = pl[i].new_state;
-			int idx;
-
-			if (!ps || !ps->fb || !ps->fb->obj[0])
-				continue;
-			idx = vdrm_pool_idx_by_obj(ps->fb->obj[0]);
-			if (idx >= 0) {
-				if (g_pool[idx].state == VDRM_ST_DISPL) {
-					/* 这块已上屏、App 还没 RETURN。
-					 *
-					 * 这里**绝不能等**：App 的 RETURN 挂在 Android release fence 上，
-					 * SF 只有收到更新的 buffer 才会释放旧 buffer，而下一帧由本次提交的
-					 * pipe_update 推出。也就是说，在提交路径里等它 == 等自己放行，
-					 * 只会空等到超时（实测 HZ=120 时 50×msleep(1) ≈ 420ms，
-					 * 日志里每一跳都跑满 50 次才放行），把合成器提交线程整个卡住。
-					 * pipe_update 会对同一块重新置 DISPL 并补推帧事件，语义上不需要
-					 * 在这里阻断；因此只计数、不等待。*/
-					if ((g_gate_hits++ % 30) == 0)
-						pr_info("vdrm: gate-observe id=%u hit=%u (no wait)\n",
-							g_pool[idx].id, g_gate_hits);
-				}
-			}
-		}
-	}
-	return 0;
-}
-
-/*
- * A 路线：dumb_create 的回退从“自持 shmem”改成“从 qcom,system dma-heap 分配”。
- * 为什么：qcom,system 就是 gralloc 用的那个堆（App 的 AHB 就在它上面），
- * 显示管线认；而 drm_gem_shmem 是另一种内存，App 伪造后上屏会炸。
- * 这样池天生就是模块的、内存可显示 → 合成器先起 / App 重启都不用换 buffer。
- */
-static int vdrm_heap_dumb_create(struct drm_file *file, struct drm_device *dev,
-				 struct drm_mode_create_dumb *args)
-{
-	struct dma_heap *heap;
-	struct dma_buf *buf;
-	struct drm_gem_object *obj;
-	u32 handle, pitch;
-	int i, slot = -1, rc;
-
-	pitch = (args->width * args->bpp + 7) / 8;
-	args->pitch = (pitch + 63) & ~63u;   /* 同 drm_gem_shmem_dumb_create 的 ALIGN(pitch,64) */
-	args->size  = (u64)args->pitch * args->height;
-
-	heap = dma_heap_find("qcom,system");
-	if (!heap) {
-		pr_err("vdrm: dma_heap_find(qcom,system) failed\n");
-		return -ENODEV;
-	}
-	buf = dma_heap_buffer_alloc(heap, args->size, 0x80002 /*O_CLOEXEC|O_RDWR*/, 0);
-	dma_heap_put(heap);
-	if (!buf || (unsigned long)buf >= (unsigned long)-4095) {
-		long e = (long)buf;
-		pr_err("vdrm: heap alloc %llu bytes failed (%ld)\n",
-		       (unsigned long long)args->size, e);
-		return buf ? (int)e : -ENOMEM;
-	}
-
-	/* 导入成 card1 的 GEM（GEM 自己会持 dma_buf 的引用）*/
-	obj = drm_gem_prime_import(dev, buf);
-	dma_buf_put(buf);
-	if (!obj || (unsigned long)obj >= (unsigned long)-4095) {
-		long e = (long)obj;
-		pr_err("vdrm: prime_import failed (%ld)\n", e);
-		return obj ? (int)e : -ENOMEM;
-	}
-
-	/* 用池的 funcs（修 mmap，避开 drm_gem_shmem_mmap 的 WARNING）*/
-	if (!g_pool_funcs_ready && obj->funcs) {
-		g_pool_funcs = *obj->funcs;
-		g_pool_funcs.mmap = vdrm_pool_mmap;
-		g_pool_funcs_ready = 1;
-	}
-	if (g_pool_funcs_ready)
-		obj->funcs = &g_pool_funcs;
-
-	/* 登记进池：pipe_update 才能匹配到 → App 才会收到 frame ready */
-	mutex_lock(&g_pool_lock);
-	for (i = 0; i < VDRM_POOL_MAX; i++) {
-		if (!g_pool[i].used) { slot = i; break; }
-	}
-	if (slot >= 0) {
-		memset(&g_pool[slot], 0, sizeof(g_pool[slot]));
-		g_pool[slot].obj       = obj;
-		g_pool[slot].user_data = 0;
-		g_pool[slot].id        = g_pool_next_id++;
-		g_pool[slot].width     = args->width;
-		g_pool[slot].height    = args->height;
-		g_pool[slot].format    = VDRM_FMT_XRGB8888;
-		g_pool[slot].pitch     = args->pitch;
-		g_pool[slot].state     = VDRM_ST_FREE;
-		g_pool[slot].used      = 1;
-	}
-	mutex_unlock(&g_pool_lock);
-
-	rc = drm_gem_handle_create(file, obj, &handle);
-	if (rc) {
-		if (slot >= 0) {
-			mutex_lock(&g_pool_lock);
-			memset(&g_pool[slot], 0, sizeof(g_pool[slot]));
-			mutex_unlock(&g_pool_lock);
-			vdrm_gem_put(obj);
-		}
-		pr_err("vdrm: handle_create failed rc=%d\n", rc);
-		return rc;
-	}
-	args->handle = handle;
-	pr_info("vdrm: dumb_create -> HEAP(qcom,system) %ux%u pitch=%u handle=%u pool_id=%d\n",
-		args->width, args->height, args->pitch, handle,
-		slot >= 0 ? (int)g_pool[slot].id : -1);
-	return 0;
-}
-
+/* 只从池里发缓冲；池由 mkpool 在 boot 时建好。没有匹配/空闲槽时
+ * 直接 -ENOSPC —— 不再保留第二套 heap 出身（那批 buffer 没有原始
+ * fd0/fd1，App 根本 forge 不出来，只会变成不可显示的隐藏状态）。*/
 static int vdrm_dumb_create(struct drm_file *file, struct drm_device *dev,
 			    struct drm_mode_create_dumb *args)
 {
-	int i, has_pool = 0;
+	int i;
 
-	g_drm_file = file;   /* 任何一次 dumb_create 都记下有效的 drm_file（GET_POOL 要用）*/
+	(void)dev;
+	if (args->bpp != 32)
+		return -EINVAL;
 
 	mutex_lock(&g_pool_lock);
-	for (i = 0; i < VDRM_POOL_MAX; i++)
-		if (g_pool[i].used && g_pool[i].f0) has_pool = 1;
-	if (args->bpp == 32) {
-		for (i = 0; i < VDRM_POOL_MAX; i++) {
-			struct vdrm_pool_entry *e = &g_pool[i];
-			u32 handle;
-			int rc;
+	for (i = 0; i < VDRM_POOL_MAX; i++) {
+		struct vdrm_pool_entry *e = &g_pool[i];
+		u32 handle;
+		int rc;
 
-			/* Display release is not allocation release, including PRIME aliases. */
-			if (!e->used || e->allocation_reserved || e->state != VDRM_ST_FREE)
-				continue;
-			/* 只认【App/helper REGISTER 进来的】真缓冲（有原始 f0）。
-			 * HEAP 回退登记的槽没有 f0，绝不能当池缓冲发给合成器。*/
-			if (!e->f0)
-				continue;
-			if (e->width != args->width || e->height != args->height)
-				continue;
+		if (!e->used || e->allocation_reserved || e->state != VDRM_ST_FREE)
+			continue;
+		if (!e->f0)
+			continue;
+		if (e->width != args->width || e->height != args->height)
+			continue;
 
-			{
-				u32 before = e->obj->handle_count;
-				u32 attempt = ++g_diag_alloc[i];
-				rc = drm_gem_handle_create(file, e->obj, &handle);
-				if (!rc) {
-					e->allocation_reserved = 1;
-					e->allocation_owner = file;
-				}
-				if (attempt <= 32)
-					pr_info("vdrm: DIAG_ALLOC t_ns=%llu slot=%d attempt=%u file=%px id=%u obj=%px dbuf=%px before=%u after=%u handle=%u rc=%d live_handle_candidate=%u reserved=%u\n",
-						(unsigned long long)ktime_get(), i, attempt, file,
-						e->id, e->obj,
-						e->obj->import_attach ? e->obj->import_attach->dmabuf : NULL,
-						before, e->obj->handle_count, rc ? 0 : handle, rc, before != 0,
-						e->allocation_reserved);
-			}
-			pr_info("vdrm: handle_create rc=%d handle=%u pool_id=%u\n",
-				rc, rc ? 0 : handle, e->id);
-			if (rc)
-				continue;
-			e->state     = VDRM_ST_TAKEN;
-			args->handle = handle;
-			args->pitch  = e->pitch;
-			args->size   = e->obj->size;
-			mutex_unlock(&g_pool_lock);
-			pr_info("vdrm: dumb_create -> POOL id=%u handle=%u %ux%u pitch=%u\n",
-				e->id, handle, e->width, e->height, e->pitch);
-			return 0;
-		}
+		rc = drm_gem_handle_create(file, e->obj, &handle);
+		if (rc)
+			continue;
+		e->allocation_reserved = 1;
+		e->allocation_owner = file;
+		e->state = VDRM_ST_TAKEN;
+		args->handle = handle;
+		args->pitch  = e->pitch;
+		args->size   = e->obj->size;
+		mutex_unlock(&g_pool_lock);
+		pr_debug("vdrm: dumb_create -> POOL id=%u handle=%u %ux%u pitch=%u\n",
+			e->id, handle, e->width, e->height, e->pitch);
+		return 0;
 	}
 	mutex_unlock(&g_pool_lock);
-	if (has_pool)
-		return args->bpp == 32 ? -ENOSPC : -EINVAL;
-
-	pr_info("vdrm: dumb_create -> HEAP %ux%u bpp=%u\n",
-		args->width, args->height, args->bpp);
-	return vdrm_heap_dumb_create(file, dev, args);
+	return -ENOSPC;
 }
 
 /*
@@ -666,7 +417,7 @@ static int vdrm_dumb_map_offset(struct drm_file *file, struct drm_device *dev,
 	rc = drm_gem_create_mmap_offset(obj);
 	if (!rc)
 		*offset = ((u64)obj->vma_node.vm_node.start) << 12;
-	pr_info("vdrm: dumb_map_offset handle=%u obj=%px rc=%d off=%llx ia=%px db=%px\n",
+	pr_debug("vdrm: dumb_map_offset handle=%u obj=%px rc=%d off=%llx ia=%px db=%px\n",
 		handle, obj, rc, (unsigned long long)*offset,
 		obj->import_attach, obj->dma_buf);
 
@@ -679,37 +430,34 @@ static void vdrm_frame_push(u32 id, u64 user_data)
 {
 	struct vdrm_frame_event ev;
 	unsigned long flags;
-	int next = (g_frame_head + 1) % VDRM_FRAME_QMAX;
 
-	/* pipe_update 上下文不能睡，先只入队（自旋锁）*/
-	flags = _raw_spin_lock_irqsave(&g_frame_lock.rlock);
 	ev.id           = id;
 	ev.user_data    = user_data;
-	ev.sequence     = ++g_frame_seq;
 	ev.timestamp_ns = (u64)ktime_get();
-	if (next != g_frame_tail) {
-		g_frame_q[g_frame_head] = ev;
-		g_frame_head = next;
-	}
+
+	/* pipe_update 上下文不能睡；新帧直接覆盖旧帧。*/
+	flags = _raw_spin_lock_irqsave(&g_frame_lock.rlock);
+	ev.sequence     = ++g_frame_seq;
+	g_frame_latest  = ev;
+	g_frame_has     = true;
 	_raw_spin_unlock_irqrestore(&g_frame_lock.rlock, flags);
 
-	/* 帧事件只有一条出口：/dev/vdrm 自己的 read/poll 队列 */
 	__wake_up(&g_frame_wq, 3 /* TASK_NORMAL */, 1, NULL);
 }
 
 static int vdrm_frame_pop(struct vdrm_frame_event *ev)
 {
 	unsigned long flags;
-	int rc = -1;
 
 	flags = _raw_spin_lock_irqsave(&g_frame_lock.rlock);
-	if (g_frame_tail != g_frame_head) {
-		*ev = g_frame_q[g_frame_tail];
-		g_frame_tail = (g_frame_tail + 1) % VDRM_FRAME_QMAX;
-		rc = 0;
+	if (!g_frame_has) {
+		_raw_spin_unlock_irqrestore(&g_frame_lock.rlock, flags);
+		return -1;
 	}
+	*ev = g_frame_latest;
+	g_frame_has = false;
 	_raw_spin_unlock_irqrestore(&g_frame_lock.rlock, flags);
-	return rc;
+	return 0;
 }
 
 static ssize_t vdrm_misc_read(struct file *file, char __user *buf,
@@ -738,7 +486,7 @@ static __poll_t vdrm_misc_poll(struct file *file,
 		wait->_qproc(file, &g_frame_wq, wait);
 
 	flags = _raw_spin_lock_irqsave(&g_frame_lock.rlock);
-	nonempty = (g_frame_head != g_frame_tail);
+	nonempty = g_frame_has;
 	_raw_spin_unlock_irqrestore(&g_frame_lock.rlock, flags);
 
 	if (nonempty)
@@ -746,21 +494,64 @@ static __poll_t vdrm_misc_poll(struct file *file,
 	return mask;
 }
 
-/* App 关闭 /dev/vdrm（或进程被杀）时内核回调：清空整个池 + 释放信令。
- * 这是"自愈"的关键——不依赖 App 主动 UNREGISTER，进程崩了也能复位。 */
+/* App 关闭 /dev/vdrm（或进程被杀）时内核回调。
+ *
+ * 池归模块所有，不在这里清；但最后一个使用者消失时必须做三件事，
+ * 否则下一次会话会继承脏状态：
+ *   1. 补发按键抬起 / 所有触点 lift —— 进程被强杀时容器里不会留下
+ *      “一直按着的键或手指”；
+ *   2. 清帧事件环 —— 新 App 不读上一实例的旧事件；
+ *   3. DISPL 槽回到 FREE —— 没有消费者了，没人会再替它们 RETURN。
+ * 只有最后一个 open 关闭时才做，mkpool 的短暂 open/close 不会误伤
+ * 正在工作的 App。 */
+static void vdrm_input_reset_state(void);   /* 定义见文件后部 */
+
 static int vdrm_misc_release(struct inode *inode, struct file *file)
 {
-	pr_info("vdrm: misc release (池不清 —— 池归模块，App 重启不影响)\n");
+	bool last;
 
-	/* 清帧事件环：否则新 App 会读到上一实例遗留的旧事件 */
-	g_frame_head = g_frame_tail = 0;
+	(void)inode;
+	(void)file;
+
+	last = atomic_dec_and_test(&g_misc_opens);
+	pr_info("vdrm: misc release (last=%d, pool kept)\n", last);
+	if (!last)
+		return 0;
+
+	vdrm_input_reset_state();
+
+	/* 清最新帧：否则新 App 会读到上一实例遗留的旧事件 */
+	g_frame_has = false;
 	g_frame_seq = 0;
+
+	mutex_lock(&g_pool_lock);
+	{
+		unsigned long flags;
+		int i;
+
+		spin_lock_irqsave(&g_pool_state_lock, flags);
+		for (i = 0; i < VDRM_POOL_MAX; i++) {
+			if (g_pool[i].used && g_pool[i].state == VDRM_ST_DISPL)
+				g_pool[i].state = VDRM_ST_FREE;
+		}
+		spin_unlock_irqrestore(&g_pool_state_lock, flags);
+	}
+	mutex_unlock(&g_pool_lock);
 
 	return 0;
 }
 
 static void vdrm_input_inject(u32 type, u32 code, s32 value);   /* 定义见文件后部 */
+static int vdrm_input_inject_batch(const struct vdrm_input_batch *b);
 static int vdrm_touch_inject(const struct vdrm_touch_frame *f); /* 定义见文件后部 */
+
+static int vdrm_misc_open(struct inode *inode, struct file *file)
+{
+	(void)inode;
+	(void)file;
+	atomic_inc(&g_misc_opens);
+	return 0;
+}
 
 /* /dev/vdrm ioctl */
 static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
@@ -777,14 +568,12 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		for (i = 0; i < sizeof(info) / sizeof(u32); i++)
 			((volatile u32 *)&info)[i] = 0;
 		info.abi_version   = VDRM_ABI_VERSION;
-		/* pending 期间报【新】尺寸：mkpool/App 据此造下一批缓冲。
-		 * 连接器仍然报 committed（见 vdrm_conn_get_modes）。*/
-		info.width         = g_mode_pending ? g_mode_pending_w : g_mode_w;
-		info.height        = g_mode_pending ? g_mode_pending_h : g_mode_h;
+		info.width         = g_mode_w;
+		info.height        = g_mode_h;
 		info.format        = VDRM_FMT_XRGB8888;
-		info.pitch         = g_mode_pending ? g_mode_pending_pitch : g_mode_pitch;
+		info.pitch         = g_mode_pitch;
 		info.pool_capacity = VDRM_POOL_MAX;
-		pr_info("vdrm: GET_INFO sizeof=%d abi=%u %ux%u fmt=%08x pitch=%u cap=%u arg=%px\n",
+		pr_debug("vdrm: GET_INFO sizeof=%d abi=%u %ux%u fmt=%08x pitch=%u cap=%u arg=%px\n",
 			(int)sizeof(struct vdrm_info), info.abi_version, info.width,
 			info.height, info.format, info.pitch, info.pool_capacity,
 			(void *)arg);
@@ -841,7 +630,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		}
 		g_pool_list.count = (u32)n;
 		mutex_unlock(&g_pool_lock);
-		pr_info("vdrm: GET_POOL -> %d entries\n", n);
+		pr_debug("vdrm: GET_POOL -> %d entries\n", n);
 		if (copy_to_user((void *)arg, &g_pool_list,
 				      sizeof(g_pool_list)))
 			return -EFAULT;
@@ -851,6 +640,7 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		struct vdrm_register_req req;
 		struct dma_buf *dbuf;
 		struct drm_gem_object *obj;
+		unsigned long flags;
 		int i, k, slot = -1;
 
 		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
@@ -916,7 +706,6 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		g_pool[slot].format    = req.format;
 		g_pool[slot].pitch     = req.pitch;
 		g_pool[slot].state     = VDRM_ST_FREE;
-		g_pool[slot].used      = 1;
 		/* B/A′：fget 住原始 fd0/fd1 的 file（GET_POOL 直接转发它们）*/
 		g_pool[slot].f0 = fget((unsigned int)req.fd);
 		g_pool[slot].f1 = (req.fd1 >= 0) ?
@@ -930,6 +719,10 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 				dst[k] = src[k];
 		}
 		req.id                 = g_pool[slot].id;
+		/* 所有字段就绪后再发布 used，提交路径不会看到半成品。*/
+		spin_lock_irqsave(&g_pool_state_lock, flags);
+		g_pool[slot].used      = 1;
+		spin_unlock_irqrestore(&g_pool_state_lock, flags);
 		mutex_unlock(&g_pool_lock);
 
 		pr_info("vdrm: REGISTER id=%u %ux%u pitch=%u size=%zu\n",
@@ -937,86 +730,71 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		if (copy_to_user((void *)arg, &req, sizeof(req))) {
 			/* 回传失败：把已入池的 slot 退掉 */
 			mutex_lock(&g_pool_lock);
+			spin_lock_irqsave(&g_pool_state_lock, flags);
+			g_pool[slot].used = 0;
+			spin_unlock_irqrestore(&g_pool_state_lock, flags);
 			memset(&g_pool[slot], 0, sizeof(g_pool[slot]));
 			mutex_unlock(&g_pool_lock);
 			vdrm_gem_put(obj);
 			return -EFAULT;
 		}
 
-		/* mode 切换：新尺寸缓冲到货才计数。够 VDRM_MODE_SWITCH_MIN_BUFS
-		 * 块才 commit + hotplug —— 保证合成器重新 probe 时池里已经有货。*/
-		if (g_mode_pending &&
-		    req.width == g_mode_pending_w && req.height == g_mode_pending_h) {
-			int do_commit = 0;
-
-			mutex_lock(&g_pool_lock);
-			if (g_mode_pending &&
-			    req.width == g_mode_pending_w &&
-			    req.height == g_mode_pending_h) {
-				g_mode_pending_hits++;
-				if (g_mode_pending_hits >= VDRM_MODE_SWITCH_MIN_BUFS)
-					do_commit = 1;
-			}
-			mutex_unlock(&g_pool_lock);
-			if (do_commit)
-				vdrm_mode_commit();
-		}
 		return 0;
 	}
 	case VDRM_IOCTL_RETURN: {
 		struct vdrm_handle_req req;
+		unsigned long flags;
 		int i, rc = -ENOENT;
-		u32 before = 0, after = 0, handles = 0, count = 0, extra = 0;
-		u64 timestamp = 0;
-		struct drm_gem_object *obj = NULL;
 
 		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
 			return -EFAULT;
 		mutex_lock(&g_pool_lock);
+		spin_lock_irqsave(&g_pool_state_lock, flags);
 		for (i = 0; i < VDRM_POOL_MAX; i++) {
 			if (g_pool[i].used && g_pool[i].id == req.id) {
-				before = g_pool[i].state;
-				obj = g_pool[i].obj;
-				handles = obj ? obj->handle_count : 0;
-				count = ++g_diag_return[i];
-				if (before != VDRM_ST_DISPL) ++g_diag_return_non_displ[i];
-				extra = g_diag_return_non_displ[i];
-				timestamp = (u64)ktime_get();
 				if (g_pool[i].state == VDRM_ST_DISPL)
 					g_pool[i].state = VDRM_ST_FREE;
-				after = g_pool[i].state;
 				rc = 0;
 				break;
 			}
 		}
+		spin_unlock_irqrestore(&g_pool_state_lock, flags);
 		mutex_unlock(&g_pool_lock);
-		if (!rc && count <= 32)
-			pr_info("vdrm: DIAG_RETURN t_ns=%llu slot=%d id=%u obj=%px before=%u after=%u handles=%u count=%u non_displ=%u\n",
-				(unsigned long long)timestamp, i, req.id, obj,
-				before, after, handles, count, extra);
 		return rc;
 	}
 	case VDRM_IOCTL_UNREGISTER: {
 		struct vdrm_handle_req req;
 		struct drm_gem_object *obj = NULL;
+		struct file *f0 = NULL, *f1 = NULL;
+		unsigned long flags;
 		int i;
 
 		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
 			return -EFAULT;
 		mutex_lock(&g_pool_lock);
 
+		spin_lock_irqsave(&g_pool_state_lock, flags);
 		for (i = 0; i < VDRM_POOL_MAX; i++) {
 			if (g_pool[i].used && (!req.id || g_pool[i].id == req.id) &&
 			    (g_pool[i].allocation_reserved || g_pool[i].state != VDRM_ST_FREE)) {
+				spin_unlock_irqrestore(&g_pool_state_lock, flags);
 				mutex_unlock(&g_pool_lock);
 				return -EBUSY;
 			}
 		}
+		spin_unlock_irqrestore(&g_pool_state_lock, flags);
 
 		if (req.id == 0) {
 			/* id=0 = 清空整池（mkpool 开跑前用，避免多次运行累积批次）*/
 			for (i = 0; i < VDRM_POOL_MAX; i++) {
-				if (!g_pool[i].used)
+				bool used;
+
+				spin_lock_irqsave(&g_pool_state_lock, flags);
+				used = g_pool[i].used;
+				if (used)
+					g_pool[i].used = 0;
+				spin_unlock_irqrestore(&g_pool_state_lock, flags);
+				if (!used)
 					continue;
 				if (g_pool[i].f0) fput(g_pool[i].f0);
 				if (g_pool[i].f1) fput(g_pool[i].f1);
@@ -1028,16 +806,25 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			return 0;
 		}
 
+		spin_lock_irqsave(&g_pool_state_lock, flags);
 		for (i = 0; i < VDRM_POOL_MAX; i++) {
 			if (g_pool[i].used && g_pool[i].id == req.id) {
+				g_pool[i].used = 0;
 				obj = g_pool[i].obj;
-				memset(&g_pool[i], 0, sizeof(g_pool[i]));
+				f0 = g_pool[i].f0;
+				f1 = g_pool[i].f1;
 				break;
 			}
 		}
-		mutex_unlock(&g_pool_lock);
-		if (!obj)
+		spin_unlock_irqrestore(&g_pool_state_lock, flags);
+		if (!obj) {
+			mutex_unlock(&g_pool_lock);
 			return -ENOENT;
+		}
+		memset(&g_pool[i], 0, sizeof(g_pool[i]));
+		mutex_unlock(&g_pool_lock);
+		if (f0) fput(f0);
+		if (f1) fput(f1);
 		vdrm_gem_put(obj);
 		return 0;
 	}
@@ -1049,6 +836,15 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		vdrm_input_inject(ie.type, ie.code, ie.value);
 		return 0;
 	}
+	case VDRM_IOCTL_INPUT_BATCH: {
+		struct vdrm_input_batch batch;
+
+		if (copy_from_user(&batch, (const void *)arg, sizeof(batch)))
+			return -EFAULT;
+		if (batch.flags)
+			return -EINVAL;
+		return vdrm_input_inject_batch(&batch);
+	}
 	case VDRM_IOCTL_TOUCH: {
 		struct vdrm_touch_frame f;
 
@@ -1057,15 +853,6 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		if (f.flags)
 			return -EINVAL;
 		return vdrm_touch_inject(&f);
-	}
-	case VDRM_IOCTL_SET_MODE: {
-		struct vdrm_set_mode_req req;
-
-		if (copy_from_user(&req, (const void *)arg, sizeof(req)))
-			return -EFAULT;
-		if (req.flags)
-			return -EINVAL;
-		return vdrm_set_mode(req.width, req.height);
 	}
 	default:
 		return -ENOTTY;
@@ -1080,13 +867,14 @@ static void vdrm_drv_release(struct drm_device *dev);
  * 归还不按 RETURN、不按 handle_count，只在合成器的 drm_file 关闭时发生。
  * 会话内仍不复用 → 保留“禁止重复分配”的防别名效果；
  * 会话结束才回收 → 解决修复版“用完不还、第二次拿不到缓冲”。 */
-static u32 g_postclose_releases;
 static void vdrm_postclose(struct drm_device *dev, struct drm_file *file)
 {
+	unsigned long flags;
 	int i;
 	(void)dev;
 
 	mutex_lock(&g_pool_lock);
+	spin_lock_irqsave(&g_pool_state_lock, flags);
 	for (i = 0; i < VDRM_POOL_MAX; i++) {
 		struct vdrm_pool_entry *e = &g_pool[i];
 
@@ -1097,10 +885,8 @@ static void vdrm_postclose(struct drm_device *dev, struct drm_file *file)
 		e->allocation_owner    = NULL;
 		if (e->state == VDRM_ST_TAKEN)
 			e->state = VDRM_ST_FREE;
-		g_postclose_releases++;
-		pr_info("vdrm: postclose release id=%u state=%u total=%u\n",
-			e->id, e->state, g_postclose_releases);
 	}
+	spin_unlock_irqrestore(&g_pool_state_lock, flags);
 	mutex_unlock(&g_pool_lock);
 }
 
@@ -1208,7 +994,7 @@ static int vdrm_do_modecfg(void)
 	/* ADDFB2 必经 funcs->fb_create；DRIVER_ATOMIC 还要求 atomic_check/commit。
 	 * 这三个是空指针就是内核崩溃，必须在注册前设好。 */
 	g_mode_funcs.fb_create     = drm_gem_fb_create;
-	g_mode_funcs.atomic_check  = vdrm_atomic_check;
+	g_mode_funcs.atomic_check  = drm_atomic_helper_check;
 	g_mode_funcs.atomic_commit = drm_atomic_helper_commit;
 	g_dev->mode_config.funcs   = &g_mode_funcs;
 
@@ -1253,6 +1039,7 @@ static int vdrm_do_register(void)
 	if (!g_misc_registered) {
 		memset(&g_misc, 0, sizeof(g_misc));
 		g_misc_fops.owner          = THIS_MODULE;
+		g_misc_fops.open           = vdrm_misc_open;
 		g_misc_fops.unlocked_ioctl = vdrm_misc_ioctl;
 		g_misc_fops.compat_ioctl   = vdrm_misc_ioctl;
 		g_misc_fops.read           = vdrm_misc_read;
@@ -1261,11 +1048,13 @@ static int vdrm_do_register(void)
 		/* 初始化帧等待队列（静态清零的 spinlock = 解锁）*/
 		g_frame_wq.head.next = &g_frame_wq.head;
 		g_frame_wq.head.prev = &g_frame_wq.head;
-		g_frame_head = g_frame_tail = 0;
+		g_frame_has = false;
 		g_misc.minor = 255;        /* MISC_DYNAMIC_MINOR */
 		g_misc.name  = "vdrm";
 		g_misc.fops  = &g_misc_fops;
-		g_misc.mode  = 0666;       /* App（非 root）要能打开；后续收紧 */
+		/* 默认只给 root；service.sh 会把它 chown 给 VDRM App 的 uid
+		 * 并保持 0600。这样普通 App 不能注入输入或取池 fd。*/
+		g_misc.mode  = 0600;
 		rc = misc_register(&g_misc);
 		if (rc)
 			pr_info("vdrm: misc_register rc=%d（/dev/vdrm 不可用）\n", rc);
@@ -1349,8 +1138,7 @@ static enum hrtimer_restart vdrm_vblank_timer_fn(struct hrtimer *t)
 	if (!g_vblank_timer_running || !g_pipe)
 		return HRTIMER_NORESTART;
 
-	/* 网格连续前进：没人持 vblank 引用时也照常走，只是不上报
-	 * （无人持引用时 vblank->enabled 为 false，此时 handle_vblank 会 WARN）。*/
+	/* 网格连续前进：没人持 vblank 引用时也照常走，只是不上报。*/
 	if (g_vblank_on)
 		drm_crtc_handle_vblank(&g_pipe->crtc);
 
@@ -1365,17 +1153,15 @@ static int vdrm_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 		return -EINVAL;
 
 	g_vblank_on = 1;
-	/* 只在网格还没跑起来时启动。旧写法每次都从“现在”重新起算一整个周期，
-	 * 于是每次提交都要白等满 16.67ms 才收到 flip-done
-	 * （实测提交间隔恒为 31.8ms = 16.67 等待 + 渲染）。vblank 网格必须连续。*/
+	/* 只在网格还没跑起来时启动；之后相位不被打断。*/
 	if (!g_vblank_timer_running) {
 		g_vblank_timer_running = 1;
 		hrtimer_start_range_ns(&g_vblank_timer,
 				       (ktime_t)g_vblank_period_ns,
 				       0, HRTIMER_MODE_REL);
 	}
-	pr_info("vdrm: vblank on (period=%llu ns)\n",
-		(unsigned long long)g_vblank_period_ns);
+	pr_debug("vdrm: vblank on (period=%llu ns)\n",
+		 (unsigned long long)g_vblank_period_ns);
 	return 0;
 }
 
@@ -1391,7 +1177,7 @@ static int vdrm_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 static void vdrm_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
 {
 	g_vblank_on = 0;
-	pr_info("vdrm: vblank off\n");
+	pr_debug("vdrm: vblank off\n");
 }
 
 static void vdrm_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -1424,8 +1210,6 @@ static void vdrm_pipe_enable(struct drm_simple_display_pipe *pipe,
 static void vdrm_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
 	pr_info("vdrm: pipe disable\n");
-	/* pipe 关闭路径，不在 vblank 自旋锁里，可以停网格。
-	 * 先清 running，让已在跑的回调也不再 rearm，再非阻塞取消。*/
 	g_vblank_on = 0;
 	g_vblank_timer_running = 0;
 	hrtimer_try_to_cancel(&g_vblank_timer);
@@ -1454,15 +1238,13 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 		struct drm_gem_object *gobj = pipe->plane.state->fb->obj[0];
 		struct dma_buf *fbdb = (gobj && gobj->import_attach) ?
 			gobj->import_attach->dmabuf : NULL;
-		struct dma_buf *pdb0 = (g_pool[0].obj && g_pool[0].obj->import_attach) ? g_pool[0].obj->import_attach->dmabuf : NULL;
-		struct dma_buf *pdb1 = (g_pool[1].obj && g_pool[1].obj->import_attach) ? g_pool[1].obj->import_attach->dmabuf : NULL;
+		u32 ready_id = 0;
+		u64 ready_ud = 0;
+		bool ready = false;
+		unsigned long flags;
 		int i;
 
-		pr_info("vdrm: pu fb=%ux%u gobj=%px sz=%zu ia=%px | p0=%px p0sz=%zu p0ia=%px\n",
-			pipe->plane.state->fb->width, pipe->plane.state->fb->height,
-			gobj, gobj ? gobj->size : 0, gobj ? gobj->import_attach : NULL,
-			g_pool[0].obj, g_pool[0].obj ? g_pool[0].obj->size : 0,
-			g_pool[0].obj ? g_pool[0].obj->import_attach : NULL);
+		spin_lock_irqsave(&g_pool_state_lock, flags);
 		for (i = 0; i < VDRM_POOL_MAX; i++) {
 			struct drm_gem_object *po = g_pool[i].obj;
 			struct dma_buf *pdb = (po && po->import_attach) ?
@@ -1471,16 +1253,18 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 			if (!g_pool[i].used)
 				continue;
 			if (po == gobj || (fbdb && pdb && fbdb == pdb)) {
-				if (g_pool[i].state == VDRM_ST_DISPL) {
-					if ((g_disp_hits++ % 30) == 0)
-						pr_info("vdrm: REUSE-WHILE-DISPL id=%u hit=%u\n",
-							g_pool[i].id, g_disp_hits);
-				}
 				g_pool[i].state = VDRM_ST_DISPL;
-				vdrm_frame_push(g_pool[i].id, g_pool[i].user_data);
-				pr_info("vdrm: frame ready id=%u\n", g_pool[i].id);
+				ready_id = g_pool[i].id;
+				ready_ud = g_pool[i].user_data;
+				ready = true;
 				break;
 			}
+		}
+		spin_unlock_irqrestore(&g_pool_state_lock, flags);
+
+		if (ready) {
+			vdrm_frame_push(ready_id, ready_ud);
+			pr_debug("vdrm: frame ready id=%u\n", ready_id);
 		}
 	}
 
@@ -1489,7 +1273,7 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 
 	event = crtc_state->event;
 	if (!event) {
-		pr_info("vdrm: pipe update (no event)\n");
+		pr_debug("vdrm: pipe update (no event)\n");
 		return;
 	}
 
@@ -1497,15 +1281,17 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 	crtc_state->event = NULL;
 
 	_raw_spin_lock_irq(&crtc->dev->event_lock.rlock);
-	/* The queued event owns this reference; DRM releases it on delivery.
-	 * Building a loadable module requires verified target CRCs for both calls. */
-	if (drm_crtc_vblank_get(crtc) == 0)
-		drm_crtc_arm_vblank_event(crtc, event);
-	else
+	/* 正常路径：arm 到下一个 vblank；诊断路径：立即完成。
+	 * 立即路径不取 vblank 引用，事件由 DRM 在 send 时释放。*/
+	if (READ_ONCE(g_flip_done_immediate) ||
+	    drm_crtc_vblank_get(crtc) != 0)
 		drm_crtc_send_vblank_event(crtc, event);
+	else
+		drm_crtc_arm_vblank_event(crtc, event);
 	_raw_spin_unlock_irq(&crtc->dev->event_lock.rlock);
 
-	pr_info("vdrm: pipe update -> event armed\n");
+	pr_debug("vdrm: pipe update -> event %s\n",
+		 READ_ONCE(g_flip_done_immediate) ? "sent" : "armed");
 }
 
 static int vdrm_conn_get_modes(struct drm_connector *connector)
@@ -1663,6 +1449,10 @@ static struct input_dev *g_kbd, *g_ptr, *g_touch;
 /* 触摸屏上一帧状态（只由 /dev/vdrm ioctl 上下文读写） */
 static u32 g_touch_slots;                       /* 活动 slot 位图 */
 static s32 g_touch_tid[VDRM_TOUCH_MAX];         /* 各 slot 当前 tracking id */
+/* 已注入、尚未抬起的按键。进程被强杀时靠它补发 key-up。 */
+static DECLARE_BITMAP(g_kbd_down, VDRM_KEY_MAX + 1);
+static DECLARE_BITMAP(g_ptr_down, VDRM_BTN_LAST + 1);
+static DEFINE_MUTEX(g_input_lock);
 
 static struct input_dev *vdrm_touch_make(void)
 {
@@ -1718,6 +1508,7 @@ static int vdrm_touch_inject(const struct vdrm_touch_frame *f)
 		newmask |= BIT(p->slot);
 	}
 
+	mutex_lock(&g_input_lock);
 	oldmask = g_touch_slots;
 
 	for (s = 0; s < VDRM_TOUCH_MAX; s++) {
@@ -1749,25 +1540,129 @@ static int vdrm_touch_inject(const struct vdrm_touch_frame *f)
 
 	input_event(d, EV_SYN, VDRM_SYN_REPORT, 0);
 	g_touch_slots = newmask;
+	mutex_unlock(&g_input_lock);
 	return 0;
+}
+
+static struct input_dev *vdrm_input_dev_for(u32 type, u32 code)
+{
+	if (type == VDRM_EV_REL)
+		return g_ptr;
+	if (type == VDRM_EV_KEY)
+		return (code >= VDRM_BTN_FIRST && code <= VDRM_BTN_LAST) ?
+			g_ptr : g_kbd;
+	return NULL;
+}
+
+/* caller holds g_input_lock */
+static void vdrm_input_emit_locked(struct input_dev *d, u32 type, u32 code,
+				   s32 value)
+{
+	if (type == VDRM_EV_KEY) {
+		if (d == g_ptr && code <= VDRM_BTN_LAST) {
+			if (value)
+				__set_bit(code, g_ptr_down);
+			else
+				__clear_bit(code, g_ptr_down);
+		} else if (d == g_kbd && code <= VDRM_KEY_MAX) {
+			if (value)
+				__set_bit(code, g_kbd_down);
+			else
+				__clear_bit(code, g_kbd_down);
+		}
+	}
+	input_event(d, type, code, value);
 }
 
 static void vdrm_input_inject(u32 type, u32 code, s32 value)
 {
-	struct input_dev *d;
+	struct input_dev *d = vdrm_input_dev_for(type, code);
 
-	if (type == VDRM_EV_REL)
-		d = g_ptr;
-	else if (type == VDRM_EV_KEY)
-		d = (code >= VDRM_BTN_FIRST && code <= VDRM_BTN_LAST) ? g_ptr : g_kbd;
-	else
-		return;
 	if (!d)
 		return;
 
-	input_event(d, type, code, value);
+	mutex_lock(&g_input_lock);
+	vdrm_input_emit_locked(d, type, code, value);
 	/* EV_SYN 由 input_register_device() 自动置入 evbit，可直接发 */
 	input_event(d, VDRM_EV_SYN, VDRM_SYN_REPORT, 0);
+	mutex_unlock(&g_input_lock);
+}
+
+/* 一次 ioctl 注入多个事件；每个设备只补一个 SYN_REPORT。*/
+static int vdrm_input_inject_batch(const struct vdrm_input_batch *b)
+{
+	bool kbd = false, ptr = false;
+	u32 i;
+
+	if (b->count > VDRM_INPUT_BATCH_MAX)
+		return -EINVAL;
+
+	mutex_lock(&g_input_lock);
+	for (i = 0; i < b->count; i++) {
+		const struct vdrm_input_event *e = &b->events[i];
+		struct input_dev *d = vdrm_input_dev_for(e->type, e->code);
+
+		if (!d)
+			continue;
+		vdrm_input_emit_locked(d, e->type, e->code, e->value);
+		if (d == g_kbd)
+			kbd = true;
+		else
+			ptr = true;
+	}
+	if (kbd)
+		input_event(g_kbd, VDRM_EV_SYN, VDRM_SYN_REPORT, 0);
+	if (ptr)
+		input_event(g_ptr, VDRM_EV_SYN, VDRM_SYN_REPORT, 0);
+	mutex_unlock(&g_input_lock);
+	return 0;
+}
+
+/* 最后一个 /dev/vdrm 使用者消失：把内核里仍按着的键和触点全部释放。
+ * 进程被 LMK/强杀时这是唯一能通知容器 input 栈的时机。 */
+static void vdrm_input_reset_state(void)
+{
+	unsigned long code;
+	bool kbd_sent = false, ptr_sent = false;
+
+	mutex_lock(&g_input_lock);
+
+	if (g_kbd) {
+		for_each_set_bit(code, g_kbd_down, VDRM_KEY_MAX + 1) {
+			input_event(g_kbd, VDRM_EV_KEY, code, 0);
+			kbd_sent = true;
+		}
+		bitmap_zero(g_kbd_down, VDRM_KEY_MAX + 1);
+	}
+	if (kbd_sent)
+		input_event(g_kbd, VDRM_EV_SYN, VDRM_SYN_REPORT, 0);
+
+	if (g_ptr) {
+		for_each_set_bit(code, g_ptr_down, VDRM_BTN_LAST + 1) {
+			input_event(g_ptr, VDRM_EV_KEY, code, 0);
+			ptr_sent = true;
+		}
+		bitmap_zero(g_ptr_down, VDRM_BTN_LAST + 1);
+	}
+	if (ptr_sent)
+		input_event(g_ptr, VDRM_EV_SYN, VDRM_SYN_REPORT, 0);
+
+	if (g_touch && g_touch_slots) {
+		int s;
+
+		for (s = 0; s < VDRM_TOUCH_MAX; s++) {
+			if (!(g_touch_slots & BIT(s)))
+				continue;
+			input_event(g_touch, EV_ABS, ABS_MT_SLOT, s);
+			input_event(g_touch, EV_ABS, ABS_MT_TRACKING_ID, -1);
+			g_touch_tid[s] = -1;
+		}
+		input_event(g_touch, EV_KEY, BTN_TOUCH, 0);
+		input_event(g_touch, EV_SYN, VDRM_SYN_REPORT, 0);
+		g_touch_slots = 0;
+	}
+
+	mutex_unlock(&g_input_lock);
 }
 
 static struct input_dev *vdrm_input_make(const char *name, int is_ptr)
@@ -1850,6 +1745,8 @@ static int vdrm_input_setup(void)
 
 static void vdrm_input_teardown(void)
 {
+	/* 卸载前把仍按着的键/触点放掉，别把状态留给 input 核心 */
+	vdrm_input_reset_state();
 	if (g_touch) { input_unregister_device(g_touch); g_touch = NULL; }
 	if (g_ptr) { input_unregister_device(g_ptr); g_ptr = NULL; }
 	if (g_kbd) { input_unregister_device(g_kbd); g_kbd = NULL; }

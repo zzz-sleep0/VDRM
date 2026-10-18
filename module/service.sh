@@ -37,20 +37,48 @@ if [ ! -f "$KO" ]; then
     exit 1
 fi
 
-insmod "$KO" || { log -t vdrm "insmod vdrm-$KMI.ko 失败"; exit 1; }
-log -t vdrm "loaded vdrm-$KMI.ko"
+if lsmod | grep -q '^vdrm '; then
+    log -t vdrm "vdrm already loaded; skip insmod"
+else
+    insmod "$KO" || { log -t vdrm "insmod vdrm-$KMI.ko 失败"; exit 1; }
+    log -t vdrm "loaded vdrm-$KMI.ko"
+fi
 
-# 2) /dev/vdrm 对 App 放行（DAC + SELinux 标签）。
-#    这两句以前在 App 里靠 su 做 —— 所以 App 一直需要 root；现在归模块管，
-#    App 就是个普通应用，不需要 KernelSU 授权。
-[ -e /dev/vdrm ] && { chmod 666 /dev/vdrm; chcon u:object_r:gpu_device:s0 /dev/vdrm; }
+# 2) /dev/vdrm 只放给 VDRM App（DAC + SELinux 标签）。
+#
+#    以前是 666，任何 App 都能打开它 —— 既能向容器注入键鼠/触摸，也能用
+#    GET_POOL 把池缓冲的 dma-buf fd 装进自己进程。现在 chown 到 App 的
+#    uid 并保持 0600；mkpool 以 root 运行，不受影响。
+#
+#    UID 查询失败时保持 600 root-only（App 打不开，但绝不会误放行）。
+#    App 卸载重装若 uid 变了，重刷模块或重启一次即可。
+if [ -e /dev/vdrm ]; then
+    APP_UID=$(cmd package list packages -U 2>/dev/null \
+              | sed -n 's/.*package:com\.vdrm\.consumer uid:\([0-9][0-9]*\).*/\1/p' \
+              | head -n1)
+    [ -z "$APP_UID" ] && APP_UID=$(stat -c '%u' /data/user/0/com.vdrm.consumer 2>/dev/null)
+    [ -z "$APP_UID" ] && APP_UID=$(stat -c '%u' /data/data/com.vdrm.consumer 2>/dev/null)
+
+    if [ -n "$APP_UID" ]; then
+        chown "$APP_UID:$APP_UID" /dev/vdrm
+        chmod 600 /dev/vdrm
+        log -t vdrm "vdrm perms: owner=$APP_UID mode=600"
+    else
+        chmod 600 /dev/vdrm
+        log -t vdrm "vdrm perms: app uid not found, root-only"
+    fi
+    chcon u:object_r:gpu_device:s0 /dev/vdrm
+fi
 
 # 3) 建池。mkpool 就在模块目录里，直接跑它 —— 不再往别处拷一份。
 #    （以前拷到 /data/wayland/vdrm_mkpool，那是守护进程时代留下的路径，已退役。
 #     它自己的日志写在 /proc/self/exe 旁边，所以也跟着模块走。）
 #    mkpool 要够到 gralloc（binder → allocator HAL），得在能到它的域里跑；
 #    服务域通常够，不够就退回 su（ksu 域，实测能到）。
-[ -x "$MODDIR/vdrm_mkpool" ] || { log -t vdrm "模块里没有 vdrm_mkpool"; exit 0; }
+# 模块管理器解压 zip 时可能不保留可执行位（实测重装后是 644），
+# 所以这里只判存在，再把需要的文件补成 755。
+[ -f "$MODDIR/vdrm_mkpool" ] || { log -t vdrm "模块里没有 vdrm_mkpool"; exit 0; }
+chmod 755 "$MODDIR/vdrm_mkpool" 2>/dev/null
 
 if "$MODDIR/vdrm_mkpool"; then
     log -t vdrm "pool built"
@@ -63,4 +91,7 @@ fi
 # 4) 把状态写进 module.prop 的 description —— 管理器直接显示那一行，不用点任何东西。
 #    照 Droidspaces 的做法（它的 service.sh 也是这么更新自己那行的）。
 #    放在最后，因为要反映的正是上面几步的结果。
-[ -x "$MODDIR/status.sh" ] && "$MODDIR/status.sh"
+if [ -f "$MODDIR/status.sh" ]; then
+    chmod 755 "$MODDIR/status.sh" 2>/dev/null
+    "$MODDIR/status.sh"
+fi

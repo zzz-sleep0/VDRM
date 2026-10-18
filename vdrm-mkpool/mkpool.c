@@ -59,6 +59,29 @@ struct vdrm_register_req {
 #define VDRM_IOCTL_REGISTER  VDRM_IOC(3, 'V', 0x01, sizeof(struct vdrm_register_req))
 #define VDRM_IOCTL_UNREGISTER VDRM_IOC(1, 'V', 0x03, sizeof(struct vdrm_handle_req))
 
+/* 分配档位：必须与 App 侧（anland 借 buffer 那条路）的分配质量对齐。
+ *
+ * 格式仍用 BGRA_8888：合成器写的是 DRM_FORMAT_XRGB8888，小端内存布局是
+ * B,G,R,X。换成 RGBA 会被按 R,G,B,A 读，R/B 反转 —— 这里对齐的是物理
+ * 布局语义，不是照抄 App 的 HAL 格式枚举。
+ *
+ * GPU_COLOR_OUTPUT 是关键位（对应 gralloc 的 HW_RENDER）：gralloc 据此
+ * 决定是否按 GPU render target 选布局（UBWC / tile / 压缩）。之前缺这一位，
+ * 池里的 buffer 很可能落成线性布局，和 App 自己分配的那批不是同一种东西。
+ *
+ * CPU_WRITE_OFTEN 暂时保留，和 App 侧的分配档位一致；它是否会把布局拉回
+ * 线性，留到下一步 A/B（C 方案）再单独验证，避免一次改两个变量。
+ *
+ * 本机实测（1920x1080）：加上 GPU_COLOR_OUTPUT 后，native_handle 的
+ * gralloc flags 里 0x80（PRIV_FLAGS_USES_UBWC）置位；再去掉 CPU_WRITE
+ * 这个位也不变。说明真正决定布局档位的是 GPU_COLOR_OUTPUT。
+ */
+#define VDRM_AHB_FORMAT  5   /* HAL_PIXEL_FORMAT_BGRA_8888；NDK 没有对应 AHB 枚举 */
+#define VDRM_AHB_USAGE   (AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | \
+                          AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | \
+                          AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | \
+                          AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY)
+
 #define NPOOL 6
 
 int main(void)
@@ -97,6 +120,8 @@ int main(void)
     }
     w = info.width; h = info.height; fmt = info.format; pitch = info.pitch;
     P("KPM mode %ux%u pitch=%u fmt=%08x\n", w, h, pitch, fmt);
+    P("alloc profile: fmt=%u usage=0x%llx\n",
+      VDRM_AHB_FORMAT, (unsigned long long)VDRM_AHB_USAGE);
 
     /* 先清空旧池：避免多次跑 mkpool 在池里累积旧批次
      * （否则合成器会用到新批，而 App 只重建前 6 个 → 对不上）*/
@@ -108,24 +133,23 @@ int main(void)
     }
 
     for (i = 0; i < NPOOL; i++) {
-        AHardwareBuffer_Desc d;
+        AHardwareBuffer_Desc d, g;
         AHardwareBuffer *b = NULL;
         const native_handle_t *nh;
         struct vdrm_register_req req;
-        uint32_t ni;
+        uint32_t ni, k;
 
         memset(&d, 0, sizeof(d));
         d.width = w; d.height = h; d.layers = 1;
-        /* 关键：必须和合成器 GBM/dumb 路径的 DRM_FORMAT_XRGB8888 对齐
-         * （小端下内存布局是 B,G,R,X）→ HAL 5 = BGRA_8888。
-         * 用 1(RGBA) 会被按 RGBA 读 → 蓝黄(R/B)反转。*/
-        d.format = 5;   /* AHARDWAREBUFFER_FORMAT_BGRA_8888 */
-        d.usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
-                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                  AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+        d.format = VDRM_AHB_FORMAT;
+        d.usage  = VDRM_AHB_USAGE;
         if (AHardwareBuffer_allocate(&d, &b) != 0 || !b) {
             P("AHB[%d] allocate failed\n", i); break;
         }
+        AHardwareBuffer_describe(b, &g);
+        P("AHB[%d] describe: %ux%u fmt=%u usage=0x%llx stride=%u layers=%u\n",
+          i, g.width, g.height, g.format,
+          (unsigned long long)g.usage, g.stride, g.layers);
         nh = AHardwareBuffer_getNativeHandle(b);
         if (!nh || nh->numFds != 2 || nh->numInts > MAX_INTS) {
             P("AHB[%d] layout unexpected numFds=%d numInts=%d\n",
@@ -133,17 +157,18 @@ int main(void)
             AHardwareBuffer_release(b);
             continue;
         }
+        P("AHB[%d] handle: numFds=%d numInts=%d ints=",
+          i, nh->numFds, nh->numInts);
+        for (k = 0; k < (uint32_t)nh->numInts; k++)
+            P("%s%08x", k ? "," : "", nh->data[2 + k]);
+        P("\n");
         memset(&req, 0, sizeof(req));
         req.fd = nh->data[0];
         req.fd1 = nh->data[1];
-        {
-            AHardwareBuffer_Desc g;
-            AHardwareBuffer_describe(b, &g);
-            req.width  = g.width;
-            req.height = g.height;
-            req.pitch  = (uint32_t)g.stride * 4;   /* 真实 stride，不是 KPM 的 mode pitch */
-            req.format = g.format;                 /* 真实 HAL 格式（1=RGBA），不是 DRM fourcc */
-        }
+        req.width  = g.width;
+        req.height = g.height;
+        req.pitch  = (uint32_t)g.stride * 4;   /* 真实 stride，不是 KPM 的 mode pitch */
+        req.format = g.format;                 /* 真实 HAL 格式（5=BGRA），不是 DRM fourcc */
         ni = (uint32_t)nh->numInts;
         req.num_ints = ni;
         memcpy(req.ints, &nh->data[2], ni * 4);

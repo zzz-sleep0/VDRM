@@ -14,11 +14,13 @@
 #     在【同名路径】下编，否则 md5 必然不同。这条对 App 的 .so 同样成立。
 #
 # 自校验（在某个目录下 `cd` 进去再编，源码叫 mkpool.c）：
-#   md5sum vdrm_mkpool  →  8f7cf89bc6d5531c6e482512c2d8bdde   (10144 B)
+#   md5sum vdrm_mkpool  →  be87f17973c77b752c8fe1c4a8b7edce   (10704 B)
 #
-# 这个值随源码变。上一版是 ffd57b46…（9640 B）—— 日志位置从写死的
-# /data/wayland/mkpool.log 改成"用 /proc/self/exe 反查自己旁边"，路径变了、
-# 二进制就变了。
+# 这个值随源码变。上一版是 8f7cf89b…（10144 B）—— 分配档位补上
+# GPU_COLOR_OUTPUT（对齐 App/anland 的分配质量），并在 mkpool.log 里
+# 打印 describe 与原始 handle 元数据，方便和 App 侧对照。
+# 更早一版是 ffd57b46…（9640 B）—— 日志位置从写死的 /data/wayland/mkpool.log
+# 改成"用 /proc/self/exe 反查自己旁边"，路径变了、二进制就变了。
 #
 # ⚠️ vdrm_mkpool 本身【要入库】（KMI 无关的小二进制，CI 装配模块 zip 时要用），
 #    所以改了 mkpool.c 之后：重编 → 更新上面这个哈希 → 把新产物一起提交。

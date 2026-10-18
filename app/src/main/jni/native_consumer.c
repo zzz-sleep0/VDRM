@@ -51,7 +51,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 
 #include "anw_hidden.h"
 
@@ -77,10 +76,24 @@ struct submission {
     struct submission *next;
     AHardwareBuffer *ahb;
     uint32_t slot;
-    int device_fd, fence_fd;
+    int fence_fd;
 };
+/* submission 对象常驻复用：每帧 calloc/free 没必要，槽位固定后直接拿。 */
+#define SUBMISSION_CACHE_MAX 32
 static struct submission *g_submissions;
+static struct submission *g_submission_free;
+static struct submission g_submission_cache[SUBMISSION_CACHE_MAX];
+static bool g_submission_cache_ready;
+static atomic_size_t g_submissions_live;
+/* 几何/透明度是图层属性，只在变化时下发；调用方都持 g_geometry_lock。 */
+static ASurfaceControl *g_geom_sc;
+static uint32_t g_geom_mw, g_geom_mh, g_geom_ww, g_geom_wh;
+static ASurfaceControl *g_opaque_sc;
 static int g_release_wake_fd = -1;
+/* 单个常驻 release worker：不再每帧 pthread_create。*/
+static int g_release_worker_fd = -1;
+static bool g_release_worker_ok;
+static pthread_once_t g_release_once = PTHREAD_ONCE_INIT;
 static struct submission *submission_create(AHardwareBuffer *ahb, uint32_t slot);
 static size_t submission_count(void);
 static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh);
@@ -115,9 +128,26 @@ static void sc_set_geometry(ASurfaceTransaction *t, uint32_t mw, uint32_t mh,
         dst.right = (int32_t)ww; dst.bottom = (int32_t)wh;
     }
 
+    /* 层实际是 XRGB（Alpha 无意义）；不标 opaque 时 SF 会按
+     * PREMULTIPLIED 混合。只在新 SurfaceControl 上设一次。 */
+    if (g_opaque_sc != g_sc) {
+        ASurfaceTransaction_setBufferTransparency(
+            t, g_sc, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+        g_opaque_sc = g_sc;
+    }
+
     ASurfaceTransaction_setVisibility(t, g_sc,
                                       ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+
+    /* 几何只在窗口/模式变化时变；每帧重复 setGeometry 没有意义。 */
+    if (g_geom_sc == g_sc && g_geom_mw == mw && g_geom_mh == mh &&
+        g_geom_ww == ww && g_geom_wh == wh)
+        return;
+
     ASurfaceTransaction_setGeometry(t, g_sc, &src, &dst, 0);
+    g_geom_sc = g_sc;
+    g_geom_mw = mw; g_geom_mh = mh;
+    g_geom_ww = ww; g_geom_wh = wh;
 }
 
 static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh)
@@ -284,6 +314,13 @@ struct vdrm_input_event {
 #define VDRM_IOCTL_SET_EVENTFD VDRM_IOC(1, 'V', 0x04, sizeof(int))
 #define VDRM_IOCTL_SET_SHM     VDRM_IOC(1, 'V', 0x05, sizeof(int))
 #define VDRM_IOCTL_INPUT       VDRM_IOC(1, 'V', 0x06, sizeof(struct vdrm_input_event))
+#define VDRM_INPUT_BATCH_MAX 16
+struct vdrm_input_batch {
+    uint32_t count;
+    uint32_t flags;
+    struct vdrm_input_event events[VDRM_INPUT_BATCH_MAX];
+};
+#define VDRM_IOCTL_INPUT_BATCH VDRM_IOC(1, 'V', 0x0b, sizeof(struct vdrm_input_batch))
 
 /* B/A′：KPM 把池里每块的【原始 fd0/fd1 + ints】交给我们（必须与 KPM 一致）*/
 #define VDRM_MAX_INTS 40
@@ -302,13 +339,6 @@ struct vdrm_pool_list {
     struct vdrm_pool_info items[VDRM_POOL_MAX];
 };
 #define VDRM_IOCTL_GET_POOL    VDRM_IOC(3, 'V', 0x07, sizeof(struct vdrm_pool_list))
-
-/* 运行时切换输出尺寸。内核先挂 pending，等 mkpool 注册够新尺寸缓冲才
- * commit + hotplug；GET_INFO 在 pending 期间已经返回新尺寸。*/
-struct vdrm_set_mode_req {
-    uint32_t width, height, flags;
-};
-#define VDRM_IOCTL_SET_MODE    VDRM_IOC(1, 'V', 0x08, sizeof(struct vdrm_set_mode_req))
 
 /* 直接触摸（必须与内核 struct vdrm_touch_frame 逐字节一致）。
  * 每帧发送当前所有活动触点；内核负责自动 lift、BTN_TOUCH 和唯一 SYN。*/
@@ -392,37 +422,23 @@ struct consumer {
  * 所以启动时先用 su 放宽一下权限。
  */
 static int g_vdrm_fd = -1;
-
-static int run_su(const char *cmd)
-{
-    pid_t pid = fork();
-    if (pid < 0) { LOGE("su fork failed err=%d", errno); return -errno; }
-    if (pid == 0) {
-        int dn = open("/dev/null", O_WRONLY);
-        if (dn >= 0) { dup2(dn, STDOUT_FILENO); dup2(dn, STDERR_FILENO); close(dn); }
-        execl("/system/bin/su", "su", "-c", cmd, (char *)NULL);
-        execl("/system/xbin/su", "su", "-c", cmd, (char *)NULL);
-        _exit(127);
-    }
-    int status;
-    if (waitpid(pid, &status, 0) < 0) return -errno;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
+/* release worker 用的常驻 fd：避免每帧 dup/close。 */
+static int g_return_fd = -1;
 
 static int vdrm_open(void)
 {
     if (g_vdrm_fd >= 0) return 0;
 
-    /* 放宽 /dev/vdrm：DAC(chmod) + SELinux 标签(chcon)。内核/KPM 都设不了标签，
-     * 只能用户态改；App 有 root，启动时自己 su 一下，省掉宿主手动步骤。 */
-    int r = run_su("chmod 666 " VDRM_DEV "; chcon u:object_r:gpu_device:s0 " VDRM_DEV);
-    if (r != 0) LOGW("chmod/chcon %s ret=%d", VDRM_DEV, r);
-
+    /* /dev/vdrm 的属主/权限由模块 service.sh 负责（chown 到本 App uid、
+     * 0600 + gpu_device 标签）。App 不再用 su 把设备放宽到 666 ——
+     * 那会把输入注入和池 fd 暴露给任何应用。*/
     g_vdrm_fd = open(VDRM_DEV, O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (g_vdrm_fd < 0) {
         LOGE("open %s failed err=%d", VDRM_DEV, errno);
         return -1;
     }
+    if (g_return_fd < 0)
+        g_return_fd = fcntl(g_vdrm_fd, F_DUPFD_CLOEXEC, 0);
     LOGI("opened %s fd=%d", VDRM_DEV, g_vdrm_fd);
     return 0;
 }
@@ -433,22 +449,6 @@ static int vdrm_get_info(struct vdrm_info *info)
         return -1;
     if (ioctl(g_vdrm_fd, VDRM_IOCTL_GET_INFO, info) < 0) {
         LOGE("GET_INFO failed err=%d", errno);
-        return -1;
-    }
-    return 0;
-}
-
-static int vdrm_set_mode(int w, int h)
-{
-    struct vdrm_set_mode_req req;
-
-    if (g_vdrm_fd < 0)
-        return -1;
-    memset(&req, 0, sizeof(req));
-    req.width  = (uint32_t)w;
-    req.height = (uint32_t)h;
-    if (ioctl(g_vdrm_fd, VDRM_IOCTL_SET_MODE, &req) < 0) {
-        LOGW("SET_MODE %dx%d failed err=%d", w, h, errno);
         return -1;
     }
     return 0;
@@ -493,63 +493,202 @@ static void vdrm_unregister(int id)
 }
 
 /* SF 用完这块 buffer 时回调 → 归还给 KPM（契中台）。可任意线程。 */
+
+#define SUBMISSION_WAIT_MAX 8
+#define RELEASE_FENCE_TIMEOUT_MS 2000
+
+/* 从提交表里摘掉并完成归还。worker 和 worker 起不来时的 fallback 共用。*/
+static void submission_finish(struct submission *s)
+{
+    struct submission **p;
+    bool busy = false;
+
+    if (!s)
+        return;
+
+    pthread_mutex_lock(&g_display_lock);
+    p = &g_submissions;
+    while (*p && *p != s)
+        p = &(*p)->next;
+    if (!*p) {
+        pthread_mutex_unlock(&g_display_lock);
+        return;   /* 已被别的路径完成 */
+    }
+    *p = s->next;
+    for (struct submission *other = g_submissions; other; other = other->next)
+        if (other->slot == s->slot) { busy = true; break; }
+    if (!busy) {
+        struct vdrm_handle_req req = { .id = s->slot };
+        int rfd = (g_return_fd >= 0) ? g_return_fd : g_vdrm_fd;
+        if (ioctl(rfd, VDRM_IOCTL_RETURN, &req) < 0)
+            LOGW("RETURN slot=%u err=%d", s->slot, errno);
+    }
+    pthread_mutex_unlock(&g_display_lock);
+
+    if (s->fence_fd >= 0)
+        close(s->fence_fd);
+    AHardwareBuffer_release(s->ahb);
+    atomic_fetch_sub(&g_submissions_live, 1);
+    if (g_release_wake_fd >= 0) {
+        uint64_t wake = 1;
+        (void)write(g_release_wake_fd, &wake, sizeof(wake));
+    }
+
+    /* 对象回缓存，下一帧直接复用。 */
+    s->ahb = NULL;
+    s->fence_fd = -2;
+    s->slot = 0;
+    pthread_mutex_lock(&g_display_lock);
+    s->next = g_submission_free;
+    g_submission_free = s;
+    pthread_mutex_unlock(&g_display_lock);
+}
+
 static struct submission *submission_create(AHardwareBuffer *ahb, uint32_t slot)
 {
-    struct submission *s = calloc(1, sizeof(*s));
-    if (!s) return NULL;
-    s->device_fd = dup(g_vdrm_fd);
-    if (s->device_fd < 0) { free(s); return NULL; }
+    struct submission *s;
+    int i;
+
     pthread_mutex_lock(&g_display_lock);
+    if (!g_submission_cache_ready) {
+        for (i = 0; i < SUBMISSION_CACHE_MAX; i++) {
+            g_submission_cache[i].next = g_submission_free;
+            g_submission_free = &g_submission_cache[i];
+        }
+        g_submission_cache_ready = true;
+    }
+    s = g_submission_free;
+    if (s)
+        g_submission_free = s->next;
+    pthread_mutex_unlock(&g_display_lock);
+
+    if (!s) {
+        s = calloc(1, sizeof(*s));
+        if (!s) return NULL;
+    }
+
     s->ahb = ahb; s->slot = slot;
+    s->fence_fd = -2;   /* release callback 还没到 */
     AHardwareBuffer_acquire(ahb);
+
+    pthread_mutex_lock(&g_display_lock);
     s->next = g_submissions; g_submissions = s;
+    atomic_fetch_add(&g_submissions_live, 1);
     pthread_mutex_unlock(&g_display_lock);
     return s;
 }
 
 static size_t submission_count(void)
 {
-    size_t n = 0;
-    pthread_mutex_lock(&g_display_lock);
-    for (struct submission *p = g_submissions; p; p = p->next) n++;
-    pthread_mutex_unlock(&g_display_lock);
-    return n;
+    return atomic_load(&g_submissions_live);
 }
 
+static void drain_eventfd(int fd)
+{
+    uint64_t v;
+    while (read(fd, &v, sizeof(v)) > 0) { }
+}
+
+static void *release_worker(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        struct submission *wait[SUBMISSION_WAIT_MAX];
+        struct submission *imm[SUBMISSION_WAIT_MAX];
+        struct pollfd pfds[SUBMISSION_WAIT_MAX + 1];
+        int wait_n = 0, imm_n = 0, i, r;
+
+        pthread_mutex_lock(&g_display_lock);
+        for (struct submission *s = g_submissions; s; s = s->next) {
+            if (s->fence_fd == -1) {
+                if (imm_n < SUBMISSION_WAIT_MAX)
+                    imm[imm_n++] = s;
+            } else if (s->fence_fd >= 0 &&
+                       wait_n < SUBMISSION_WAIT_MAX) {
+                wait[wait_n] = s;
+                pfds[wait_n].fd = s->fence_fd;
+                pfds[wait_n].events = POLLIN;
+                pfds[wait_n].revents = 0;
+                wait_n++;
+            }
+        }
+        pthread_mutex_unlock(&g_display_lock);
+
+        for (i = 0; i < imm_n; i++)
+            submission_finish(imm[i]);
+
+        if (wait_n == 0) {
+            struct pollfd w = { .fd = g_release_worker_fd, .events = POLLIN };
+            r = poll(&w, 1, -1);
+            if (r > 0)
+                drain_eventfd(g_release_worker_fd);
+            continue;
+        }
+
+        pfds[wait_n].fd = g_release_worker_fd;
+        pfds[wait_n].events = POLLIN;
+        pfds[wait_n].revents = 0;
+        r = poll(pfds, wait_n + 1, RELEASE_FENCE_TIMEOUT_MS);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            LOGW("release worker poll err=%d; forcing all", errno);
+            for (i = 0; i < wait_n; i++)
+                submission_finish(wait[i]);
+            continue;
+        }
+        if (r > 0 && (pfds[wait_n].revents & POLLIN))
+            drain_eventfd(g_release_worker_fd);
+
+        for (i = 0; i < wait_n; i++) {
+            if (r == 0)
+                LOGW("release fence timeout slot=%u; forcing RETURN", wait[i]->slot);
+            if (r == 0 || (pfds[i].revents &
+                           (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
+                submission_finish(wait[i]);
+        }
+    }
+    return NULL;
+}
+
+static void release_worker_init(void)
+{
+    pthread_t t;
+
+    g_release_worker_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_release_worker_fd < 0) {
+        LOGE("release worker eventfd failed err=%d", errno);
+        return;
+    }
+    if (pthread_create(&t, NULL, release_worker, NULL) != 0) {
+        LOGE("release worker thread failed err=%d", errno);
+        close(g_release_worker_fd);
+        g_release_worker_fd = -1;
+        return;
+    }
+    pthread_detach(t);
+    g_release_worker_ok = true;
+    LOGI("release worker started");
+}
+
+/* worker 起不来时的 fallback：带超时，避免永久挂住。*/
 static void *release_wait(void *arg)
 {
     struct submission *s = arg;
+
     if (s->fence_fd >= 0) {
         struct pollfd pfd = { .fd = s->fence_fd, .events = POLLIN };
         int r;
-        do { r = poll(&pfd, 1, -1); } while (r < 0 && errno == EINTR);
-        if (r < 0 || !(pfd.revents & POLLIN)) {
-            LOGE("release fence failed for slot=%u; retaining lease", s->slot);
-            close(s->fence_fd);
-            return NULL;
-        }
-        close(s->fence_fd);
+        do {
+            r = poll(&pfd, 1, RELEASE_FENCE_TIMEOUT_MS);
+        } while (r < 0 && errno == EINTR);
+        if (r == 0)
+            LOGW("release fence timeout slot=%u; forcing RETURN", s->slot);
+        else if (r < 0 || !(pfd.revents & POLLIN))
+            LOGW("release fence failed slot=%u; forcing RETURN", s->slot);
     }
-    pthread_mutex_lock(&g_display_lock);
-    struct submission **p = &g_submissions;
-    while (*p && *p != s) p = &(*p)->next;
-    if (*p) *p = s->next;
-    bool busy = false;
-    for (struct submission *other = g_submissions; other; other = other->next)
-        if (other->slot == s->slot) { busy = true; break; }
-    if (!busy) {
-        struct vdrm_handle_req req = { .id = s->slot };
-        if (ioctl(s->device_fd, VDRM_IOCTL_RETURN, &req) < 0)
-            LOGW("RETURN slot=%u err=%d", s->slot, errno);
-    }
-    pthread_mutex_unlock(&g_display_lock);
-    AHardwareBuffer_release(s->ahb);
-    close(s->device_fd);
-    if (g_release_wake_fd >= 0) {
-        uint64_t wake = 1;
-        (void)write(g_release_wake_fd, &wake, sizeof(wake));
-    }
-    free(s);
+    submission_finish(s);
     return NULL;
 }
 
@@ -566,8 +705,26 @@ static void return_unsubmitted(uint32_t slot)
 static void on_buf_release(void *context, int release_fd)
 {
     struct submission *s = context;
+
+    /* sc_remove() 用 NULL buffer 清图层时也会走到这里 */
+    if (!s)
+        return;
+
+    pthread_mutex_lock(&g_display_lock);
     s->fence_fd = release_fd;
-    if (release_fd < 0) { release_wait(s); return; }
+    pthread_mutex_unlock(&g_display_lock);
+
+    if (g_release_worker_ok) {
+        uint64_t wake = 1;
+        if (g_release_worker_fd >= 0)
+            (void)write(g_release_worker_fd, &wake, sizeof(wake));
+        return;
+    }
+
+    if (release_fd < 0) {
+        submission_finish(s);
+        return;
+    }
     pthread_t thread;
     if (pthread_create(&thread, NULL, release_wait, s) == 0)
         pthread_detach(thread);
@@ -723,6 +880,7 @@ static int forge_pool(struct consumer *c)
     int n, i;
     const uint32_t usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
                            AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                           AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                            AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
 
     n = vdrm_get_pool(&lst);
@@ -1043,6 +1201,8 @@ static int vdrm_open_lazy(void)
     if (g_vdrm_fd >= 0) return 0;
     g_vdrm_fd = open(VDRM_DEV, O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (g_vdrm_fd < 0) return -1;
+    if (g_return_fd < 0)
+        g_return_fd = fcntl(g_vdrm_fd, F_DUPFD_CLOEXEC, 0);
     LOGI("input: lazy re-open %s fd=%d", VDRM_DEV, g_vdrm_fd);
     return 0;
 }
@@ -1065,6 +1225,31 @@ static void in_emit(uint16_t type, uint16_t code, int32_t value)
         LOGW("input: ioctl type=%u code=%u err=%d", type, code, errno);
 }
 
+/* 一次 ioctl 发多个事件；内核每个设备只补一个 SYN。*/
+static void in_emit_batch(const struct vdrm_input_event *ev, int n)
+{
+    struct vdrm_input_batch b;
+    static int warned;
+
+    if (n <= 0)
+        return;
+    if (n > VDRM_INPUT_BATCH_MAX)
+        n = VDRM_INPUT_BATCH_MAX;
+    if (g_vdrm_fd < 0 && vdrm_open_lazy() < 0) {
+        if (!warned) {
+            warned = 1;
+            LOGW("input: %s 打不开 err=%d —— 事件被丢弃", VDRM_DEV, errno);
+        }
+        return;
+    }
+    warned = 0;
+    memset(&b, 0, sizeof(b));
+    b.count = (uint32_t)n;
+    memcpy(b.events, ev, (size_t)n * sizeof(ev[0]));
+    if (ioctl(g_vdrm_fd, VDRM_IOCTL_INPUT_BATCH, &b) < 0)
+        LOGW("input: batch ioctl err=%d", errno);
+}
+
 static void in_key(int code, int down)
 {
     in_emit(IN_EV_KEY, (uint16_t)code, down ? 1 : 0);
@@ -1077,13 +1262,25 @@ static void in_btn(int btn, int pressed)
 
 static void in_motion(float dx, float dy)
 {
-    int ix, iy;
+    struct vdrm_input_event ev[2];
+    int ix, iy, n = 0;
+
     g_in_mv[0] += dx;
     g_in_mv[1] += dy;
     ix = (int)g_in_mv[0];
     iy = (int)g_in_mv[1];
-    if (ix) { g_in_mv[0] -= (float)ix; in_emit(IN_EV_REL, IN_REL_X, ix); }
-    if (iy) { g_in_mv[1] -= (float)iy; in_emit(IN_EV_REL, IN_REL_Y, iy); }
+    if (ix) {
+        g_in_mv[0] -= (float)ix;
+        ev[n].type = IN_EV_REL; ev[n].code = IN_REL_X;
+        ev[n].value = ix; n++;
+    }
+    if (iy) {
+        g_in_mv[1] -= (float)iy;
+        ev[n].type = IN_EV_REL; ev[n].code = IN_REL_Y;
+        ev[n].value = iy; n++;
+    }
+    if (n)
+        in_emit_batch(ev, n);
 }
 
 static void in_scroll(int axis, float v)
@@ -1274,6 +1471,8 @@ Java_com_vdrm_consumer_Native_nativeCreate(JNIEnv *env, jclass clazz)
     if (c->stop_fd < 0) { free(c); return 0; }
     c->event_fd = -1;
     c->shm_fd = -1;
+    /* 进程级 release worker：只起一次，之后所有 frame 共用一个线程。*/
+    pthread_once(&g_release_once, release_worker_init);
     LOGI("instance %p created", (void *)c);
     return (jlong)(uintptr_t)c;
 }
@@ -1355,7 +1554,9 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
         LOGE("vdrm_open failed (no /dev/vdrm access?)");
         return;
     }
-    /* A live Surface resize changes geometry only, not buffer ownership. */
+    /* 输出分辨率由模块的 mode 参数决定，App 不参与。窗口尺寸变化只改
+     * letterbox 几何；不在这里 SET_MODE，避免运行中 mode 切换带来的
+     * 池重建/热插拔边界状态。*/
     if (c->running && g_sc && g_last_surface &&
         (*env)->IsSameObject(env, g_last_surface, surface)) {
         pthread_mutex_lock(&g_geometry_lock);
@@ -1375,7 +1576,7 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
             pthread_join(c->thread, NULL);
             while (read(c->stop_fd, &wake, sizeof(wake)) > 0) {}
         }
-        /* Resize is handled above without stopping the render loop. */
+        /* Pure resize is handled above without stopping the render loop. */
     close_channels(c);
 
     /* 分清"同一块 surface 的纯尺寸变化"和"surface 被销毁重建"：
@@ -1394,6 +1595,11 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
             if (c->win) { ANativeWindow_release(c->win); c->win = NULL; }
             sc_remove(g_sc);
             g_sc = NULL;
+            /* 新 SC 可能复用旧指针地址，几何/透明度缓存必须显式失效。 */
+            pthread_mutex_lock(&g_geometry_lock);
+            g_geom_sc = NULL;
+            g_opaque_sc = NULL;
+            pthread_mutex_unlock(&g_geometry_lock);
             c->win = ANativeWindow_fromSurface(env, surface);
             if (!c->win) {
                 LOGE("ANativeWindow_fromSurface failed");
@@ -1417,25 +1623,9 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
     c->screen_w = ANativeWindow_getWidth(c->win);
     c->screen_h = ANativeWindow_getHeight(c->win);
 
-    /* 让虚拟输出跟随窗口尺寸：App 是唯一 setter。SET_MODE 只挂 pending，
-     * 真正的 commit + hotplug 由内核在 mkpool 注册够新尺寸缓冲后做。*/
-    int mode_change_requested = 0;
-    {
-        struct vdrm_info cur;
-        int want_w = c->screen_w, want_h = c->screen_h;
+    /* 几何从模块来（App 只跟随）；取不到就退回窗口尺寸。
+     * 分辨率是模块 insmod 的 mode，不在运行时修改。*/
 
-        if (want_w >= 16 && want_h >= 16 && want_w <= 4096 && want_h <= 4096 &&
-            vdrm_get_info(&cur) == 0 &&
-            ((int)cur.width != want_w || (int)cur.height != want_h)) {
-            if (vdrm_set_mode(want_w, want_h) == 0) {
-                mode_change_requested = 1;
-                LOGI("SET_MODE -> %dx%d (was %ux%u)",
-                     want_w, want_h, cur.width, cur.height);
-            }
-        }
-    }
-
-    /* 几何从 KPM 来（App 只跟随）；取不到就退回窗口尺寸 */
     {
         struct vdrm_info info;
         memset(&info, 0, sizeof(info));
@@ -1506,10 +1696,9 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
      * 由内核/ueventd 管理（注册时建、注销时删）。容器直接按节点绑定即可，
      * 不再需要 App 搬运 —— 也就不会留下悬空节点。*/
 
-    if (!same_surface || c->buf_count <= 0 || mode_change_requested) {
-        /* mode 变了必须强制重建：旧池的尺寸不对，mkpool 会按 GET_INFO
-         * 返回的新尺寸造一批（它自己先清池）。异步，不等。*/
-        ensure_pool_spawn(mode_change_requested);
+    if (!same_surface || c->buf_count <= 0) {
+        /* 池由模块 boot 时按固定 mode 建好；这里只在池不可用时兜底拉起。*/
+        ensure_pool_spawn(0);
         free_buffers(c);
         if (forge_pool(c) < 0)
             LOGE("forge_pool 暂不可用（池未就绪？）— 渲染循环会自动重试");
