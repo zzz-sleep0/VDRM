@@ -40,8 +40,32 @@ fi
 if lsmod | grep -q '^vdrm '; then
     log -t vdrm "vdrm already loaded; skip insmod"
 else
-    insmod "$KO" || { log -t vdrm "insmod vdrm-$KMI.ko 失败"; exit 1; }
-    log -t vdrm "loaded vdrm-$KMI.ko"
+    # 分辨率：mode.conf 的 mode=1920x1080（默认，留黑边）/ 2376x1080（铺满，挖空）
+    # / auto（开机采当前逻辑分辨率，竖屏自动转横屏）。没有配置就按 .ko 默认 1920x1080。
+    MODE=$(sed -n 's/^mode=//p' "$MODDIR/mode.conf" 2>/dev/null | tr -d ' \r' | tail -n1)
+    if [ "$MODE" = "auto" ]; then
+        MODE=$(wm size 2>/dev/null | sed -n 's/.*Override size: *//p' | head -n1)
+        [ -z "$MODE" ] && MODE=$(wm size 2>/dev/null | sed -n 's/.*Physical size: *//p' | head -n1)
+        if [ -n "$MODE" ]; then
+            W=${MODE%x*}
+            H=${MODE#*x}
+            case "$W$H" in *[!0-9]*) MODE= ;; esac
+            if [ -n "$MODE" ] && [ "$W" -lt "$H" ]; then
+                MODE="${H}x${W}"
+            fi
+        fi
+    fi
+    INSMOD_ARGS=
+    case "$MODE" in
+        [0-9]*x[0-9]*) INSMOD_ARGS="mode=$MODE" ;;
+    esac
+    insmod "$KO" $INSMOD_ARGS || { log -t vdrm "insmod vdrm-$KMI.ko 失败"; exit 1; }
+    log -t vdrm "loaded vdrm-$KMI.ko ${INSMOD_ARGS:+($INSMOD_ARGS)}"
+fi
+
+# 稳定节拍：flip_done_immediate 默认 Y 在 120 下会让翻转立即完成，反而掉帧；设 0。
+if [ -e /sys/module/vdrm/parameters/flip_done_immediate ]; then
+    echo 0 > /sys/module/vdrm/parameters/flip_done_immediate
 fi
 
 # 2) /dev/vdrm 只放给 VDRM App（DAC + SELinux 标签）。

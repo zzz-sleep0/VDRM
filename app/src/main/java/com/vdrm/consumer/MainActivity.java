@@ -10,6 +10,7 @@ import android.os.PowerManager;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -60,6 +61,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         /* Keep screen on */
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        /* 窗口级刷新率偏好：Surface/SC 的 120 请求不够，Activity 窗口
+         * 自身也要投票，否则 display mode director 按窗口默认的 60 处理。 */
+        WindowManager.LayoutParams attrs = getWindow().getAttributes();
+        attrs.preferredRefreshRate = 120f;
+        if (Build.VERSION.SDK_INT >= 30) {
+            /* 允许窗口铺满摄像头挖空区：1920x1080 模式仍由 SC letterbox 留黑边，
+             * 2376x1080 模式则真正 1:1 铺满（挖空会压在桌面上）。 */
+            attrs.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        }
+        getWindow().setAttributes(attrs);
 
         /* Wake lock */
         PowerManager pm = getSystemService(PowerManager.class);
@@ -135,6 +148,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         keyboardView.setScreenSize(width, height);
+        /* 请求 120Hz：让 SF/display 以 8.3ms 的网格 latch，减少 60fps 内容
+         * 等满 16.7ms 的概率。native 侧还会对子 SC 下一次同样的请求。 */
+        if (Build.VERSION.SDK_INT >= 30) {
+            holder.getSurface().setFrameRate(120f,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        }
+        Log.i(TAG, "VDRM build window-120-t3");
         Native.nativeStart(nativeHandle, holder.getSurface());
         Native.nativeStartAudio(nativeHandle);
     }

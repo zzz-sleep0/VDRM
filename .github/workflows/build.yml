@@ -2,13 +2,6 @@ name: Build APK
 
 on:
   push:
-    branches: [ main ]
-    paths:                      # 只有 app 相关变了才跑；推 vdrm-ko/ 不会触发
-      - 'app/**'
-      - 'build.gradle'
-      - 'settings.gradle'
-      - 'gradle.properties'
-      - '.github/workflows/build.yml'
   pull_request:
     branches: [ main ]
     paths:

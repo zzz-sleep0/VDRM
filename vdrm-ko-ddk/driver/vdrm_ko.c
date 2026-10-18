@@ -276,12 +276,24 @@ static char *g_mode_param;
 module_param_named(mode, g_mode_param, charp, 0444);
 MODULE_PARM_DESC(mode, "Virtual output mode WxH (default 1920x1080)");
 
+/* 虚拟输出的刷新率（Hz）。vblank 周期由 mode 的 clock/htotal/vtotal 反推，
+ * 所以改这里就够了：60 时 niri 出 60fps，120 时出 120fps（宿主面板是 120
+ * 就对齐到 120）。默认 120，可 insmod vdrm.ko refresh=60 覆盖。 */
+static uint g_refresh = 120;
+module_param_named(refresh, g_refresh, uint, 0444);
+MODULE_PARM_DESC(refresh, "Virtual output refresh rate in Hz (24..240, default 120)");
+
 /* 解析 module_param mode。范围与 mode_config 的 max 一致（4096），
  * 下限取 16 —— 再小 CVT 的 porch 都放不下。 */
 static int vdrm_parse_mode_param(void)
 {
 	unsigned int w, h;
 	char tail;
+
+	if (g_refresh < 24 || g_refresh > 240) {
+		pr_err("vdrm: refresh %u out of range (24..240)\n", g_refresh);
+		return -ERANGE;
+	}
 
 	if (!g_mode_param || !*g_mode_param)
 		return 0;
@@ -1308,7 +1320,7 @@ static int vdrm_conn_get_modes(struct drm_connector *connector)
 	 * 6.1–6.12 全档可用）。*/
 	m = vdrm_kzalloc(sizeof(*m));
 	if (m) {
-		m->clock       = ((g_mode_w + 280) * (g_mode_h + 45) * 60) / 1000;
+		m->clock       = ((g_mode_w + 280) * (g_mode_h + 45) * g_refresh) / 1000;
 		m->hdisplay    = g_mode_w;
 		m->hsync_start = g_mode_w + 88;
 		m->hsync_end   = g_mode_w + 88 + 44;
@@ -1326,8 +1338,8 @@ static int vdrm_conn_get_modes(struct drm_connector *connector)
 		return 0;
 	}
 	/* CVT 会对尺寸取整；强制回请求值，保证连接器 mode == App buffer */
-	pr_info("vdrm: cvt req %ux%u -> mode %dx%d\n",
-		g_mode_w, g_mode_h, m->hdisplay, m->vdisplay);
+	pr_info("vdrm: cvt req %ux%u@%u -> mode %dx%d\n",
+		g_mode_w, g_mode_h, g_refresh, m->hdisplay, m->vdisplay);
 	m->hdisplay = g_mode_w;
 	m->vdisplay = g_mode_h;
 	if (m->htotal < g_mode_w) m->htotal = g_mode_w + 160;
@@ -1336,7 +1348,7 @@ static int vdrm_conn_get_modes(struct drm_connector *connector)
 	drm_mode_set_name(m);
 	drm_mode_probed_add(connector, m);
 
-	pr_info("vdrm: get_modes -> 1 (%ux%u)\n", g_mode_w, g_mode_h);
+	pr_info("vdrm: get_modes -> 1 (%ux%u@%u)\n", g_mode_w, g_mode_h, g_refresh);
 	return 1;
 }
 

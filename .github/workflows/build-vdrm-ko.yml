@@ -8,13 +8,6 @@ name: Build vdrm.ko (DDK)
 
 on:
   push:
-    paths:
-      - 'vdrm-ko-ddk/**'
-      # 模块的文本变了、装配脚本变了，都得重出那个 zip
-      - 'module/**'
-      - 'make-module.py'
-      - 'vdrm-mkpool/**'
-      - '.github/workflows/build-vdrm-ko.yml'
   workflow_dispatch:
 
 jobs:

@@ -89,6 +89,7 @@ static atomic_size_t g_submissions_live;
 static ASurfaceControl *g_geom_sc;
 static uint32_t g_geom_mw, g_geom_mh, g_geom_ww, g_geom_wh;
 static ASurfaceControl *g_opaque_sc;
+static ASurfaceControl *g_fr_sc;   /* 已经下发过 frame rate 的 SC */
 static int g_release_wake_fd = -1;
 /* 单个常驻 release worker：不再每帧 pthread_create。*/
 static int g_release_worker_fd = -1;
@@ -109,6 +110,14 @@ static void sc_set_geometry(ASurfaceTransaction *t, uint32_t mw, uint32_t mh,
 
     if (!g_sc)
         return;
+
+    /* 让 SF 把这个 layer 的 frame rate 拉到 120：display 的 latch 网格从
+     * 16.7ms 变 8.3ms，60fps 内容的最坏等待减半。每个 SC 只下发一次。 */
+    if (g_fr_sc != g_sc) {
+        ASurfaceTransaction_setFrameRate(t, g_sc, 120.0f,
+                        ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        g_fr_sc = g_sc;
+    }
 
     if (mw && mh && ww && wh) {
         double s  = (double)ww / (double)mw;
@@ -1084,8 +1093,8 @@ static void *render_loop(void *arg)
             stat_ev++;
         }
         if (!have_pending) continue;
-        /* Keep room for a replacement of the current display buffer. */
-        if (submission_count() >= 2) {
+        /* 三缓冲：120fps 下 2 个 in-flight 不够，留第 3 个替换当前显示帧。 */
+        if (submission_count() >= 3) {
             stat_deferred++;
             continue;
         }
@@ -1599,6 +1608,7 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
             pthread_mutex_lock(&g_geometry_lock);
             g_geom_sc = NULL;
             g_opaque_sc = NULL;
+            g_fr_sc = NULL;
             pthread_mutex_unlock(&g_geometry_lock);
             c->win = ANativeWindow_fromSurface(env, surface);
             if (!c->win) {
