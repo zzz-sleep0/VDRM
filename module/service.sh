@@ -73,8 +73,16 @@ fi
 #    不做 chown：0666 让第一次安装/重装换 UID 都能直接 open，不需要查 UID、不需要
 #    重启。SELinux 边界是 gpu_device —— 有该权限的域能打开，没有的域打不开；
 #    不要求“只有 VDRM App 能开”。mkpool 以 root 运行，不受影响。
+#    ueventd 可能在 insmod 返回之后才把节点建出来，直接 chmod 会落空
+#    （实测 /dev/vdrm-audio 会停在 0600）。先等两个节点都出现。
+i=0
+while [ "$i" -lt 5 ]; do
+    [ -e /dev/vdrm ] && [ -e /dev/vdrm-audio ] && break
+    sleep 1
+    i=$((i + 1))
+done
 for n in /dev/vdrm /dev/vdrm-audio; do
-    [ -e "$n" ] || continue
+    [ -e "$n" ] || { log -t vdrm "vdrm perms: $n missing"; continue; }
     chmod 666 "$n"
     chcon u:object_r:gpu_device:s0 "$n"
     log -t vdrm "vdrm perms: $n 0666 gpu_device"

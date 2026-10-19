@@ -1166,31 +1166,80 @@ static void *render_loop(void *arg)
  * 这里 mmap 环、poll 可读、把 PCM 写进 AAudio。
  */
 
+#define AUDIO_FRAME_BYTES (VDRM_AUDIO_CHANNELS * 2)   /* S16_LE 立体声 */
+#define AUDIO_WRITE_TIMEOUT_NS 50000000LL             /* 50ms：别把环堵满 */
+/* 一次最多搬 ~20ms：块太大时 AAudio 会攒着写，tail 更新变粗，ALSA 那边
+ * 看到的就是一阵一阵的消费，延迟也跟着变大。 */
+#define AUDIO_CHUNK_MAX (VDRM_AUDIO_RATE / 50 * AUDIO_FRAME_BYTES)
+
 static void *audio_play_thread(void *arg)
 {
     struct consumer *c = arg;
     struct vdrm_audio_ring *r = c->audio_map;
+    int err_logged = 0;
 
     if (!r)
         return NULL;
+    uint32_t gen = __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE);
     while (c->audio_running) {
         struct pollfd p = { .fd = c->audio_fd, .events = POLLIN };
         uint32_t head, tail, avail, off, n;
+        uint32_t newgen;
+        int32_t written;
 
-        if (poll(&p, 1, 200) <= 0)
+        if (poll(&p, 1, 100) <= 0)
             continue;
+        /* 内核 prepare 抬了代次：丢掉本地旧 tail，从新 head 重新同步。 */
+        newgen = __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE);
+        if (newgen != gen) {
+            gen = newgen;
+            head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&r->tail, head, __ATOMIC_RELEASE);
+            ioctl(c->audio_fd, VDRM_AUDIO_KICK);
+            continue;
+        }
         head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
         tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
         avail = head - tail;
+        /* 内核 prepare 会把 head/tail 清零。若本线程正好有一次写还没落地，
+         * tail 会被甩到 head 前面，avail 变成巨大的回绕值。环里永远不可能
+         * 有超过 size 的数据，所以这一定是重同步，不是真数据。 */
+        if (avail > r->size) {
+            __atomic_store_n(&r->tail, head, __ATOMIC_RELEASE);
+            continue;
+        }
         if (!avail)
             continue;
         off = tail % r->size;
         n = avail < r->size - off ? avail : r->size - off;
-        if (n)
-            AAudioStream_write(c->play_stream, r->data + off, n / 4, 1000000);
-        if (avail > n)
-            AAudioStream_write(c->play_stream, r->data, (avail - n) / 4, 1000000);
-        __atomic_store_n(&r->tail, tail + avail, __ATOMIC_RELEASE);
+        if (n > AUDIO_CHUNK_MAX)
+            n = AUDIO_CHUNK_MAX;
+
+        /* 只把真正写进 AAudio 的帧算作消费：超时/短写时 tail 不动，
+         * 下一轮重试，不能像以前那样无条件把整段 avail 记成已消费。 */
+        written = AAudioStream_write(c->play_stream, r->data + off,
+                                     n / AUDIO_FRAME_BYTES,
+                                     AUDIO_WRITE_TIMEOUT_NS);
+        if (written > 0) {
+            __atomic_store_n(&r->tail,
+                             tail + (uint32_t)written * AUDIO_FRAME_BYTES,
+                             __ATOMIC_RELEASE);
+            /* 告诉内核"又消费了一段"：它要推 hw_ptr 并叫醒容器里等空间的
+             * 写者，否则对方会在 10 秒后拿到 -EIO。 */
+            ioctl(c->audio_fd, VDRM_AUDIO_KICK);
+            err_logged = 0;
+            continue;
+        }
+        if (written == AAUDIO_ERROR_TIMEOUT || written == 0)
+            continue;              /* 只是暂时没空间，不是流坏了 */
+        if (!err_logged) {
+            LOGE("audio: AAudioStream_write err=%d，丢弃积压", written);
+            err_logged = 1;
+        }
+        /* 流没了（耳机拔掉/被抢占）：丢掉积压，别让环一直满着空转 */
+        __atomic_store_n(&r->tail, head, __ATOMIC_RELEASE);
+        ioctl(c->audio_fd, VDRM_AUDIO_KICK);
+        usleep(10000);
     }
     return NULL;
 }
@@ -1250,6 +1299,11 @@ static int audio_start(struct consumer *c)
         c->audio_running = false;
         AAudioStream_close(s);
         c->play_stream = NULL;
+        /* err_map 会 munmap/close；这里必须先清掉，否则 audio_stop() 会二次
+         * munmap 同一个地址、close 一个可能已被复用的 fd。 */
+        c->audio_fd = -1;
+        c->audio_map = NULL;
+        c->audio_map_len = 0;
         goto err_map;
     }
     LOGI("audio: started %u Hz %u ch, ring %u", info.rate, info.channels, info.size);
@@ -1272,7 +1326,7 @@ static void audio_stop(struct consumer *c)
         pthread_join(c->play_thr, NULL);
     }
     if (c->play_stream) {
-        AAudioStream_stop(c->play_stream, 0);
+        AAudioStream_requestStop(c->play_stream);
         AAudioStream_close(c->play_stream);
         c->play_stream = NULL;
     }

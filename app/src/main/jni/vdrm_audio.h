@@ -28,10 +28,12 @@ struct vdrm_audio_ring {
 	__u32 rate;
 	__u32 channels;
 	__u32 format;
-	__u32 reserved;
+	__u32 generation; /* prepare 时 +1，App 用它丢弃旧 tail */
 	__u8  data[];
 };
 
 #define VDRM_AUDIO_GET_INFO _IOR('v', 0x30, struct vdrm_audio_info)
+/* App 每消费一段（更新 tail）后调用：让内核推一次 hw_ptr 并叫醒 ALSA 写者。 */
+#define VDRM_AUDIO_KICK     _IO('v', 0x31)
 
 #endif

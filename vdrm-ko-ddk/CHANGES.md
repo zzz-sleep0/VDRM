@@ -134,3 +134,85 @@ input_unregister_device  input_event       input_set_capability
 
 设备名固定为 `vdrm-kbd` / `vdrm-ptr`。它们仍然是**内核级**输入设备，Android 侧也会认到，
 所以 `/vendor/etc/excluded-input-devices.xml` 里那两条**仍然是必需的**。
+
+## 本版本第五项改动：音频真正能出声
+
+音频刚接上时有几个会把声音彻底掐死的问题，逐个记一下。
+
+### 1. mmap 长度没按页对齐（直接原因）
+
+共享环是 `sizeof(header) + 512KB` = **524320** 字节，不是页的整数倍；而 mmap 的长度
+会被内核向上取整到 **528384**。`vdrm_audio_mmap()` 用未对齐的 `total` 做上限检查，
+合法映射直接被 `-EINVAL` 拒掉 —— App mmap 不上，音频根本起不来。
+改成 `PAGE_ALIGN()`，alloc / free / mmap 三处用同一个值。
+
+### 2. `ack` 里睡眠 / `period_elapsed` 自锁
+
+`ack` 是在 ALSA 流锁里被调用的（`pcm_lib_apply_appl_ptr()` 位于
+`snd_pcm_stream_lock_irq()` 之后）：
+
+- 旧的 `.copy` 路径在环满时 `wait_event_interruptible()` —— 睡在自旋锁上；
+- 在 `ack` 里调 `snd_pcm_period_elapsed()` —— 同一把非递归锁重入，自锁。
+
+现在 `ack` 只做非阻塞搬运，环满就丢尾巴并记账（`dropped_bytes`），
+绝不在内核里等 App。
+
+### 3. 阻塞写没人叫醒，10 秒后 -EIO
+
+ALSA 的阻塞写在没空间时睡在 `runtime->tsleep` 上，**默认只等 10 秒**，超时直接
+返回 `-EIO`；它不会自己轮询 hw_ptr。所以光把 `pointer` 改成按 `tail` 回报还不够：
+必须有人推 `period_elapsed`，否则写者永远不会被唤醒。
+
+- App 每消费一段（约 20ms）就 `ioctl(VDRM_AUDIO_KICK)`；
+- 内核在锁外调 `snd_pcm_period_elapsed()`，更新 hw_ptr 并叫醒写者；
+- App 关闭（`release`）时也踢一次，让写者立刻走"没人收、直接丢"的退化路径，
+  不用干等 10 秒。
+
+> 这是新增 ABI：`VDRM_AUDIO_KICK = _IO('v', 0x31)`。
+> 新 .ko 必须配新 APK，旧 APK 不会踢，阻塞写会周期性 -EIO。
+
+### 4. `pointer` 零延迟 + `ack` 一次前进整 buffer 丢数据
+
+- `pointer` 原来直接返回 `appl_ptr`，等于告诉 ALSA"写进来就已经播完"：播放器
+  满速灌满 512KB 环，然后被丢帧，延迟越来越大、音画对不上。现在按 App 的
+  `tail` 增量算真实消费；App 没开时退化成 `appl_ptr` 并丢弃新数据。
+- `ack` 的增量原来写成 `(cur - last + frames) % frames`。一次 ack 正好前进一个
+  buffer 是合法的（prepare 后写满整块），取模会得到 0，且不更新 `g_last_appl`，
+  之后每次都看到 `frames` 的整数倍 → 永久静音。改成未取模的差，防御性钳到
+  `frames`。
+
+### App 侧
+
+- 只按 `AAudioStream_write()` **实际写入的帧**推进 `tail`，超时/短写不再把没写
+  进去的数据记成已消费；`AAUDIO_ERROR_TIMEOUT` 当背压重试，不当流已死；
+- 一次最多搬 ~20ms，消费进度和唤醒都更细；
+- `prepare` 与本线程 in-flight 写撞上时，`avail` 会回绕成巨大值；看到
+  `avail > size` 就按重同步处理（`tail = head`）；
+- `pthread_create` 失败时清掉已赋值的 `audio_fd/audio_map`，避免 `audio_stop`
+  二次 `munmap`/`close`。
+
+> 顺带：`struct snd_pcm_ops.ack` 的签名从 2.6.32 到 6.15 一直是
+> `int (*ack)(struct snd_pcm_substream *)`，**没有** `appl_ptr` 参数；
+> 按 6.1 分叉出两个签名反而编不过 5.10。`vm_flags_set()` 是 6.3 才有的，
+> 这里继续用 `vma->vm_flags |=`。
+
+诊断（只增不减）：
+
+```sh
+cat /sys/module/vdrm/parameters/dropped_bytes     # 环满丢的字节
+cat /sys/module/vdrm/parameters/discarded_bytes   # App 没开时丢的字节
+cat /sys/module/vdrm/parameters/ring_used_bytes   # 当前环里积压的字节
+```
+
+## 本版本第六项改动：延迟、播放/停止边界和 mixer
+
+- ALSA buffer 从 512KB 压到 **32KB**（48k 立体声约 171ms），避免播放器把整条
+  512KB 共享环当 ALSA buffer 灌满，造成 1 秒以上的音画延迟；
+- 共享环加 **96KB 上限**（约 0.5 秒）：超过就丢新帧，不让启动时的积压一直留着；
+- `prepare` / STOP / close 时清空共享环并抬 **generation**，App 看到代次变化就
+  丢弃本地旧 tail；关闭视频后不会再把已经排队的尾巴放完；
+- 注册 `Master/PCM Playback Volume`（带 TLV/dB）和 `Master Playback Switch`，
+  给 ACP/WirePlumber 识别；驱动内部不再用这些控件衰减数据，避免 server 把
+  音量设 0 时整条数据被乘静音；
+- `snd_jack_new("Speaker")` 上报常插耳机口，给 ACP 建 Speaker 端口；
+- 共享环 ABI 的 `reserved` 字段改为 `generation`（结构大小不变）。
