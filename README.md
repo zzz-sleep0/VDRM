@@ -1,11 +1,10 @@
-# 前置声明！！理论上该模块仅适用于遵循GKI(OKI)标准的内核！！如果你的厂商对内核有魔改行为，或者你刷入了深度优化魔改的内核，请勿在没有音量键救砖的情况下刷入此模块，不遵循以上声明，由此模块引发的问题作者概不负责！
+前置声明，理论上该模块仅适用于对应KMI内遵循GKI(OKI)标准的内核。如果你的内核声明已经达到该模块支持的KMI，但是内核本身并未遵循G(O)KI标准，刷入该模块可能导致无限重启，请勿在没有音量键救砖或可解密data分区的recovery或其他基础救砖方式的前提下刷入；对于KMI不在支持范围内的内核，该模块不会加载内核模块因此不会实质性生效；不遵循以上声明，由此模块引发的问题作者概不负责！
 
 # VDRM
 
 把一台 Android 手机变成**虚拟 DRM 显示器**（`/dev/vdrm`，虚拟 `card1`），
 让 Linux 合成器（niri / KWin / Hyprland / sway …）跑在容器里、画面显示在手机屏幕上，
-同时提供一套**通用**的虚拟键鼠。
-
+同时提供一套**通用**的虚拟键鼠
 不是投屏，也不是 X11 转发 —— 容器里的合成器看到的就是一块真实的 DRM 卡。
 虚拟键鼠走**内核 evdev**，所以任何用 libinput 的合成器都通用。
 
@@ -43,11 +42,10 @@ vdrm-debug.apk         ← Android App
 
 ### 1. 装模块
 
-用管理器安装 `vdrm-lkm-v2.0.zip`，然后**重启**。
+用管理器安装 `vdrm-lkm-***.zip`，然后**重启**。
 
-> ⚠️ **别的机型要补屏蔽表**：把你**自己 ROM** 的 `/vendor/etc/excluded-input-devices.xml`
-> 里加上 `vdrm-kbd`、`vdrm-ptr`、`vdrm-touch` 三个设备名，再按这个改模块里的那份。
-> **必须装 metamodule**，文件覆盖才生效。三个都要：`vdrm-kbd`（键盘）、`vdrm-ptr`（指针）、
+> ⚠️ **不同机型要补屏蔽表**：把你**自己手机** 的 `/vendor/etc/excluded-input-devices.xml` 里按照模块内置文件的格式加上 `vdrm-kbd`、`vdrm-ptr`、`vdrm-touch` 三个设备名，再用修补过的文件覆盖模块内置文件。
+> **必须装 metamodule**，针对设备的排除列表覆盖才生效。三个都要：`vdrm-kbd`（键盘）、`vdrm-ptr`（指针）、
 > `vdrm-touch`（触摸）。少一个就会出现大鼠标或幽灵触摸。
 
 ### 2. 装 App
@@ -86,13 +84,10 @@ enable_hw_access=1
 privileged=nomask
 ```
 
-> 输入挂整个目录，别逐个列 `eventN`。开了完整硬件访问后 `card0` / `renderD128` 已经在容器里，
-> **不要**再整目录挂 `/dev/dri`。
-
 ### 4. 配合成器
 
-- 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs）
-- 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（Arch 是这路径，别的发行版自己找）
+- 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs），用于获取硬件加速(可选)
+- 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（Arch发行版是这个路径，别的发行版需要自行寻找对应路径）
 
 **已知合成器的最小适配**
 
@@ -100,7 +95,7 @@ privileged=nomask
 |---|---|
 | **niri** | 放 udev 规则（见下）+ `~/.config/niri/config.kdl` 末尾加 `debug { render-drm-device "/dev/dri/renderD128" }`；`MESA_LOADER_DRIVER_OVERRIDE=msm` |
 | **KWin** | `KWIN_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=kgsl` |
-| **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=msm` |
+| **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=ksgl` |
 
 niri 的 udev 规则，存成 `/etc/udev/rules.d/99-vdrm-primary.rules`：
 
@@ -111,6 +106,8 @@ SUBSYSTEM=="drm", KERNEL=="renderD128", ENV{ID_SEAT}="seat0"
 ```
 
 改完重启（或 `udevadm trigger`）。
+
+> 由于niri对mesa后端的识别缺陷，目前只有msm后端可用，其他后端会被识别为软件渲染导致niri不工作
 
 ---
 
@@ -143,6 +140,8 @@ mode=1920x1080
 # mode=2376x1080
 # mode=auto
 ```
+
+> 这里已经初见端倪了，mode.conf中的分辨率设置优先级是要高于内核模块内置分辨率的，可以试着自行调试
 
 ### 怎么选
 
@@ -180,7 +179,7 @@ niri msg outputs     # 1920x1080@120（或你选的模式），Current mode 有�
 | niri 没起来 / 没输出 | 检查 `/etc/udev/rules.d/99-vdrm-primary.rules` 三行、`render-drm-device`；重启或 `udevadm trigger` |
 | KWin / Hyprland 没输出 | `KWIN_DRM_DEVICES=/dev/dri/card1` / `AQ_DRM_DEVICES=/dev/dri/card1` |
 | **120 模式但感觉只有 60** | 用 Action 选 1920 模式 |
-| **2376 模式很卡** | 用 Action 选音量上（1920 带黑边），重启 |
+| **全面屏模式很卡** | 用 Action 选音量上（1920 带黑边），重启 |
 | **Action 按音量键没反应** | 直接编辑 `mode.conf`，或换物理音量键再试 |
 | **装 CI 的 APK 提示签名冲突** | 先卸载旧 App 再装 |
 | niri 日志 `got vblank after 0ns` | 可忽略，不影响出图 |
