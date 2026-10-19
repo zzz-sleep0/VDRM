@@ -3,25 +3,15 @@
 # VDRM
 
 把一台 Android 手机变成**虚拟 DRM 显示器**（`/dev/vdrm`，虚拟 `card1`），
-让 Linux 合成器（KWin / niri / Hyprland / sway …）跑在容器里、画面显示在手机屏幕上，
+让 Linux 合成器（niri / KWin / Hyprland / sway …）跑在容器里、画面显示在手机屏幕上，
 同时提供一套**通用**的虚拟键鼠。
 
 不是投屏，也不是 X11 转发 —— 容器里的合成器看到的就是一块真实的 DRM 卡。
-虚拟键鼠走**内核 evdev**，所以任何用 libinput 的合成器都通用，不需要为每个桌面环境写适配。
+虚拟键鼠走**内核 evdev**，所以任何用 libinput 的合成器都通用。
 
-**换句话说：在你自己的手机上，跑一个完整的 Linux 桌面。**
+**在你自己的手机上，跑一个完整的 Linux 桌面。**
 
----
-
-## 它是怎么跑起来的
-
-```
-① 显示   合成器（容器）──写池缓冲──► 内核模块 ──► App 用 AHB 重建 ──► SurfaceFlinger ──► 屏幕
-② 输入   App 触控板/键盘 ──ioctl(/dev/vdrm)──► 内核模块 ──input_event()──► evdev ──► 合成器
-③ 屏蔽   虚拟键鼠是内核级设备，Android 侧也会认到 → 用排除表按设备名屏蔽掉
-```
-
-池由内核模块持有，App 重启不影响；虚拟键鼠由内核模块注册，生命周期绑在模块上。
+默认 **1920x1080@120**；比例不合适时，用模块的 Action 切到真实分辨率。
 
 ---
 
@@ -29,120 +19,199 @@
 
 | | |
 |---|---|
-| **手机** | 已 root（KernelSU / Magisk / APatch），**并装了 metamodule** —— 模块的文件覆盖靠它 |
+| **手机** | 已 root（KernelSU / Magisk / APatch），**并装了 metamodule** |
 | **容器** | [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS)（或任何能起 Linux 容器、能指定设备节点的方案） |
-| **合成器** | 容器里装一个。KWin 和 niri 都验过；其它用 libinput 的应该也能，环境变量照抄 |
+| **合成器** | 容器里装一个。niri / KWin / Hyprland 都验过 |
 
 ---
 
-## 这套东西由哪几块组成
+## 拿到三个文件
 
-| 路径 | 是什么 | 怎么得到 |
-|---|---|---|
-| `module/` | **内核侧模块** `vdrm-lkm`：装 .ko、建池、把状态写进模块列表 | 装下面的 zip |
-| `vdrm-ko-ddk/` | 内核模块**源码**（按 KMI 编，六档一批） | CI（DDK） |
-| `vdrm-mkpool/` | **建池 helper**（用户态小程序，要 NDK 的 bionic clang） | 见其 `Makefile` |
-| `vdrm-gbm/` | **GBM 后端 shim**：让合成器在虚拟卡上分配缓冲 | 见其 `Makefile` |
-| `app/` | **Android 应用**：把池里的缓冲贴上屏 + 注入输入 | Gradle，CI 自动编 |
+去 GitHub Releases 下最新的 `weekly-YYYY-Www`：
 
-**正常情况下你只需要一个文件**：`vdrm-lkm-<version>.zip` —— 里面六个 KMI 的 `.ko`、
-helper、屏蔽表都齐了。要自己出这个 zip：
-
-```sh
-python3 make-module.py          # 本地装配；或者推上去让 CI 出（artifact: vdrm-lkm-module）
+```
+vdrm-lkm-v2.0.zip      ← 模块（六个 KMI 的 .ko + mkpool + Action 脚本）
+vdrm_gbm.so            ← 容器里的 GBM shim
+vdrm-debug.apk         ← Android App
 ```
 
+同一周内的更新会覆盖同一个 release；跨周自动新建。
+
 ---
 
-## 三步跑起来
+## 安装
 
 ### 1. 装模块
 
-把 `vdrm-lkm-<version>.zip` **用管理器安装**（KernelSU / Magisk 里"从本地安装"）。
+用管理器安装 `vdrm-lkm-v2.0.zip`，然后**重启**。
 
-> ⚠️ **别的机型要改一下屏蔽表**：模块里那份 `excluded-input-devices.xml` 是拿**本机
-> ROM 的原文件**改的（在原文件上加 `vdrm-kbd` / `vdrm-ptr` 两行）。你的 ROM 里那份
-> 列的设备不一样，直接套用会丢掉它自己的排除项 —— 把这两行补进**你自己**的
-> `/vendor/etc/excluded-input-devices.xml`，再按这个改模块里的那份。**并且要装
-> metamodule**，文件覆盖才生效。
+> ⚠️ **别的机型要补屏蔽表**：把你**自己 ROM** 的 `/vendor/etc/excluded-input-devices.xml`
+> 里加上 `vdrm-kbd`、`vdrm-ptr`、`vdrm-touch` 三个设备名，再按这个改模块里的那份。
+> **必须装 metamodule**，文件覆盖才生效。三个都要：`vdrm-kbd`（键盘）、`vdrm-ptr`（指针）、
+> `vdrm-touch`（触摸）。少一个就会出现大鼠标或幽灵触摸。
 
-装完**重启**。
+### 2. 装 App
 
-### 2. 起容器，把两个设备交给它
+装 `vdrm-debug.apk`。
 
-容器配置里（以 Droidspaces 和Arch为例）：
+- CI 的 debug APK 和你自己签名的包**签名不同**；如果手机上已经装了别的签名版本，先卸载再装。
+- 模块启动时已经把 `/dev/vdrm` 设成 `0666`、标签 `gpu_device`；不需要 chown，第一次安装/重装直接可用。
+- App 是横屏全屏；1920 模式居中留黑边，真实分辨率模式铺满（摄像头挖空会压在桌面上）。
+
+### 3. 配容器
+
+以 Droidspaces + Arch 为例：
 
 **环境变量**
 
 ```
-XDG_RUNTIME_DIR=/home/alarm/.xdg
+XDG_RUNTIME_DIR=/tmp/xdg
 LIBSEAT_BACKEND=noop
 MESA_LOADER_DRIVER_OVERRIDE=msm
 ```
 
-**设备挂载**
+**设备**
 
 ```
 /dev/input        → /dev/input          # 整个目录
-/dev/dri/card1    → /dev/dri/card1      # 虚拟卡
+/dev/dri/card1    → /dev/dri/card1      # 只挂虚拟卡
 ```
 
-> 输入**挂整个目录**，别逐个列 `eventN` —— 设备编号会变，写死就会一段时间后失灵。
+Droidspaces 对应：
 
-**开放特殊权限**
+```ini
+bind_mounts=/dev/input:/dev/input,/dev/dri/card1:/dev/dri/card1
+enable_hw_access=1
+privileged=nomask
+```
 
-需要容器中开“完整硬件访问”和“nomask特权”，否则键鼠不识别
+> 输入挂整个目录，别逐个列 `eventN`。开了完整硬件访问后 `card0` / `renderD128` 已经在容器里，
+> **不要**再整目录挂 `/dev/dri`。
 
-### 3. 在容器里装合成器
+### 4. 配合成器
 
-- 打上 **`mesa-for-android-container`**（lfdevs 大佬那套）—— 硬件加速靠它
+- 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs）
 - 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（Arch 是这路径，别的发行版自己找）
-  —— **必须**：没有它，合成器的缓冲不来自池，画面就出不来
-- niri 的配置加一句：
 
-```kdl
-debug {
-    render-drm-device "/dev/dri/renderD128"
-}
+**已知合成器的最小适配**
+
+| 合成器 | 要做的 |
+|---|---|
+| **niri** | 放 udev 规则（见下）+ `~/.config/niri/config.kdl` 末尾加 `debug { render-drm-device "/dev/dri/renderD128" }`；`MESA_LOADER_DRIVER_OVERRIDE=msm` |
+| **KWin** | `KWIN_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=kgsl` |
+| **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1` |
+
+niri 的 udev 规则，存成 `/etc/udev/rules.d/99-vdrm-primary.rules`：
+
+```
+SUBSYSTEM=="drm", KERNEL=="card0", ENV{ID_SEAT}="seat0"
+SUBSYSTEM=="drm", KERNEL=="card1", ENV{ID_SEAT}="seat0"
+SUBSYSTEM=="drm", KERNEL=="renderD128", ENV{ID_SEAT}="seat0"
 ```
 
-（其它合成器自行探索。KWin 是用 `AQ_DRM_DEVICES=/dev/dri/card1`。）
+改完重启（或 `udevadm trigger`）。
+
+---
+
+## 分辨率与 120Hz
+
+### 默认
+
+`.ko` 默认 **1920x1080@120**。模块的 `mode.conf` 默认也是：
+
+```
+mode=1920x1080
+```
+
+### 用 Action 切
+
+模块管理器里点 **Action**，5 秒内：
+
+| 按键 | 结果 |
+|---|---|
+| **音量上** | 按真实分辨率取最大 **16:9**（例如 1920x1080），居中留黑边 |
+| **音量下** | 真实横屏分辨率（例如 2376x1080），铺满，摄像头挖空压在桌面上 |
+| **不按** | 保持当前配置 |
+
+结果写入 `mode.conf`，**重启后生效**。
+
+也可以直接改 `/data/adb/modules/vdrm-lkm/mode.conf`：
+
+```
+mode=1920x1080
+# mode=2376x1080
+# mode=auto
+```
+
+### 怎么选
+
+- **1920x1080（音量上）**：带黑边、避开挖空，合成器负担小，优先选这个
+- **真实分辨率（音量下）**：铺满，挖空会压在桌面上；如果卡就切回 1920
+
+> 120 模式在部分机型上实际只呈现 60 次/秒；想要更稳就用 1920 模式。
 
 ---
 
 ## 怎么确认成功了
 
 ```sh
-# 容器里 —— 应该看到一块 1920x1080@60 的输出，且 Current mode 有值（已启用）
-niri msg outputs
+# 容器里
+niri msg outputs     # 1920x1080@120（或你选的模式），Current mode 有值
 ```
 
-- 管理器里模块那三行是 `🟢` / 有 KMI / `ready 😋`
+- 管理器里模块状态是 `🟢` / 有 KMI / `ready 😋`
 - 按一下虚拟键盘：**在容器中打出字**
+- `ls -l /dev/vdrm` 是 `crw-rw-rw-`、标签 `gpu_device`
 
 ---
 
 ## 出问题先看这里
 
-| 症状 | 多半是 | 怎么办 |
-|---|---|---|
-| **全黑屏**，但合成器明明在跑 | 池没建起来。合成器只分配一次缓冲，抢在池之前以后就再也匹配不上 | 重启（模块在 boot 时建池）；或关掉合成器再开一次 |
-| **手机上冒出个大鼠标在滑** | 屏蔽表没生效，通常是模块被手工拷进去、丢了 SELinux 标签 | 用管理器装模块。已经拷了的话：<br>`chcon u:object_r:vendor_configs_file:s0 <模块>/system/vendor/etc/excluded-input-devices.xml` |
-| 合成器**起不来 / 说没有渲染器** | `MESA_LOADER_DRIVER_OVERRIDE=kgsl` 会被部分合成器(如niri)误判成"软件渲染器"而拒绝 | 改成 `msm` |
+| 情况 | 怎么做 |
+|---|---|
+| **全黑屏**，合成器在跑 | 重启；确认 `ls -l /dev/vdrm` 是 666 + `gpu_device`；`cat /sys/module/vdrm/parameters/flip_done_immediate` 是 N；用 Action 重选分辨率并重启 |
+| App 打不开 `/dev/vdrm` | `su -c 'chmod 666 /dev/vdrm; chcon u:object_r:gpu_device:s0 /dev/vdrm'`，确认模块 service.sh 跑过 |
+| **手机上冒出个大鼠标** | 用管理器装模块；给模块里的 `excluded-input-devices.xml` 打 `vendor_configs_file` 标签；确认装了 metamodule |
+| **Android 多出触摸屏/幽灵触摸** | 在 `/vendor/etc/excluded-input-devices.xml` 里补 `vdrm-touch`（三个设备一起），装 metamodule 后重启 |
+| 合成器**起不来 / 说没有渲染器** | `MESA_LOADER_DRIVER_OVERRIDE` 改成 `msm` |
+| niri 报 `error opening primary GPU DRM node` | 确认容器里有 `card0`（完整硬件访问 / `enable_gpu_mode=1`，或显式 bind `/dev/dri/card0`） |
+| niri 报 `primary node is missing, display-only devices may not work` | 可忽略，不影响出图 |
+| niri 没起来 / 没输出 | 检查 `/etc/udev/rules.d/99-vdrm-primary.rules` 三行、`render-drm-device`；重启或 `udevadm trigger` |
+| KWin / Hyprland 没输出 | `KWIN_DRM_DEVICES=/dev/dri/card1` / `AQ_DRM_DEVICES=/dev/dri/card1` |
+| **120 模式但感觉只有 60** | 用 Action 选 1920 模式 |
+| **2376 模式很卡** | 用 Action 选音量上（1920 带黑边），重启 |
+| **Action 按音量键没反应** | 直接编辑 `mode.conf`，或换物理音量键再试 |
+| **装 CI 的 APK 提示签名冲突** | 先卸载旧 App 再装 |
+| niri 日志 `got vblank after 0ns` | 可忽略，不影响出图 |
+
+---
+
+## 自己构建（可选）
+
+```sh
+# 模块 zip（需要六档 .ko 和 mkpool）
+python3 make-module.py
+
+# mkpool（NDK bionic clang）
+cd vdrm-mkpool && make CC=/data/data/com.termux/files/usr/bin/aarch64-linux-android-clang
+
+# vdrm_gbm.so（容器 aarch64 glibc，只依赖 libc）
+cd vdrm-gbm && gcc -shared -fPIC -O2 -Wall -o vdrm_gbm.so vdrm_gbm.c
+
+# APK
+gradle assembleDebug
+```
+
+推上去后 CI 会自动出 `weekly-YYYY-Www`，资产就是上面那三个文件。
 
 ---
 
 ## 鸣谢
 
-- Goldzxcbug，Superturtlee，项目引路人以及参考项目的开发者
-
-- Dere3046，提供了项目普适化的必要工具以及解决问题的思路
-
-- lfdevs大佬，该项目想要拥有硬件加速需要打他的驱动
-
-- anland项目，提供了初期思路以及大部分键鼠触控优化方法
-
-- mesa-for-android-container项目，该项目硬件加速所需要的驱动来源于此
+- Goldzxcbug、Superturtlee：项目引路与参考项目
+- Dere3046：普适化工具与排查思路
+- lfdevs：[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)：硬件加速驱动
+- anland：初期思路与键鼠触控优化
 
 ## 许可
 
