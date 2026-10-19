@@ -68,16 +68,17 @@ if [ -e /sys/module/vdrm/parameters/flip_done_immediate ]; then
     echo 0 > /sys/module/vdrm/parameters/flip_done_immediate
 fi
 
-# 2) /dev/vdrm：gpu_device 标签 + 0666。
+# 2) /dev/vdrm、/dev/vdrm-audio：gpu_device 标签 + 0666。
 #
 #    不做 chown：0666 让第一次安装/重装换 UID 都能直接 open，不需要查 UID、不需要
 #    重启。SELinux 边界是 gpu_device —— 有该权限的域能打开，没有的域打不开；
 #    不要求“只有 VDRM App 能开”。mkpool 以 root 运行，不受影响。
-if [ -e /dev/vdrm ]; then
-    chmod 666 /dev/vdrm
-    chcon u:object_r:gpu_device:s0 /dev/vdrm
-    log -t vdrm "vdrm perms: 0666 gpu_device"
-fi
+for n in /dev/vdrm /dev/vdrm-audio; do
+    [ -e "$n" ] || continue
+    chmod 666 "$n"
+    chcon u:object_r:gpu_device:s0 "$n"
+    log -t vdrm "vdrm perms: $n 0666 gpu_device"
+done
 
 # 3) 建池。mkpool 就在模块目录里，直接跑它 —— 不再往别处拷一份。
 #    （以前拷到 /data/wayland/vdrm_mkpool，那是守护进程时代留下的路径，已退役。

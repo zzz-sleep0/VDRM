@@ -53,6 +53,7 @@
 #include <sys/syscall.h>
 
 #include "anw_hidden.h"
+#include "vdrm_audio.h"
 
 #include <android/hardware_buffer.h>
 #include <android/surface_control.h>
@@ -417,10 +418,13 @@ struct consumer {
     volatile struct vdr2_frame_info *shm;  /* mmap'd */
     uint32_t last_seq;
 
-    /* Audio (reserved for KPM audio ctl0; threads only start if fd available) */
+    /* Audio: /dev/vdrm-audio ring -> AAudio */
     pthread_t play_thr;
     pthread_t cap_thr;
     volatile bool audio_running;
+    int audio_fd;
+    void *audio_map;
+    size_t audio_map_len;
     AAudioStream *play_stream;
     AAudioStream *cap_stream;
 };
@@ -1157,22 +1161,134 @@ static void *render_loop(void *arg)
     return NULL;
 }
 
-/* ======================== audio (reserved) ========================
- * KPM currently has no audio ctl0 command. These threads are kept for
- * when the KPM audio channel lands; they simply won't start (fd < 0).
+/* ======================== audio ========================
+ * /dev/vdrm-audio 的共享环由 vdrm.ko 的 ALSA playback 填充；
+ * 这里 mmap 环、poll 可读、把 PCM 写进 AAudio。
  */
 
 static void *audio_play_thread(void *arg)
 {
-    (void)arg;
-    LOGI("audio play thread: no audio channel (KPM audio not yet wired)");
+    struct consumer *c = arg;
+    struct vdrm_audio_ring *r = c->audio_map;
+
+    if (!r)
+        return NULL;
+    while (c->audio_running) {
+        struct pollfd p = { .fd = c->audio_fd, .events = POLLIN };
+        uint32_t head, tail, avail, off, n;
+
+        if (poll(&p, 1, 200) <= 0)
+            continue;
+        head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+        avail = head - tail;
+        if (!avail)
+            continue;
+        off = tail % r->size;
+        n = avail < r->size - off ? avail : r->size - off;
+        if (n)
+            AAudioStream_write(c->play_stream, r->data + off, n / 4, 1000000);
+        if (avail > n)
+            AAudioStream_write(c->play_stream, r->data, (avail - n) / 4, 1000000);
+        __atomic_store_n(&r->tail, tail + avail, __ATOMIC_RELEASE);
+    }
     return NULL;
+}
+
+static int audio_start(struct consumer *c)
+{
+    struct vdrm_audio_info info;
+    void *map;
+    int fd;
+    AAudioStreamBuilder *b = NULL;
+    AAudioStream *s = NULL;
+
+    if (c->audio_running)
+        return 0;
+    fd = open("/dev/vdrm-audio", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        LOGE("audio: open /dev/vdrm-audio: %s", strerror(errno));
+        return -1;
+    }
+    if (ioctl(fd, VDRM_AUDIO_GET_INFO, &info) < 0 ||
+        info.magic != VDRM_AUDIO_MAGIC) {
+        LOGE("audio: GET_INFO failed");
+        close(fd);
+        return -1;
+    }
+    map = mmap(NULL, info.header_size + info.size, PROT_READ | PROT_WRITE,
+               MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        LOGE("audio: mmap failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK)
+        goto err;
+    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setSampleRate(b, info.rate);
+    AAudioStreamBuilder_setChannelCount(b, info.channels);
+    AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_MEDIA);
+    AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
+    if (AAudioStreamBuilder_openStream(b, &s) != AAUDIO_OK)
+        goto err;
+    AAudioStreamBuilder_delete(b);
+    b = NULL;
+    if (AAudioStream_requestStart(s) != AAUDIO_OK) {
+        AAudioStream_close(s);
+        goto err_map;
+    }
+
+    c->audio_fd = fd;
+    c->audio_map = map;
+    c->audio_map_len = info.header_size + info.size;
+    c->play_stream = s;
+    c->audio_running = true;
+    if (pthread_create(&c->play_thr, NULL, audio_play_thread, c) != 0) {
+        c->audio_running = false;
+        AAudioStream_close(s);
+        c->play_stream = NULL;
+        goto err_map;
+    }
+    LOGI("audio: started %u Hz %u ch, ring %u", info.rate, info.channels, info.size);
+    return 0;
+err:
+    if (b)
+        AAudioStreamBuilder_delete(b);
+err_map:
+    munmap(map, info.header_size + info.size);
+    close(fd);
+    return -1;
+}
+
+static void audio_stop(struct consumer *c)
+{
+    if (!c->audio_running && c->audio_fd < 0)
+        return;
+    if (c->audio_running) {
+        c->audio_running = false;
+        pthread_join(c->play_thr, NULL);
+    }
+    if (c->play_stream) {
+        AAudioStream_stop(c->play_stream, 0);
+        AAudioStream_close(c->play_stream);
+        c->play_stream = NULL;
+    }
+    if (c->audio_map) {
+        munmap(c->audio_map, c->audio_map_len);
+        c->audio_map = NULL;
+    }
+    if (c->audio_fd >= 0) {
+        close(c->audio_fd);
+        c->audio_fd = -1;
+    }
 }
 
 static void *audio_cap_thread(void *arg)
 {
     (void)arg;
-    LOGI("audio cap thread: no audio channel (KPM audio not yet wired)");
     return NULL;
 }
 
@@ -1480,6 +1596,7 @@ Java_com_vdrm_consumer_Native_nativeCreate(JNIEnv *env, jclass clazz)
     if (c->stop_fd < 0) { free(c); return 0; }
     c->event_fd = -1;
     c->shm_fd = -1;
+    c->audio_fd = -1;
     /* 进程级 release worker：只起一次，之后所有 frame 共用一个线程。*/
     pthread_once(&g_release_once, release_worker_init);
     LOGI("instance %p created", (void *)c);
@@ -1499,6 +1616,7 @@ Java_com_vdrm_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong han
         pthread_join(c->thread, NULL);
         while (read(c->stop_fd, &wake, sizeof(wake)) > 0) {}
     }
+    audio_stop(c);
     sc_remove(g_sc);
     g_sc = NULL;
     if (g_last_surface) {
@@ -1761,8 +1879,8 @@ Java_com_vdrm_consumer_Native_nativeStartAudio(JNIEnv *env, jclass clazz, jlong 
 {
     struct consumer *c = STATE(handle);
     if (!c) return;
-    /* Audio channel not wired in KPM yet — reserved. */
-    (void)c;
+    if (audio_start(c) < 0)
+        LOGE("audio: start failed");
 }
 
 JNIEXPORT void JNICALL
@@ -1770,5 +1888,5 @@ Java_com_vdrm_consumer_Native_nativeStopAudio(JNIEnv *env, jclass clazz, jlong h
 {
     struct consumer *c = STATE(handle);
     if (!c) return;
-    (void)c;
+    audio_stop(c);
 }

@@ -78,6 +78,10 @@ static int                      g_has_modecfg;
 static int                      g_registered;
 
 static struct file_operations   g_fops;
+
+/* vdrm_audio.c */
+extern int vdrm_audio_init(struct device *parent);
+extern void vdrm_audio_exit(void);
 static struct drm_driver        g_driver;
 
 /* ---- 显示管线（M2b）---- */
@@ -1812,6 +1816,10 @@ static int vdrm_init(void)
 	if (rc) goto err;
 	pr_info("vdrm: stage=input-ok\n");
 
+	rc = vdrm_audio_init(&g_pdev->dev);
+	if (rc)
+		pr_err("vdrm: audio init rc=%d (audio disabled)\n", rc);
+
 	/* 池不在这里建，见上面"池不由内核建" */
 	pr_info("vdrm: bring-up ok (dev=%px)\n", g_dev);
 	return 0;
@@ -1822,6 +1830,7 @@ err:
 
 static void vdrm_exit(void)
 {
+	vdrm_audio_exit();
 	vdrm_input_teardown();
 	vdrm_do_unregister();
 	pr_info("vdrm: exit ok (dev=%px)\n", g_dev);
