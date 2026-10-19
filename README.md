@@ -206,6 +206,11 @@ gradle assembleDebug
 
 ---
 
+## 已知局限
+
+1.目前没有音频支持
+2.部分依赖高级设备特性的部分功能无法使用(如多屏协同，合成器录屏等)
+
 ## 鸣谢
 
 - Goldzxcbug、Superturtlee：项目引路与参考项目
