@@ -1,10 +1,12 @@
 name: Weekly release
 
-# 每次 push 都跑；同一 ISO 周内所有 commit 覆盖同一个 release，
-# 跨周自动新建。资产固定三个：模块 zip、vdrm_gbm.so、debug APK。
+# 每次 push 都跑（只改 README.md 的 push 跳过）；同一 ISO 周内所有 commit 覆盖
+# 同一个 release，跨周自动新建。资产固定三个：模块 zip、vdrm_gbm.so、debug APK。
 
 on:
   push:
+    paths-ignore:
+      - 'README.md'
   workflow_dispatch:
 
 permissions:

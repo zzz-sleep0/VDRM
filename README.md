@@ -67,8 +67,9 @@ vdrm-debug.apk         ← Android App
 ```
 XDG_RUNTIME_DIR=/tmp/xdg
 LIBSEAT_BACKEND=noop
-MESA_LOADER_DRIVER_OVERRIDE=msm
 ```
+
+> `MESA_LOADER_DRIVER_OVERRIDE` 跟着合成器走，见下面的合成器表。
 
 **设备**
 
@@ -99,7 +100,7 @@ privileged=nomask
 |---|---|
 | **niri** | 放 udev 规则（见下）+ `~/.config/niri/config.kdl` 末尾加 `debug { render-drm-device "/dev/dri/renderD128" }`；`MESA_LOADER_DRIVER_OVERRIDE=msm` |
 | **KWin** | `KWIN_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=kgsl` |
-| **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1` |
+| **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=msm` |
 
 niri 的 udev 规则，存成 `/etc/udev/rules.d/99-vdrm-primary.rules`：
 
@@ -173,7 +174,7 @@ niri msg outputs     # 1920x1080@120（或你选的模式），Current mode 有�
 | App 打不开 `/dev/vdrm` | `su -c 'chmod 666 /dev/vdrm; chcon u:object_r:gpu_device:s0 /dev/vdrm'`，确认模块 service.sh 跑过 |
 | **手机上冒出个大鼠标** | 用管理器装模块；给模块里的 `excluded-input-devices.xml` 打 `vendor_configs_file` 标签；确认装了 metamodule |
 | **Android 多出触摸屏/幽灵触摸** | 在 `/vendor/etc/excluded-input-devices.xml` 里补 `vdrm-touch`（三个设备一起），装 metamodule 后重启 |
-| 合成器**起不来 / 说没有渲染器** | `MESA_LOADER_DRIVER_OVERRIDE` 改成 `msm` |
+| 合成器**起不来 / 说没有渲染器** | 按合成器设 Mesa 后端：niri / Hyprland=`msm`，KWin=`kgsl` |
 | niri 报 `error opening primary GPU DRM node` | 确认容器里有 `card0`（完整硬件访问 / `enable_gpu_mode=1`，或显式 bind `/dev/dri/card0`） |
 | niri 报 `primary node is missing, display-only devices may not work` | 可忽略，不影响出图 |
 | niri 没起来 / 没输出 | 检查 `/etc/udev/rules.d/99-vdrm-primary.rules` 三行、`render-drm-device`；重启或 `udevadm trigger` |
