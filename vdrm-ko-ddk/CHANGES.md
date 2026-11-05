@@ -2271,3 +2271,48 @@ niri: ERROR connector mode list missing current mode
 | 再回竖屏 | 1264x2780 | 正常 |
 
 `vblank_ticks` 每次切档 +3（预热），之后 `vblank_running` 回到 0。
+
+---
+
+## 本版本第四十二项：把"容器 / 合成器"那批断言逐条实测（文档纠错）
+
+这一轮没改代码，只改文档 —— README 里关于容器和合成器的几条说法是"看着合理"写下的，
+实测有一半是错的。测试环境：Arch Linux ARM 容器、Mesa 27.0.0、**非 root 用户**
+（uid 1001，组 `video,input,audio,droidspaces-gpu`），判据一律是
+`/sys/module/vdrm/parameters/frames_pushed` 到底涨不涨（15 秒窗口）。
+
+| | niri 26.04 | Hyprland 0.57.1 | KWin / Plasma 6.8.2 |
+|---|---|---|---|
+| `MESA_LOADER_DRIVER_OVERRIDE=msm` | 出图（+197） | 出图（+1160） | 出图（+888） |
+| `MESA_LOADER_DRIVER_OVERRIDE=kgsl` | 出图（+465） | 出图（+1381） | 出图（+1048） |
+| 不设 | 0 帧：`software EGL renderers are skipped` + `no allocator available` | 崩（`Hyprland has crashed`） | 1 秒内 SIGTRAP（日志只有一个 `Trace/breakpoint trap`） |
+| `LIBSEAT_BACKEND=noop` 不设 | `Failed to open session: Function not implemented (os error 38)`，0 帧 | `CBackend::create() failed!` 后崩 | 不需要 |
+| 不给任何 DRM 设备变量 | 自己选中 card1 / renderD129 | 自己选中 card1 | 自己选中 card1 |
+
+纠正的断言：
+
+1. **"niri 只有 msm 后端可用，其他后端会被当成软件渲染"** —— 错。`kgsl` 也能跑，
+   三个合成器都试过，帧数都在涨。真正必要的是"**必须显式设**"：不设时 Mesa 加载器
+   从 card1 的驱动名 `vdrm` 找不到硬件驱动，才退到软件渲染。
+2. **Hyprland 的 `MESA_LOADER_DRIVER_OVERRIDE=ksgl`** —— 错字；而且它真正缺的是
+   `LIBSEAT_BACKEND=noop`（少了它崩在 `CBackend::create() failed!`）。
+3. **`KWIN_DRM_DEVICES` / `AQ_DRM_DEVICES` 不是必填** —— 容器里只剩 vdrm 一张 DRM 卡时，
+   两个合成器都自己选中 card1；这两个变量只在容器里还有真 GPU 的 `card0` 时才需要。
+4. **`bind_mounts=/dev/input,…` 不是必须的** —— `enable_hw_access=1` 就把整份 `/dev`
+   带进来了：那个 Arch 测试容器一个 `bind_mounts` 都没写，`/dev/dri`（card1 +
+   renderD128 + renderD129）、`/dev/input`（13 个设备）、`/dev/snd`（`0 [vdrm]` + 真声卡）
+   全都在。
+5. **niri 日志里的 render 节点是 `/dev/dri/renderD129`**（vdrm 自己的），原来写死成
+   `renderD128`；编号随容器，vdrm 排第几就是几。
+6. **`LIBSEAT_BACKEND=noop` 的说明**原来写"让 niri 以 root 直接开 DRM 设备" —— 普通用户
+   同样可以，前提是对 `/dev/dri/card1` 有 rw。现在连"非 root 要加哪些组"一起写进 README。
+7. **非 root 用户的三组权限**（README 新增小节）：`video`（card1）、
+   `droidspaces-gpu`（renderD128）、`input`（`/dev/input/event8` 能读到事件）、
+   `audio`（`plughw:vdrm,0` 能打开）。注意**缺 render 组的表现和缺 Mesa 覆盖一模一样**
+   （`failed to initialize renderer … software EGL renderers are skipped` +
+   `no allocator available for device`），很容易误判成"Mesa 后端选错了"。
+
+顺带确认（写进 README 的"设备"段）：容器里的节点是**容器 udev 重新生成**的，
+权限和宿主机不同 —— `card1` 是 `0660 root:video`、`renderD128` 是
+`0660 root:droidspaces-gpu`、vdrm 三个输入设备是 `0660 root:input`；宿主机上那三个
+输入设备仍是 `vdrm_hide_input` 造的 `0600 root:root`。

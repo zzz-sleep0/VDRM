@@ -75,28 +75,37 @@ vdrm-debug.apk         ← Android App
 ```
 XDG_RUNTIME_DIR=/tmp/xdg
 LIBSEAT_BACKEND=noop
+MESA_LOADER_DRIVER_OVERRIDE=msm
 ```
 
-> `MESA_LOADER_DRIVER_OVERRIDE` 跟着合成器走，见下面的合成器表。
+> 前两个是 wlroots 系（niri / Hyprland）必须的，KWin 只用第三个；`msm` 和 `kgsl`
+> 都实测可用，见下面的合成器表。
 
 **设备**
 
-```
-/dev/input        → /dev/input          # 整个目录
-/dev/dri/card1    → /dev/dri/card1      # 只挂虚拟卡
-/dev/snd          → /dev/snd            # 音频（整个目录）
-```
-
-Droidspaces 对应：
+Droidspaces 只要 `enable_hw_access=1`，整份 `/dev` 就进来了 —— 实测一个
+`bind_mounts` 都不写，容器里也照样有 `/dev/dri/card1`、`/dev/input`、
+`/dev/snd`（`/proc/asound/cards` 里 `0 [vdrm]` + 真声卡）、`/dev/vdrm`。
 
 ```ini
-bind_mounts=/dev/input:/dev/input,/dev/dri/card1:/dev/dri/card1,/dev/snd:/dev/snd
 enable_hw_access=1
 privileged=nomask
 ```
 
-> `/dev/snd` 里是 `vdrm` 声卡的 PCM/control 节点。容器里用非 root 用户放声时，
-> 如果打不开设备，检查一下节点权限/所属组（通常是 `0660 root:audio`）。
+只有开了 `enable_gpu_mode=1`（让容器里的 Mesa 直接吃真 GPU）的容器，我们才额外补一行
+把虚拟卡挂进 `/dev/dri`：
+
+```ini
+bind_mounts=/dev/dri/card1:/dev/dri/card1
+```
+
+> 容器里看到的是**容器 udev 重新生成过的节点**，权限和宿主机不同：`/dev/dri/card1`
+> 是 `0660 root:video`、`renderD128` 是 `0660 root:droidspaces-gpu`、
+> vdrm 那三个 input 设备是 `0660 root:input`。用非 root 用户跑合成器需要的组见
+> 上面「非 root 用户跑合成器」。
+>
+> `/dev/snd` 里 `card0` 就是 vdrm 声卡（`pcmC0D0p` 是 `0660 root:audio`）：非 root
+> 用户放声要进 `audio` 组。
 
 ### 4. 配合成器
 
@@ -125,42 +134,69 @@ card1 的驱动名是 `vdrm`，就去后端目录找 `vdrm_gbm.so` 并加载它�
 cd vdrm-gbm && make      # 只依赖 gcc + 发行版的 gbm.h
 ```
 
-**已知合成器的最小适配**
+**三个合成器的启动方式**
 
-| 合成器 | 要做的 |
-|---|---|
-| **niri** | 不需要任何额外配置：`XDG_RUNTIME_DIR=… LIBSEAT_BACKEND=noop MESA_LOADER_DRIVER_OVERRIDE=msm niri` 直接起（见下） |
-| **KWin** | `KWIN_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=kgsl` |
-| **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=ksgl` |
+下面这组都是在 Arch Linux ARM 容器、Mesa 27.0.0（niri 26.04 / Hyprland 0.57.1 /
+Plasma 6.8.2）里，用**非 root 用户**跑起来后 `frames_pushed` 真在涨的结果。
 
-**niri 的启动命令**就是普通的 niri，容器里没有 TTY，只多两个环境变量：
+| 合成器 | 启动 | 少一个环境变量会怎样（实测输出） |
+|---|---|---|
+| **niri** | `XDG_RUNTIME_DIR=… LIBSEAT_BACKEND=noop MESA_LOADER_DRIVER_OVERRIDE=msm niri` | 缺 `LIBSEAT_BACKEND=noop`：`Failed to open session: Function not implemented (os error 38)`，0 帧；缺 `MESA_LOADER_DRIVER_OVERRIDE`：`failed to initialize renderer, falling back to primary gpu: software EGL renderers are skipped`，0 帧 |
+| **Hyprland** | `XDG_RUNTIME_DIR=… LIBSEAT_BACKEND=noop MESA_LOADER_DRIVER_OVERRIDE=msm Hyprland` | 缺 `LIBSEAT_BACKEND=noop`：`CBackend::create() failed!` 后进程崩；缺 `MESA_LOADER_DRIVER_OVERRIDE`：同样崩 |
+| **KWin / Plasma** | `XDG_RUNTIME_DIR=… MESA_LOADER_DRIVER_OVERRIDE=msm dbus-run-session -- startplasma-wayland`（只要合成器的话 `kwin_wayland --drm` 也行） | 缺 `MESA_LOADER_DRIVER_OVERRIDE`：1 秒内 SIGTRAP 退出，日志只有一行 `Trace/breakpoint trap`；**不需要** `LIBSEAT_BACKEND=noop` |
+
+三个合成器的共同点（都是踩过的，不是保险起见）：
+
+1. **`XDG_RUNTIME_DIR` 必须存在、属于当前用户、可写**（0700 就够）。root 建的
+   `/tmp/xdg` 要 `chown` 给要跑合成器的用户，否则 socket 建不出来。
+2. **`MESA_LOADER_DRIVER_OVERRIDE` 必须显式写出。** Mesa 加载器从 card1 的驱动名
+   `vdrm` 找不到对应硬件驱动，就退到软件渲染（合成器这边表现成"没有渲染器"）。
+   `msm` 和 `kgsl` **两个都实测能用**（niri / Hyprland / KWin 挨个试过，帧数都在涨），
+   任选其一，推荐 `msm`。
+3. **设备节点不用指。** 容器里只剩 vdrm 这一张 DRM 卡（真 GPU 的 `card0` 已删）时，
+   三个合成器都自己选中了 card1 和它的 render 节点。`AQ_DRM_DEVICES=/dev/dri/card1`、
+   `KWIN_DRM_DEVICES=/dev/dri/card1` 只在容器里还有 `card0`、它挑错卡时才需要。
+
+**niri 的启动命令**：
 
 ```sh
-mkdir -p /tmp/xdg && chmod 700 /tmp/xdg     # XDG_RUNTIME_DIR 必须存在且 0700
+install -d -o "$USER" -g "$USER" -m 700 /tmp/xdg   # 属于自己且可写
 XDG_RUNTIME_DIR=/tmp/xdg \
 LIBSEAT_BACKEND=noop \
 MESA_LOADER_DRIVER_OVERRIDE=msm \
 niri
 ```
 
-两个变量的理由（都是实测过的，不是保险起见）：
+- `LIBSEAT_BACKEND=noop`：容器里没有能激活的 seat 会话，`noop` 让 niri 绕过
+  logind/seatd 自己去开 DRM 设备（对 `/dev/dri/card1` 有 rw 权限就行，root 或
+  普通用户都可以）。装了 seatd 时也可能停在
+  `session is not active, starting libinput in paused state`，同样是一个输出都不碰。
+- `MESA_LOADER_DRIVER_OVERRIDE=msm`：不设就是上面那条 `software EGL renderers are
+  skipped` + `no allocator available for device`，不出图。
 
-- `LIBSEAT_BACKEND=noop`：容器里没有能激活的 seat 会话。装的 seatd 也一样 ——
-  niri 会打印 `session is not active, starting libinput in paused state`，
-  然后一个输出都不碰（`frames_pushed` 一直是 0）。`noop` 是让 niri 以 root
-  直接开 DRM 设备。
-- `MESA_LOADER_DRIVER_OVERRIDE=msm`：不设的话 mesa 加载器给这台设备挑不到
-  硬件驱动，niri 会报 `failed to initialize renderer, falling back to primary
-  gpu: software EGL renderers are skipped`，接着 `no allocator available`，
-  不出图。
+> **不需要** udev 规则，也不需要 `debug { render-drm-device … }`：render 节点在位，
+> niri 自己就会选中它 —— 日志里是
+> `using as the render node: "/dev/dri/renderD129"`、`this is the primary node`
+> （编号随容器，vdrm 排第几个就是几）。只有在它真挑错 GPU 时，才用
+> `render-drm-device` 手动指一下。
 
-> **不需要** udev 规则，也不需要 `debug { render-drm-device … }`。
-> 那是早期没有 `renderD129` 的时候，niri 会把只有 card1 的设备当成"没有渲染节点"
-> 才要那么写；现在 render 节点在位，niri 自己就会选中它：
-> `using as the render node: "/dev/dri/renderD128"`、`this is the primary node`。
-> 只有在它真挑错 GPU 时，才用 `render-drm-device` 手动指一下。
+**非 root 用户跑合成器**
 
-> 由于niri对mesa后端的识别缺陷，目前只有msm后端可用，其他后端会被识别为软件渲染导致niri不工作
+容器里用普通用户跑（更像一台真机器，也免得合成器把文件都写成 root 的）需要三组权限，
+少一组就是"起得来但不出图"或者"有画面但没输入"：
+
+| 组 | 为了 | 少了会怎样 |
+|---|---|---|
+| `video` | `/dev/dri/card1`（`crw-rw---- root:video`） | 打不开输出设备 |
+| `droidspaces-gpu` | `/dev/dri/renderD128`（真 GPU 的 render 节点，droidspaces 建的组） | niri 报 `failed to initialize renderer … software EGL renderers are skipped` + `no allocator available for device`，`frames_pushed` 不动 |
+| `input` | `/dev/input/event*`（vdrm 的三个是 `crw-rw---- root:input`） | 有画面，但触摸/键鼠一个事件都收不到（拿 `dd if=/dev/input/event8 bs=24` 试，普通用户会 `Permission denied`） |
+
+```sh
+usermod -aG video,input,droidspaces-gpu <用户名>
+```
+
+（`droidspaces-gpu` 是 Droidspaces 给真 GPU 节点建的组；用别的容器方案时看
+`ls -l /dev/dri/renderD*` 的属组照着加。）
 
 ---
 
@@ -370,19 +406,22 @@ cat /sys/module/vdrm/parameters/frames_pushed   # 动一下鼠标，这个数应
 |---|---|
 | **全黑屏**，合成器在跑 | 重启；确认 `ls -l /dev/vdrm` 是 666 + `gpu_device`；在通知里切一次档；再看 `cat /sys/module/vdrm/parameters/active` 是否等于 `mode` |
 | App 打不开 `/dev/vdrm` | `su -c 'chmod 666 /dev/vdrm; chcon u:object_r:gpu_device:s0 /dev/vdrm'`，确认模块 service.sh 跑过 |
-| **手机上冒出个大鼠标 / Android 多出触摸屏、幽灵触摸** | `ls -l /dev/input/event*`：vdrm 那三个应该是 `crw------- root root`。被改回 `crw-rw---- root input` 就手动补一刀：`su -c '. /data/adb/modules/vdrm-lkm/common.sh; vdrm_hide_input'`（reload 场景用 `tools/vdrm_up.sh --reload`） |
-| 合成器**起不来 / 说没有渲染器** | 按合成器设 Mesa 后端：niri / Hyprland=`msm`，KWin=`kgsl` |
-| niri 报 `error opening primary GPU DRM node` | 确认容器里有 `card0`（完整硬件访问 / `enable_gpu_mode=1`，或显式 bind `/dev/dri/card0`） |
+| **手机上冒出个大鼠标 / Android 多出触摸屏、幽灵触摸** | **宿主机**上 `ls -l /dev/input/event*`：vdrm 那三个（`vdrm-kbd/ptr/touch`）应该是 `crw------- root root`，那是 `vdrm_hide_input` 一次性删掉重建的结果。被改回 `crw-rw---- root input` 就手动补一刀：`su -c '. /data/adb/modules/vdrm-lkm/common.sh; vdrm_hide_input'`（reload 场景用 `tools/vdrm_up.sh --reload`）。容器里看到的权限是容器 udev 自己给的（vdrm 三个是 `crw-rw---- root:input`），容器内靠 `LIBINPUT_IGNORE_DEVICE` 规则把其余设备全忽略 |
+| 合成器**起不来 / 说没有渲染器** | 先查 `MESA_LOADER_DRIVER_OVERRIDE` —— 不设时三个合成器都不干活（niri：`software EGL renderers are skipped`，KWin：1 秒内 SIGTRAP，Hyprland：崩）。`msm` / `kgsl` 实测都能用，任选 |
+| niri 报 `Failed to open session: Function not implemented (os error 38)` | 缺 `LIBSEAT_BACKEND=noop` |
+| Hyprland 崩在 `CBackend::create() failed!` | 缺 `LIBSEAT_BACKEND=noop`（或 `MESA_LOADER_DRIVER_OVERRIDE`） |
+| niri 报 `error opening primary GPU DRM node` | niri 打不开 DRM 卡：确认容器里有 `/dev/dri/card1`、当前用户对它有 rw（`video` 组）；设过 `render-drm-device` 的话先去掉 |
 | niri 报 `primary node is missing, display-only devices may not work` | 可忽略，不影响出图 |
-| niri 没起来 / 没输出 | 看日志里有没有 `software EGL renderers are skipped`（缺 `MESA_LOADER_DRIVER_OVERRIDE=msm`）或 `session is not active`（缺 `LIBSEAT_BACKEND=noop`）；`niri msg outputs` 里 `Virtual-3` 要是 `Current mode` 有值 |
-| KWin / Hyprland 没输出 | `KWIN_DRM_DEVICES=/dev/dri/card1` / `AQ_DRM_DEVICES=/dev/dri/card1` |
+| niri 没起来 / 没输出 | 先看 `software EGL renderers are skipped`（缺 `MESA_LOADER_DRIVER_OVERRIDE`）和 `Failed to open session`（缺 `LIBSEAT_BACKEND=noop`）；能跑起来后 `niri msg outputs` 里 `Virtual-3` 的 `Current mode` 要有值 |
+| KWin / Hyprland 没输出 | 容器里只有 vdrm 一张卡时它们会自己选中 card1，不用给设备变量；容器里还有真 GPU 的 `card0` 且挑错卡时，才用 `KWIN_DRM_DEVICES=/dev/dri/card1` / `AQ_DRM_DEVICES=/dev/dri/card1` |
+| 普通用户跑合成器：能起但不出图，或没触摸 | 见上表「非 root 用户跑合成器」：`video`（card1）、`droidspaces-gpu`（renderD128）、`input`（`/dev/input/event*`）三个组，缺 render 组就是 `no allocator available` |
 | **120 模式但感觉只有 60** | 在通知里切到黑边屏（1920x1080） |
 | **全面屏模式很卡** | 在通知里切到黑边屏（1920x1080） |
 | **通知里切档没反应** | 看 `cat /sys/module/vdrm/parameters/active` 有没有跟着变；没变多半是那个尺寸 HWC 扫不出去（见"已知局限"） |
 | **装 CI 的 APK 提示签名冲突** | 先卸载旧 App 再装 |
 | **无线 adb 老是掉** | 这不再随模块发布。仓库 `tools/adbd_keep.sh` 里留了一份自用版本（每 20 秒把 TCP 5555 重挂一遍），需要就自己 `setsid sh tools/adbd_keep.sh` 起 |
 | **没声音**，但 `aplay` 不报错 | 确认 App 开着；`cat /sys/module/vdrm/parameters/dropped_bytes` 是否在涨；`ls -l /dev/snd` |
-| 容器里 `aplay -l` 看不到 `vdrm` | 容器没绑 `/dev/snd`（见"配容器"）；宿主机 `lsmod \| grep vdrm` 要有 |
+| 容器里 `aplay -l` 看不到 `vdrm` | 先看 `cat /proc/asound/cards` 有没有 `0 [vdrm]`（没有就是容器没 `enable_hw_access=1`）；`aplay` 本身不存在是没装 `alsa-utils` |
 | 播放卡顿/爆音 | 看 `dropped_bytes`；App 被后台限流时也会掉；先试 1920 模式降负载 |
 | `insmod` 报 `Unknown symbol snd_*` | 内核没开 ALSA 或 `snd` 没加载；`dmesg` 看具体符号 |
 | niri 日志 `got vblank after 0ns` | 可忽略，不影响出图 |

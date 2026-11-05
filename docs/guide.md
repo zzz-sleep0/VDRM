@@ -98,13 +98,13 @@ cat /sys/module/vdrm/parameters/frames_pushed   # 动一下鼠标，这个数要
 
 ## 10. 已知局限（诚实清单）
 
-### 10.1 只有一档 KMI 是实测的
+### 10.1 只用 android14-6.1 实测过
 
-`.ko` 覆盖六档 GKI KMI（`android13-5.10` … `android16-6.12`），但**只有
-`android14-6.1` 上过真机**。其余五档的验收标准是"CI 编过"—— 那证明符号解析没问题，
-不证明行为正确。装到别的 KMI 上，第一反馈可能是黑屏而不是"有点小 bug"。
+`.ko` 覆盖六档 GKI KMI（`android13-5.10` … `android16-6.12`），但**只在
+`android14-6.1` 上实测过**。别的 KMI 装上去，第一反馈可能是黑屏而不是"有点小 bug"
+—— 这也是 README 开头要求先单独 `insmod` 试一次的原因。
 
-模块的 `service.sh` 会按 `uname -r` 拼出 KMI 再找同名 `.ko`，找不到会明确报
+`service.sh` 会按 `uname -r` 拼出 KMI 再找同名 `.ko`，找不到会明确报
 "没有 `vdrm-android14-6.1.ko`"而不是糊过去 —— 这是故意的。
 
 ### 10.2 有些分辨率永远上不了屏
