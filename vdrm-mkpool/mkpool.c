@@ -42,6 +42,10 @@ struct vdrm_handle_req {
     uint32_t id;      /* 0 = 清空整池 */
     uint32_t flags;
 };
+struct vdrm_screen_req {
+    uint32_t width;
+    uint32_t height;
+};
 struct vdrm_register_req {
     int32_t  fd;      /* fd0 */
     int32_t  fd1;     /* fd1 */
@@ -58,6 +62,82 @@ struct vdrm_register_req {
 #define VDRM_IOCTL_GET_INFO  VDRM_IOC(2, 'V', 0x00, sizeof(struct vdrm_info))
 #define VDRM_IOCTL_REGISTER  VDRM_IOC(3, 'V', 0x01, sizeof(struct vdrm_register_req))
 #define VDRM_IOCTL_UNREGISTER VDRM_IOC(1, 'V', 0x03, sizeof(struct vdrm_handle_req))
+#define VDRM_IOCTL_SET_SCREEN VDRM_IOC(1, 'V', 0x0b, sizeof(struct vdrm_screen_req))
+
+/* 面板尺寸：模块用它推出"全面屏"的横竖两档分辨率（modes 里那两档 1080p 以外
+ * 的尺寸就是这里来的）。
+ *
+ * 以前只有 App 会上报，而且是【窗口尺寸】—— 于是出现一个很难受的顺序依赖：
+ * App 不起，modes 里就只有 1080x1920 / 1920x1080 两档，写 mode=1264x2780
+ * 会被 rebuild 掉，合成器只能退回 16:9。窗口尺寸本来也不该决定"这块屏有多大"。
+ *
+ * 现在 mkpool 自己查：`wm size` 的输出里有 Physical size，设了 Override 就用
+ * Override（那是用户/系统实际生效的分辨率）。查不到就不动，模块保留原值。
+ * 传 --no-screen 可以跳过这一步。*/
+/* 写一个 /sys/module/vdrm/parameters/ 下的参数。 */
+static int write_param(const char *name, const char *val)
+{
+    char path[128];
+    FILE *f;
+    int rc;
+
+    snprintf(path, sizeof(path), "/sys/module/vdrm/parameters/%s", name);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    rc = fputs(val, f);
+    fputc('\n', f);
+    fclose(f);
+    return rc < 0 ? -1 : 0;
+}
+
+/* 目标尺寸：从 mode 参数读，而不是从 GET_INFO 读。
+ *
+ * GET_INFO 的 width/height 是 g_active，也就是"合成器此刻真正在用的尺寸"
+ * （App 靠它决定转屏）。运行中切分辨率时，参数已经是新尺寸、合成器还没
+ * modeset，这时候按 g_active 建池就会建到旧尺寸上。
+ * 参数读不到才退回 GET_INFO。*/
+static int query_mode_param(uint32_t *w, uint32_t *h)
+{
+    FILE *f = fopen("/sys/module/vdrm/parameters/mode", "r");
+    unsigned int a, b;
+    int ok = -1;
+
+    if (!f)
+        return -1;
+    if (fscanf(f, "%ux%u", &a, &b) == 2 && a && b) {
+        *w = a;
+        *h = b;
+        ok = 0;
+    }
+    fclose(f);
+    return ok;
+}
+
+static int query_screen(uint32_t *w, uint32_t *h)
+{
+    FILE *fp = popen("wm size 2>/dev/null", "r");
+    char line[128];
+    uint32_t pw = 0, ph = 0, ow = 0, oh = 0;
+
+    if (!fp)
+        return -1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned int a, b;
+
+        if (sscanf(line, "Physical size: %ux%u", &a, &b) == 2) {
+            pw = a; ph = b;
+        } else if (sscanf(line, "Override size: %ux%u", &a, &b) == 2) {
+            ow = a; oh = b;
+        }
+    }
+    pclose(fp);
+
+    if (ow && oh) { *w = ow; *h = oh; return 0; }
+    if (pw && ph) { *w = pw; *h = ph; return 0; }
+    return -1;
+}
 
 /* 分配档位：必须与 App 侧（anland 借 buffer 那条路）的分配质量对齐。
  *
@@ -84,7 +164,7 @@ struct vdrm_register_req {
 
 #define NPOOL 6
 
-int main(void)
+int main(int argc, char **argv)
 {
     /*
      * 日志写在【自己旁边】—— 也就是模块目录里，跟着模块走（模块被卸掉日志一起没）。
@@ -105,7 +185,7 @@ int main(void)
         strcpy(logpath, "/data/local/tmp/vdrm-mkpool.log");
 
     FILE *lg = fopen(logpath, "w");
-    int fd, i, ok = 0;
+    int fd, i, ok = 0, have = 0, need;
     struct vdrm_info info;
     uint32_t w, h, fmt, pitch;
 
@@ -114,25 +194,121 @@ int main(void)
     fd = open("/dev/vdrm", O_RDWR | O_CLOEXEC);
     if (fd < 0) { P("open /dev/vdrm: %s\n", strerror(errno)); return 1; }
 
+    /* 先把面板尺寸告诉模块，modes 列表里才会有"这块屏"的横竖两档。
+     * 必须在 GET_INFO / 建池之前 —— 建池看的是模块当前的生效尺寸。*/
+    {
+        int no_screen = 0;
+
+        for (i = 1; i < argc; i++)
+            if (strcmp(argv[i], "--no-screen") == 0)
+                no_screen = 1;
+
+        if (!no_screen) {
+            uint32_t sw = 0, sh = 0;
+
+            if (query_screen(&sw, &sh) == 0) {
+                struct vdrm_screen_req sr;
+
+                sr.width = sw;
+                sr.height = sh;
+                if (ioctl(fd, VDRM_IOCTL_SET_SCREEN, &sr) == 0)
+                    P("screen %ux%u -> KPM\n", sw, sh);
+                else
+                    P("SET_SCREEN: %s\n", strerror(errno));
+            } else {
+                P("wm size 查不到，沿用 KPM 现有尺寸\n");
+            }
+        }
+    }
+
     memset(&info, 0, sizeof(info));
     if (ioctl(fd, VDRM_IOCTL_GET_INFO, &info) < 0) {
         P("GET_INFO: %s\n", strerror(errno)); return 1;
     }
     w = info.width; h = info.height; fmt = info.format; pitch = info.pitch;
-    P("KPM mode %ux%u pitch=%u fmt=%08x\n", w, h, pitch, fmt);
+    P("KPM active %ux%u pitch=%u fmt=%08x\n", w, h, pitch, fmt);
+
+    /* --mode WxH：一次完整的运行时切换。
+     *   1) 写 mode 参数 = prepare（只记目标，模块不发 hotplug）
+     *   2) 按目标尺寸把槽补齐
+     *   3) 池齐了再写 commit = 更新 EDID + hotplug
+     * 顺序固定，所以合成器收到热插拔时槽一定已经在了。*/
+    const char *mode_arg = NULL;
+
+    for (i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
+            mode_arg = argv[++i];
+
+    if (mode_arg) {
+        uint32_t mw = 0, mh = 0;
+
+        if (sscanf(mode_arg, "%ux%u", &mw, &mh) == 2 && mw && mh) {
+            if (write_param("mode", mode_arg) == 0)
+                P("prepare: mode -> %ux%u\n", mw, mh);
+            else
+                P("写 mode 参数失败: %s\n", strerror(errno));
+            w = mw;
+            h = mh;
+        } else {
+            P("--mode 参数格式不对（要 WxH）：%s\n", mode_arg);
+        }
+    } else {
+        uint32_t mw = 0, mh = 0;
+
+        if (query_mode_param(&mw, &mh) == 0 && (mw != w || mh != h)) {
+            P("目标尺寸取 mode 参数：%ux%u（合成器当前 %ux%u）\n", mw, mh, w, h);
+            w = mw;
+            h = mh;
+        }
+    }
     P("alloc profile: fmt=%u usage=0x%llx\n",
       VDRM_AHB_FORMAT, (unsigned long long)VDRM_AHB_USAGE);
 
-    /* 先清空旧池：避免多次跑 mkpool 在池里累积旧批次
-     * （否则合成器会用到新批，而 App 只重建前 6 个 → 对不上）*/
-    {
-        struct vdrm_handle_req clr;
-        memset(&clr, 0, sizeof(clr));
-        if (ioctl(fd, VDRM_IOCTL_UNREGISTER, &clr) == 0)
-            P("已清空旧池\n");
+    /* 保留 / 补齐：只在显式 --reset 时清池。
+     *
+     * 为什么要改：切分辨率时清整池会让"旧尺寸的槽"一起消失，切换要等一整轮
+     * 重新分配（1–2 秒黑），而且来回切尺寸等于反复全清全建。现在改成"看看这档
+     * 还缺几个，只补缺的"，其它尺寸的槽原样留着 —— 来回切就几乎零成本。*/
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--reset") == 0) {
+            struct vdrm_handle_req clr;
+
+            memset(&clr, 0, sizeof(clr));
+            if (ioctl(fd, VDRM_IOCTL_UNREGISTER, &clr) == 0)
+                P("--reset: 已清空旧池\n");
+            break;
+        }
     }
 
-    for (i = 0; i < NPOOL; i++) {
+    {
+        FILE *f = fopen("/sys/module/vdrm/parameters/mode_slots", "r");
+
+        if (f) {
+            if (fscanf(f, "%d", &have) != 1)
+                have = 0;
+            fclose(f);
+        }
+    }
+    if (have < 0)
+        have = 0;
+    P("池里已有 %d 个 %ux%u 的槽（目标 %d）\n", have, w, h, NPOOL);
+    if (have >= NPOOL) {
+        P("done: %d/%d registered; 池已够，无需补齐\n", have, NPOOL);
+
+        /* 池本来就够，也要 commit —— 否则这次的 mode 永远不会广播出去。*/
+        if (mode_arg) {
+            if (write_param("commit", "1") == 0)
+                P("commit: EDID + hotplug 已发出\n");
+            else
+                P("写 commit 失败: %s\n", strerror(errno));
+        }
+        close(fd);
+        if (lg) fclose(lg);
+        return 0;
+    }
+    need = NPOOL - have;
+
+    for (i = 0; i < need; i++) {
         AHardwareBuffer_Desc d, g;
         AHardwareBuffer *b = NULL;
         const native_handle_t *nh;
@@ -183,7 +359,15 @@ int main(void)
          * 但底层 dma-buf 已被 KPM fget 住，池不受影响。*/
         ok++;
     }
-    P("done: %d/%d registered; 退出后池由 KPM 持住\n", ok, NPOOL);
+    P("done: %d/%d registered; 退出后池由 KPM 持住\n", have + ok, NPOOL);
+
+    /* 槽齐了才广播新尺寸：合成器换档时一定有 buffer 可用。*/
+    if (mode_arg) {
+        if (write_param("commit", "1") == 0)
+            P("commit: EDID + hotplug 已发出\n");
+        else
+            P("写 commit 失败: %s\n", strerror(errno));
+    }
     close(fd);
     if (lg) fclose(lg);
     return ok > 0 ? 0 : 2;

@@ -14,9 +14,14 @@
 #     在【同名路径】下编，否则 md5 必然不同。这条对 App 的 .so 同样成立。
 #
 # 自校验（在某个目录下 `cd` 进去再编，源码叫 mkpool.c）：
-#   md5sum vdrm_mkpool  →  be87f17973c77b752c8fe1c4a8b7edce   (10704 B)
+#   md5sum vdrm_mkpool  →  c7b653f96e1e950ae3a3d76862fb34c3   (15528 B)
 #
-# 这个值随源码变。上一版是 8f7cf89b…（10144 B）—— 分配档位补上
+# 这个值随源码变。上一版是 f99801ad…（13896 B）—— `--mode WxH` 一条命令走完
+# prepare（写 mode）→ 建槽 → commit（EDID + hotplug）。
+# 再上一版是 5c62aecd…（13280 B）—— 建池前自己用 `wm size`
+# 查面板尺寸并 SET_SCREEN（不再依赖 App 上报窗口尺寸）。
+# 更早是 27b5fd1a…（11680 B）
+# 更早是 8f7cf89b…（10144 B）—— 分配档位补上
 # GPU_COLOR_OUTPUT（对齐 App/anland 的分配质量），并在 mkpool.log 里
 # 打印 describe 与原始 handle 元数据，方便和 App 侧对照。
 # 更早一版是 ffd57b46…（9640 B）—— 日志位置从写死的 /data/wayland/mkpool.log

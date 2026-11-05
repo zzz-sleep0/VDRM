@@ -72,7 +72,7 @@ AHardwareBuffer *vdrm_ahb_rebuild(int fd0, int fd1, const uint32_t *ints,
 	head[7]  = (int32_t)(id >> 32);
 	head[8]  = (int32_t)id;
 	head[9]  = 0;                          /* generationNumber */
-	head[10] = 2;                          /* numFds: pixel + blob */
+	head[10] = (fd1 >= 0) ? 2 : 1;         /* numFds: 实际发出的 fd 数 */
 	head[11] = (int32_t)num_ints;
 	head[12] = (int32_t)(usage >> 32);
 	memcpy(wire, head, sizeof(head));
@@ -80,7 +80,9 @@ AHardwareBuffer *vdrm_ahb_rebuild(int fd0, int fd1, const uint32_t *ints,
 
 	pix = dup(fd0);
 	blb = (fd1 >= 0) ? dup(fd1) : -1;
-	if (pix < 0 || blb < 0) {
+	/* 只有 1 个 fd 的 handle（没有 metadata blob）必须也能重建；
+	 * 旧代码一律要求 blb >= 0，这种 handle 永远失败。*/
+	if (pix < 0 || (fd1 >= 0 && blb < 0)) {
 		FLOGE("rebuild: dup failed errno=%d", errno);
 		if (pix >= 0) close(pix);
 		if (blb >= 0) close(blb);
@@ -88,6 +90,7 @@ AHardwareBuffer *vdrm_ahb_rebuild(int fd0, int fd1, const uint32_t *ints,
 		return NULL;
 	}
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+		int nfds = (blb >= 0) ? 2 : 1;
 		char cbuf[CMSG_SPACE(2 * sizeof(int))];
 		struct iovec iov = { wire, total };
 		struct msghdr msg;
@@ -101,9 +104,9 @@ AHardwareBuffer *vdrm_ahb_rebuild(int fd0, int fd1, const uint32_t *ints,
 		cmsg = CMSG_FIRSTHDR(&msg);
 		cmsg->cmsg_level = SOL_SOCKET;
 		cmsg->cmsg_type = SCM_RIGHTS;
-		cmsg->cmsg_len = CMSG_LEN(2 * sizeof(int));
+		cmsg->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
 		fds[0] = pix; fds[1] = blb;
-		memcpy(CMSG_DATA(cmsg), fds, sizeof(fds));
+		memcpy(CMSG_DATA(cmsg), fds, (size_t)nfds * sizeof(int));
 		msg.msg_controllen = cmsg->cmsg_len;
 		if (sendmsg(sv[0], &msg, 0) >= 0)
 			rc = AHardwareBuffer_recvHandleFromUnixSocket(sv[1], &out);
@@ -116,7 +119,8 @@ AHardwareBuffer *vdrm_ahb_rebuild(int fd0, int fd1, const uint32_t *ints,
 	}
 	free(wire);
 	close(pix);
-	close(blb);
+	if (blb >= 0)
+		close(blb);
 
 	if (rc != 0 || !out) {
 		FLOGE("rebuild refused rc=%d (%ux%u stride=%u ints=%u)",

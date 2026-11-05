@@ -4,13 +4,14 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.content.pm.ActivityInfo;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.PowerManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
-import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -21,17 +22,55 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final String TAG = "VDRM";
 
-    /* true  = 手机触摸当直接触摸屏（ABS_MT，经内核 vdrm-touch）
-     * false = 旧的触控板模拟（REL 鼠标，VirtualTouchpad）
-     * 目前是编译期开关；后面可以接成 UI 里的小按钮。 */
-    private static final boolean DIRECT_TOUCH = true;
+    /* 输入模式：手机触摸要当成什么注入给容器。
+     *
+     *   0 = 鼠标    手指拖动 → REL 相对位移（VirtualTouchpad，触控板手感）
+     *   1 = 触控屏  手指按哪就点哪 → ABS_MT 绝对坐标（经内核 vdrm-touch）
+     *
+     * 运行时可切：通知里的 `input 0` / `input 1` 会改这个静态字段并写进
+     * SharedPreferences，下一次触摸立即按新模式走（不用重启 App）。*/
+    public static final int INPUT_MOUSE = 0;
+    public static final int INPUT_TOUCH = 1;
+    public static final String PREFS = "vdrm";
+    public static final String PREF_INPUT = "input_mode";
+
+    /** volatile：通知服务（另一个线程）改，UI 线程每次触摸读 */
+    public static volatile int inputMode = INPUT_TOUCH;
 
     private SurfaceView surfaceView;
     private VirtualTouchpad touchpad;
     private VirtualKeyboardView keyboardView;
     private long nativeHandle;
-    private PowerManager.WakeLock wakeLock;
+    /* 以前这里还持有一个 SCREEN_BRIGHT + ACQUIRE_CAUSES_WAKEUP 的唤醒锁。
+     * 那个锁有两个副作用：
+     *   1) ACQUIRE_CAUSES_WAKEUP 是"每次申请都把屏幕点亮"——进程被杀后前台服务
+     *      重新拉起、Activity 重建，都会在息屏状态下把屏幕点亮，看起来像
+     *      "电源键没生效/要按两次"；
+     *   2) 常驻持有会让屏幕永不因超时熄灭。
+     * 屏幕常亮这件事 window 上的 FLAG_KEEP_SCREEN_ON 已经做了，而且作用域只跟着
+     * 窗口走（退到后台自动释放），不会主动点亮屏幕。所以这里不再要唤醒锁。*/
     private long lastBackTime;
+
+    /* ---- 跟着虚拟屏的方向转 ----
+     *
+     * KPM 的输出是一块"显示器"，横竖由合成器选的 mode 决定（1080x1920 就是竖的）。
+     * 手机这边窗口方向如果写死 landscape，竖屏 mode 就只能在中间缩成一小条 ——
+     * 所以这里按 mode 的宽高申请窗口方向：竖 mode → 竖窗口，横 mode → 横窗口。
+     * 这样虚拟屏才能按原比例尽量铺满屏幕（比例不同时仍由 native 的 letterbox
+     * 补黑边，绝不拉伸）。
+     *
+     * 正常由内核的 mode eventfd 推事件，native 回调 onModeChanged()；
+     * 1 秒的 Handler 只是兜底（事件丢失/老模块没有事件通道时仍能自愈）。*/
+    private static final long ORIENT_POLL_MS = 1000;
+    private int appliedOrientation;
+    private final Handler orientHandler = new Handler(Looper.getMainLooper());
+    private final Runnable orientPoll = new Runnable() {
+        @Override
+        public void run() {
+            syncOrientation();
+            orientHandler.postDelayed(this, ORIENT_POLL_MS);
+        }
+    };
 
     /* 复用触摸数组，避免每个 MotionEvent 分配 4 个数组（120Hz 下很可观）。*/
     private static final int TOUCH_MAX = 10;   /* = VDRM_TOUCH_MAX */
@@ -43,6 +82,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        /* 先按当前生效尺寸申请窗口方向，再 setContentView。
+         * 放在后面的话 SurfaceView 会先按手机默认方向（通常是竖）创建，
+         * 第一帧横屏画面就会先被等比缩进竖窗口，等转屏完成才铺满。
+         * nativeGetMode 首次调用只看 GET_INFO（active），不会被上一次
+         * commit 的目标尺寸带偏。*/
+        syncOrientation();
 
         /* Fullscreen */
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
@@ -62,10 +108,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         /* Keep screen on */
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        /* 窗口级刷新率偏好：Surface/SC 的 120 请求不够，Activity 窗口
-         * 自身也要投票，否则 display mode director 按窗口默认的 60 处理。 */
+        /* 不再投 120Hz 的票。
+         *
+         * 这台是 LTPO 屏：SF 的 VRR 策略本来就会在 60/90/120 之间按内容切，
+         * 每次切面板都要重配 gamma/boost，暗画面（容器桌面）上就是可见的一闪。
+         * App 硬投 120 等于一直把策略往 120 拉，和空闲计时器/别的窗口打架，
+         * 只会制造更多切换。anland 那边从不投票，帧率完全交给系统。
+         * 详见 docs/anland-output-path.md。*/
         WindowManager.LayoutParams attrs = getWindow().getAttributes();
-        attrs.preferredRefreshRate = 120f;
         if (Build.VERSION.SDK_INT >= 30) {
             /* 允许窗口铺满摄像头挖空区：1920x1080 模式仍由 SC letterbox 留黑边，
              * 2376x1080 模式则真正 1:1 铺满（挖空会压在桌面上）。 */
@@ -73,14 +123,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         }
         getWindow().setAttributes(attrs);
-
-        /* Wake lock */
-        PowerManager pm = getSystemService(PowerManager.class);
-        if (pm != null) {
-            wakeLock = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK |
-                                      PowerManager.ACQUIRE_CAUSES_WAKEUP, "vdrm:wakelock");
-            wakeLock.acquire();
-        }
 
         /* Foreground notification (prevents Android from killing us) */
         requestPermissions();
@@ -102,7 +144,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         View touchOverlay = new View(this) {
             @Override
             public boolean onTouchEvent(MotionEvent event) {
-                if (DIRECT_TOUCH) return sendTouchFrame(event);
+                if (inputMode == INPUT_TOUCH) return sendTouchFrame(event);
                 if (touchpad != null) return touchpad.onTouch(event);
                 return true;
             }
@@ -126,16 +168,77 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setContentView(root);
 
         touchpad = new VirtualTouchpad(this);
+        inputMode = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getInt(PREF_INPUT, INPUT_TOUCH);
         nativeHandle = Native.nativeCreate();
+
+        /* 真·事件驱动：内核 commit / pipe_enable 时 signal App eventfd，
+         * native 渲染线程回调这里。回调在非 UI 线程，转回主线程再转屏。*/
+        Native.setModeListener(() -> runOnUiThread(() -> {
+            if (!isFinishing() && !isDestroyed())
+                syncOrientation();
+            /* 换档的同时把通知里的状态也刷一遍：这里天然是"参数刚变过"的
+             * 时刻，不需要另开轮询。*/
+            ForegroundService.requestRefresh(this);
+        }));
+
+        syncOrientation();
+        orientHandler.postDelayed(orientPoll, ORIENT_POLL_MS);
+    }
+
+    /** 读一次 KPM 的生效几何，方向变了就申请转屏。 */
+    private void syncOrientation() {
+        int packed = Native.nativeGetMode();
+        if (packed <= 0) return;
+        int w = (packed >>> 16) & 0xffff;
+        int h = packed & 0xffff;
+        if (w <= 0 || h <= 0) return;
+
+        int want = (h > w) ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                           : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+
+        /* appliedOrientation 只记“申请过”，不代表窗口真的转过去了。
+         * 启动时 Activity 可能先是手机默认的竖屏；如果只比 appliedOrientation，
+         * 就会以为已经申请过而不再 setRequestedOrientation，窗口永远停在竖屏，
+         * 横屏帧被 letterbox 缩进去。这里再对一次实际 Configuration。*/
+        int current = getResources().getConfiguration().orientation;
+        boolean windowMatches =
+            (want == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT &&
+             current == Configuration.ORIENTATION_PORTRAIT) ||
+            (want == ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE &&
+             current == Configuration.ORIENTATION_LANDSCAPE);
+        if (want == appliedOrientation && windowMatches) return;
+        appliedOrientation = want;
+        Log.i(TAG, "orientation -> "
+                + (want == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                   ? "portrait" : "landscape")
+                + " (KPM " + w + "x" + h + ")");
+        /* configChanges 里有 orientation|screenSize，所以不会重建 Activity，
+         * SurfaceView 的尺寸变化走 surfaceChanged。*/
+        setRequestedOrientation(want);
+    }
+
+    /* 从后台回到前台：通知 native 一声"就绪"。
+     *
+     * 后台时 SF 不再合成这个图层 → present 不来 → 内核的帧事件只能等存活超时，
+     * 桌面掉到个位数帧率。干等合成器下一次提交的话，切回来那一下会先停一下
+     * 再醒 —— 就是肉眼看到的卡顿。nativeSetReady() 让内核立刻把当前帧重推
+     * 一次，并把最后一帧重贴回图层，恢复是瞬时的。*/
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (nativeHandle != 0)
+            Native.nativeSetReady(nativeHandle);
+        /* 回前台顺手把通知状态对一次（用户这时候才会看它） */
+        ForegroundService.requestRefresh(this);
     }
 
     @Override
     protected void onDestroy() {
+        Native.setModeListener(null);
+        orientHandler.removeCallbacks(orientPoll);
         Native.nativeDestroy(nativeHandle);
         nativeHandle = 0;
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
-        }
         stopForegroundService();
         super.onDestroy();
     }
@@ -148,13 +251,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         keyboardView.setScreenSize(width, height);
-        /* 请求 120Hz：让 SF/display 以 8.3ms 的网格 latch，减少 60fps 内容
-         * 等满 16.7ms 的概率。native 侧还会对子 SC 下一次同样的请求。 */
-        if (Build.VERSION.SDK_INT >= 30) {
-            holder.getSurface().setFrameRate(120f,
-                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
-        }
-        Log.i(TAG, "VDRM build window-120-t3");
+        /* 同上：不再对 Surface 投 120Hz。 */
+        Log.i(TAG, "VDRM build window-no-fps-vote");
         Native.nativeStart(nativeHandle, holder.getSurface());
         Native.nativeStartAudio(nativeHandle);
     }
@@ -193,29 +291,32 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return true;
     }
 
-    /** 小窗↔全屏 等配置变化：键盘来不及重排（约 0.5s 延迟），干脆先收起来，
-     *  等画面稳定后用户再按 BACK 唤出。*/
+    /** 横竖切换 / 小窗↔全屏 等配置变化。
+     *
+     *  以前这里会把键盘收起来，因为键盘大小是按窗口比例算的、重排会跳一下。
+     *  现在键盘大小定死了（见 VirtualKeyboardView.setScreenSize），转屏之后
+     *  尺寸不变，只是重新贴到底部，所以让它一直显示着，不用再藏。*/
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
-        if (keyboardView != null && keyboardView.getVisibility() == View.VISIBLE) {
-            keyboardView.setVisibility(View.GONE);
-            Log.i(TAG, "config changed -> hide keyboard");
-        }
+        Log.i(TAG, "config changed -> orientation "
+                + newConfig.orientation + ", keyboard kept");
     }
 
     /* ---- Key interception ---- */
 
+    /* 音量键不拦。
+     *
+     * 以前这里把 VOLUME_UP/DOWN 转发进容器（115/114）然后 return true ——
+     * 只要这块窗口是焦点（也就是容器正在出画面的时候），手机的音量键就被
+     * 整个吞掉：音量的加减完全没反应，看起来像"音量炸了"。
+     * 而且容器里的虚拟键盘现在也不再声明 113/114/115（见内核 vdrm_key_system），
+     * 转发过去也是空转。
+     *
+     * 更关键的是：容器里的声音是 App 用 AudioTrack 播到手机上的，
+     * 所以手机的音量键本来就该调手机的媒体音量 —— 交给系统处理才对。*/
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-            Native.nativeSendKey(115, true);
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            Native.nativeSendKey(114, true);
-            return true;
-        }
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             long now = System.currentTimeMillis();
             if (now - lastBackTime < 500) {
@@ -237,14 +338,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-            Native.nativeSendKey(115, false);
-            return true;
-        }
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            Native.nativeSendKey(114, false);
-            return true;
-        }
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             return true;
         }

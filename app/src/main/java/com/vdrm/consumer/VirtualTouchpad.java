@@ -34,7 +34,9 @@ public final class VirtualTouchpad {
     private static final float DEAD_ZONE        = 0.3f;
     private static final float SMOOTHING_FACTOR = 0.45f;
     private static final float ACCUM_THRESHOLD  = 0.1f;
-    private static final float ACCEL            = 2.0f;   /* 灵敏度：>1 即非 1:1 */
+    /* 灵敏度：>1 即非 1:1。曲线是 scale = 1 + (ACCEL-1) * speed/(1+speed)，
+     * 所以 2.0 → 1.5 就是"最大加速从 2.0x 降到 1.5x"，整体手感约 75%。*/
+    private static final float ACCEL            = 1.5f;
     private static final float SCROLL_SPEED     = 0.5f;  /* 双指位移 → 滚动量 */
 
     private int state = STATE_IDLE;

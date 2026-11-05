@@ -21,7 +21,10 @@ jobs:
 
   release:
     needs: [ko, apk]
-    runs-on: ubuntu-latest
+    # 固定在 22.04：vdrm_gbm.so 在这里现编，跑在用户容器里。
+    # 构建机的 glibc 就是产物的 glibc 下限 —— 用 ubuntu-latest（24.04）会让
+    # 它要 GLIBC_2.38，Debian 12 / Ubuntu 22.04 直接加载失败。
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +39,17 @@ jobs:
         with:
           name: vdrm-apk
           path: assets
+
+      # vdrm_gbm.so 是【构建产物】（.gitignore 里有 *.so），仓库里没有它。
+      # 以前这里直接 cp，等于依赖"本地编好、恰好没被清掉"的文件 —— 干净
+      # checkout 上这一步会 cp 失败。所以在装配前现编一次：
+      # 只依赖 libc + 容器/构建机自带的 gbm.h，几十毫秒的事。
+      - name: Build vdrm_gbm.so
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential
+          make -C vdrm-gbm
+          file vdrm-gbm/vdrm_gbm.so
 
       - name: Collect assets
         run: |

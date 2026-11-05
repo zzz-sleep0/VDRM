@@ -22,7 +22,15 @@ rm -f /data/wayland/vdrm_mkpool /data/wayland/mkpool.log
 # 3) 更早一次【手工安装】留下的 ROM 备份。现在覆盖靠 metamodule，没这一步。
 rm -f /data/adb/excluded-input-devices.xml.bak
 
-# 4) 模块目录自己，外加可能存在的更新暂存目录。
+# 4) adbd 保活守护：先停进程，再收掉它的开机钩子副本。
+if [ -f /data/local/tmp/adbd_keep.pid ]; then
+    kill "$(cat /data/local/tmp/adbd_keep.pid)" 2>/dev/null
+    rm -f /data/local/tmp/adbd_keep.pid
+fi
+rm -f /data/adb/service.d/adbd_keep.sh /data/adb/service.d/.adbd_keep.sh.new
+rm -f /data/local/tmp/adbd_keep.log
+
+# 5) 模块目录自己，外加可能存在的更新暂存目录。
 #    —— 放在【最后】一行，因为这一步会把自己也删掉：shell 已把本文件读进内存了，
 #    删了不影响正在跑的这几步，但放最后更稳妥。
 rm -rf "/data/adb/modules/$ID" "/data/adb/modules_update/$ID"

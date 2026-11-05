@@ -5,25 +5,37 @@ plugins {
 android {
     namespace 'com.vdrm.consumer'
     compileSdk 34
-    ndkVersion '30.0.16248370'   // r30：r25~r27 的 surface_control.h 里 C++ 重载没加 __cplusplus 保护，C 编不过；r29 起才修
+    /* 只有从源码编原生库（-PvdrmBuildNative）才需要 NDK。
+     * r30：r25~r27 的 surface_control.h 里 C++ 重载没加 __cplusplus 保护，
+     * C 编不过；r29 起才修。*/
+    if (project.hasProperty('vdrmBuildNative')) {
+        ndkVersion '30.0.16248370'
+    }
 
     defaultConfig {
         applicationId 'com.vdrm.consumer'
         minSdk 29
         targetSdk 34
-        versionCode 2
-        versionName '0.5.0'
+        versionCode 3
+        versionName '0.6.0'
         ndk {
             abiFilters 'arm64-v8a'
         }
-        externalNativeBuild {
-            cmake {
-                /* AGP 默认拿 minSdk 当 NDK 的编译 API 级别。NDK 头里
-                 * ASurfaceTransaction_setGeometry 的 C 版本被
-                 * __ANDROID_API__ >= 34 挡着，级别不够就只剩一个
-                 * const ARect& 的 C++ 重载 —— C 编不过（实测）。
-                 * 这里把【编译】级别抬到 34，minSdk 不动。*/
-                arguments '-DANDROID_PLATFORM=android-34'
+        /* 原生库有两条路：
+         *  1) 默认：用 src/main/jniLibs/<abi>/libvdrm_consumer.so（预编译）。
+         *     没有 NDK 的环境（如 Android 上的 IDE）也能打出可用的 APK。
+         *  2) 传 -PvdrmBuildNative 时：用下面的 CMake 从 jni/ 现场编。
+         * 两条同时开会撞"同名 .so 出现两次"，所以默认只留预编译。*/
+        if (project.hasProperty('vdrmBuildNative')) {
+            externalNativeBuild {
+                cmake {
+                    /* AGP 默认拿 minSdk 当 NDK 的编译 API 级别。NDK 头里
+                     * ASurfaceTransaction_setGeometry 的 C 版本被
+                     * __ANDROID_API__ >= 34 挡着，级别不够就只剩一个
+                     * const ARect& 的 C++ 重载 —— C 编不过（实测）。
+                     * 这里把【编译】级别抬到 34，minSdk 不动。*/
+                    arguments '-DANDROID_PLATFORM=android-34'
+                }
             }
         }
     }
@@ -35,12 +47,14 @@ android {
         }
     }
 
-    // native 从源码编：jni/ 是唯一真源，CI 顺带充当“源码能不能编过”的守门人。
-    // 产物直接打进 APK，不再需要预置 jniLibs/*.so。
-    externalNativeBuild {
-        cmake {
-            path 'src/main/jni/CMakeLists.txt'
-            version '3.22.1'
+    // 传 -PvdrmBuildNative 才从源码编（jni/ 是唯一真源，CI 用它做守门）；
+    // 默认走 src/main/jniLibs 里的预编译 .so。
+    if (project.hasProperty('vdrmBuildNative')) {
+        externalNativeBuild {
+            cmake {
+                path 'src/main/jni/CMakeLists.txt'
+                version '3.22.1'
+            }
         }
     }
 }

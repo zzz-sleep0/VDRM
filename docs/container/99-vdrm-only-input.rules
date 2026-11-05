@@ -1,0 +1,20 @@
+# 装进容器：/etc/udev/rules.d/99-vdrm-only-input.rules
+#
+# 合成器（niri/libinput）只能看见 VDRM 的三件虚拟设备。
+#
+# 之前容器和手机共用同一个 /dev/input，niri 起来后会把手机真实的
+# pmic_pwrkey(event2)、gpio-keys(event0)、oplus_fp_input(event4)、
+# hall(event5) 等全部打开。多一个读者之后，手机息屏这条路径就乱了：
+# 按电源键息屏后 3~4 秒，屏幕又被自己点亮，logcat 里能看到
+#   Biometrics/FingerprintProvider: dispatchTouchDown
+#   OplusPowerManagerHelper: wakeUpAndBlockScreenOn reason=android.service.fingerprint:WAKEUP
+# 或者
+#   PowerManagerService: Waking up ... details=oplus.wakeup.gesture:DOUBLE_TAP_SCREEN
+# 不加合成器时（模块加载、App 不跑）复现不出来。
+#
+# LIBINPUT_IGNORE_DEVICE 是 libinput 官方认的 udev 属性，命中就整台设备跳过，
+# 不会 grab，也不会改设备状态。
+ACTION=="add|change", SUBSYSTEM=="input", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="vdrm-touch", ENV{LIBINPUT_IGNORE_DEVICE}="0"
+ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="vdrm-ptr",   ENV{LIBINPUT_IGNORE_DEVICE}="0"
+ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="vdrm-kbd",   ENV{LIBINPUT_IGNORE_DEVICE}="0"

@@ -11,7 +11,7 @@ import android.view.ViewConfiguration;
 
 public class VirtualKeyboardView extends View {
 
-    private Paint bgPaint, keyPaint, textPaint, pressPaint, barPaint, dotPaint;
+    private Paint bgPaint, keyPaint, textPaint, pressPaint, barPaint;
     private int pressedKey = -1;
     private boolean fnMode = false;
     private boolean shiftMode = false;
@@ -24,17 +24,13 @@ public class VirtualKeyboardView extends View {
 
     private static final int BAR_W = 24;
     private static final int CTRL_GAP = 20;
-    private static final float ALPHA_MIN = 0.2f;
 
-    private boolean showExtra = false;
-    private float kbAlpha = 1.0f;
-    private int baseW, baseH;
+    /* 定死的大小（见 setScreenSize）：算一次，之后不再变。*/
+    private int fixedW, fixedH;
     private int kbW, kbH;
     private int screenW, screenH;
 
     private int dragBarY, dragBarLeft, dragBarRight;
-    private int alphaBarX, alphaBarTop, alphaBarBottom;
-    private float dotCX, dotCY, dotR;
     private int keyAreaTop;
 
     private boolean isDragging = false;
@@ -43,21 +39,12 @@ public class VirtualKeyboardView extends View {
     private int dragSlop;
     private int dragPointerId = -1;
 
-    private boolean isResizing = false;
-    private float resizeStartX, resizeStartY;
-    private int resizeStartW, resizeStartH;
-
-    private boolean isAdjustingAlpha = false;
-    private float alphaStartY, alphaStartVal;
-
     private int[] rowKeyCount;
     private int[] rowWideCount;
     private int[] rowKeyWidth;
     private int[] rowWideWidth;
     private int keyH;
     private int keyAreaH;
-    private int initKeyH;
-    private int initKeyAreaH;
 
     private static final String[][] KEYS = {
         {"`","41","~","41",  "1","2","!","2",  "2","3","@","3",
@@ -130,10 +117,6 @@ public class VirtualKeyboardView extends View {
         barPaint.setColor(0xFF505050);
         barPaint.setStyle(Paint.Style.FILL);
 
-        dotPaint = new Paint();
-        dotPaint.setColor(0xFF808080);
-        dotPaint.setStyle(Paint.Style.FILL);
-        dotPaint.setAntiAlias(true);
 
         dragSlop = ViewConfiguration.get(context).getScaledTouchSlop();
 
@@ -157,15 +140,27 @@ public class VirtualKeyboardView extends View {
         }
     }
 
+    /* 键盘大小**定死**，不跟屏幕横竖走。
+     *
+     * 以前是 baseW = 屏宽*4/5、baseH = 屏高/2 —— 于是屏幕一转竖，宽度被压到
+     * 竖屏宽的一半（横向过窄）、高度却按竖屏高算（纵向过长），键位全变形。
+     *
+     * 现在只按屏幕**短边**定一次：
+     *   宽 = 短边 - 两侧留白，高 = 短边 / 2
+     * 横屏（2780x1264）和竖屏（1264x2780）算出来完全一样（1224 x 632），
+     * 而且这个宽度一定塞得进竖屏。窗口比它还窄（分屏/小窗）时再夹一下。
+     *
+     * 大小、透明度都不再可调；唯一能调的是位置（拖上面的横条）。*/
     public void setScreenSize(int w, int h) {
         screenW = w;
         screenH = h;
-        baseW = w * 4 / 5;
-        baseH = h * 1 / 2;
-        if (baseW > w / 2) baseW = w / 2;
-        if (baseH > h / 2) baseH = h / 2;
-        kbW = baseW;
-        kbH = baseH;
+
+        int shortSide = Math.min(w, h);
+        fixedW = shortSide - 2 * CTRL_GAP;
+        fixedH = shortSide / 2;
+
+        kbW = Math.min(fixedW, Math.max(200, w));
+        kbH = fixedH;
     }
 
     private void recomputeLayout() {
@@ -189,26 +184,12 @@ public class VirtualKeyboardView extends View {
 
         keyAreaH = rows * keyH + (rows - 1) * gap;
 
-        if (initKeyH == 0) {
-            initKeyH = keyH;
-            initKeyAreaH = keyAreaH;
-        }
-
         dragBarY = CTRL_GAP;
         keyAreaTop = dragBarY + BAR_W + CTRL_GAP;
 
         int dragBarWidth = BAR_W * 5;
         dragBarLeft = (kbW - dragBarWidth) / 2;
         dragBarRight = dragBarLeft + dragBarWidth;
-
-        int alphaBarH = keyAreaH - (int)(initKeyH * 0.5f * keyAreaH / (float) initKeyAreaH);
-        alphaBarX = kbW + CTRL_GAP;
-        alphaBarBottom = keyAreaTop + keyAreaH;
-        alphaBarTop = alphaBarBottom - alphaBarH;
-
-        dotCX = alphaBarX + BAR_W / 2f;
-        dotCY = dragBarY + BAR_W / 2f;
-        dotR = BAR_W * 0.75f;
 
         recomputeKeyRects();
     }
@@ -263,9 +244,8 @@ public class VirtualKeyboardView extends View {
 
         recomputeLayout();
 
-        int totalW = alphaBarX + BAR_W + (int) dotR;
-        int totalH = keyAreaTop + keyAreaH + (int) dotR;
-        setMeasuredDimension(totalW, totalH);
+        /* 视图就是键盘本身，右边不再挂透明度条、右上角不再挂缩放点。*/
+        setMeasuredDimension(kbW, keyAreaTop + keyAreaH + CTRL_GAP);
     }
 
     @Override
@@ -276,16 +256,6 @@ public class VirtualKeyboardView extends View {
 
         RectF dragBar = new RectF(dragBarLeft, dragBarY, dragBarRight, dragBarY + BAR_W);
         canvas.drawRoundRect(dragBar, BAR_W / 2f, BAR_W / 2f, barPaint);
-
-        if (showExtra) {
-            RectF alphaBar = new RectF(alphaBarX, alphaBarTop, alphaBarX + BAR_W, alphaBarBottom);
-            canvas.drawRoundRect(alphaBar, BAR_W / 2f, BAR_W / 2f, barPaint);
-
-            float alphaDotY = alphaBarBottom - (alphaBarBottom - alphaBarTop) * kbAlpha;
-            canvas.drawCircle(alphaBarX + BAR_W / 2f, alphaDotY, dotR, dotPaint);
-
-            canvas.drawCircle(dotCX, dotCY, dotR, dotPaint);
-        }
 
         for (int r = 0; r < KEYS.length; r++) {
             int kw = rowKeyWidth[r];
@@ -448,26 +418,10 @@ public class VirtualKeyboardView extends View {
         return Integer.parseInt(baseCode);
     }
 
-    private int clampW(int w) {
-        int maxW = screenW / 2;
-        return Math.max(200, Math.min(maxW, w));
-    }
-
-    private int clampH(int h) {
-        int maxH = screenH / 2;
-        return Math.max(150, Math.min(maxH, h));
-    }
-
     private void cancelAllStates() {
         if (isDragging) {
             isDragging = false;
             dragPointerId = -1;
-        }
-        if (isResizing) {
-            isResizing = false;
-        }
-        if (isAdjustingAlpha) {
-            isAdjustingAlpha = false;
         }
         if (pressedKey >= 0) {
             releaseKey(pressedKey / 20, pressedKey % 20);
@@ -528,10 +482,8 @@ public class VirtualKeyboardView extends View {
                     return true;
                 }
                 case MotionEvent.ACTION_UP:
-                    if (!isDragging) {
-                        showExtra = !showExtra;
-                        invalidate();
-                    }
+                    /* 横条只用来拖动位置：大小和透明度都不可调了，单击不再
+                     * 展开任何额外控件。*/
                     isDragging = false;
                     dragPointerId = -1;
                     return true;
@@ -596,77 +548,22 @@ public class VirtualKeyboardView extends View {
                         invalidate();
                     }
                     return true;
+                case MotionEvent.ACTION_POINTER_UP:
+                    /* 第二根手指按着时抬起按住字母的那根，会走 POINTER_UP
+                     * 而不是 UP；不处理的话 pressedKey 永远不释放，而键盘
+                     * 声明了 EV_REP，容器里会一直自动重复。*/
+                    if (event.getActionIndex() == 0 && pressedKey >= 0) {
+                        releaseKey(pressedKey / 20, pressedKey % 20);
+                        clearPressedKey();
+                        invalidate();
+                    }
+                    return true;
             }
         } else {
             if (action == MotionEvent.ACTION_MOVE && pressedKey >= 0) {
                 releaseKey(pressedKey / 20, pressedKey % 20);
                 clearPressedKey();
                 invalidate();
-            }
-        }
-
-        if (!showExtra) {
-            if (action == MotionEvent.ACTION_UP) return true;
-            return true;
-        }
-
-        /* === Resize dot (only when showExtra) === */
-        float rdx = x - dotCX, rdy = y - dotCY;
-        if (rdx * rdx + rdy * rdy <= (dotR + touchPad) * (dotR + touchPad)) {
-            switch (action) {
-                case MotionEvent.ACTION_DOWN:
-                    isResizing = true;
-                    resizeStartX = x;
-                    resizeStartY = y;
-                    resizeStartW = kbW;
-                    resizeStartH = kbH;
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    if (isResizing) {
-                        int newW = (int)(resizeStartW + (x - resizeStartX));
-                        int newH = (int)(resizeStartH - (y - resizeStartY));
-                        newW = clampW(newW);
-                        newH = clampH(newH);
-                        float oldH = kbH;
-                        kbW = newW;
-                        kbH = newH;
-                        recomputeLayout();
-                        int newTotalW = alphaBarX + BAR_W + (int) dotR;
-                        int newTotalH = keyAreaTop + keyAreaH + (int) dotR;
-                        if (newTotalW != getWidth() || newTotalH != getHeight()) {
-                            layout(getLeft(), getTop(), getLeft() + newTotalW, getTop() + newTotalH);
-                        }
-                        offsetTopAndBottom(-(int)(kbH - oldH));
-                        invalidate();
-                    }
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    isResizing = false;
-                    invalidate();
-                    return true;
-            }
-        }
-
-        /* === Alpha bar (only when showExtra) === */
-        if (x >= alphaBarX - touchPad && x <= alphaBarX + BAR_W + touchPad
-                && y >= alphaBarTop - touchPad && y <= alphaBarBottom + touchPad) {
-            switch (action) {
-                case MotionEvent.ACTION_DOWN:
-                    isAdjustingAlpha = true;
-                    alphaStartY = y;
-                    alphaStartVal = kbAlpha;
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    if (isAdjustingAlpha) {
-                        float dy2 = (alphaStartY - y) / (alphaBarBottom - alphaBarTop);
-                        kbAlpha = Math.max(ALPHA_MIN, Math.min(1.0f, alphaStartVal + dy2));
-                        setAlpha(kbAlpha);
-                        invalidate();
-                    }
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    isAdjustingAlpha = false;
-                    return true;
             }
         }
 

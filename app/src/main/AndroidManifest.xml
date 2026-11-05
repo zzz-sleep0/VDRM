@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -12,14 +11,22 @@
         android:supportsRtl="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
+        <!-- 这块窗口只是"容器的显示器"，不是锁屏替代品。
+             以前这里挂了 turnScreenOn + showWhenLocked：
+               * turnScreenOn：窗口每次重新可见就 requestWakeUp → 按电源键息屏后
+                 又被这一下点亮，"一下子就息屏"永远做不到；
+               * showWhenLocked：窗口盖在锁屏上 → KeyguardController 反复收到
+                 onKeyguardOccludeChange，SystemUI 的 OneShotAnimController 跟着
+                 反复走 sleep/occluded 分支，看起来就是自己亮、自己灭。
+             电源键的语义应该完全交还给系统：息屏就是息屏，锁屏就是锁屏。
+             屏幕常亮由 FLAG_KEEP_SCREEN_ON 负责（只跟着窗口可见性走，
+             不会主动点亮屏幕）。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode"
-            android:screenOrientation="landscape"
-            android:turnScreenOn="true"
-            android:showWhenLocked="true">
+            android:screenOrientation="unspecified">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

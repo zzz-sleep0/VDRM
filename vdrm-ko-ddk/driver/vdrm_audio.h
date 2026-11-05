@@ -8,6 +8,9 @@
 #define VDRM_AUDIO_MAGIC      0x56445241u   /* "VDRA" */
 #define VDRM_AUDIO_FMT_S16_LE 1
 #define VDRM_AUDIO_RING_SIZE  (512 * 1024)
+/* 采集环：ALSA 的 capture buffer 直接就是它（buffer_size == 16384 帧），
+ * 所以大小必须和 hw 约束里的 buffer_bytes 一致。0.34 秒 @48k。*/
+#define VDRM_AUDIO_IN_RING_SIZE (64 * 1024)
 #define VDRM_AUDIO_RATE       48000
 #define VDRM_AUDIO_CHANNELS   2
 

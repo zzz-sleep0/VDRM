@@ -18,22 +18,28 @@ MODDIR=${0%/*}
 PRINT=0
 [ "$1" = "--print" ] && PRINT=1
 
-# ── 第一段：虚拟键鼠有没有被排除 ───────────────────────────────────────────
-# 判据是【覆盖有没有真的落上】：生效时 /vendor/etc/excluded-input-devices.xml
-# 就是模块里那份（metamodule 用 overlayfs 把它从 userdata 挂过去），内容必然
-# 逐字节一致；没生效时那里是 ROM 的原版，或者压根不存在。
-# 不能靠看挂载表判断 —— 生效时 mount 显示的是底层块设备，不是模块路径。
-XML_MOD=$MODDIR/system/vendor/etc/excluded-input-devices.xml
-XML_SYS=/vendor/etc/excluded-input-devices.xml
-[ -f "$XML_SYS" ] || XML_SYS=/system/vendor/etc/excluded-input-devices.xml
-
-live=$(md5sum "$XML_SYS" 2>/dev/null | cut -d' ' -f1)
-want=$(md5sum "$XML_MOD" 2>/dev/null | cut -d' ' -f1)
-
-if [ -n "$live" ] && [ "$live" = "$want" ]; then
+# ── 第一段：虚拟键鼠对 Android 藏好没有 ────────────────────────────────────
+# 判据是【真状态】，不是配置文件：
+#   - 三台 vdrm-* 的 /dev/input/eventN 必须是我们自己 mknod 的 0600 root:root
+#     （0600 才是"Android 打不开"的关键；ueventd 建的那份是 0660 root:input）
+# 节点由 post-fs-data.sh / service.sh 在加载后一次性删掉重建；不再需要常驻进程。
+# 以前这里比的是 /vendor/etc/excluded-input-devices.xml 的 md5 —— Android 17
+# 根本不读那个文件（InputManagerService 里没人调用），所以那个 🟢 是假绿。
+VKM=0
+for f in /sys/class/input/event*/device/name; do
+    [ -e "$f" ] || continue
+    case "$(cat "$f" 2>/dev/null)" in
+        vdrm-*) ;;
+        *) continue ;;
+    esac
+    node="/dev/input/$(basename "${f%/device/name}")"
+    [ -c "$node" ] || continue
+    [ "$(stat -c '%a:%U' "$node" 2>/dev/null)" = "600:root" ] && VKM=$((VKM + 1))
+done
+if [ "$VKM" -ge 3 ]; then
     S1="Virtual keyboard & mouse: 🟢"
 else
-    S1="Virtual keyboard & mouse: 🔴 It won't work correctly — install a metamodule to solve it"
+    S1="Virtual keyboard & mouse: 🔴 Android can still see it — run: sh $MODDIR/service.sh"
 fi
 
 # ── 第二段：内核信息 ───────────────────────────────────────────────────────
@@ -72,8 +78,8 @@ fi
 
 # ── 手动打印：同样的三段，一行一段 ─────────────────────────────────────────
 # 长相跟 module.prop 那行刻意保持一致：emoji 表状态，不用 ANSI 颜色。
-# 模块里【没有 action.sh】—— 有的话管理器会多挂一个"执行"按钮，Droidspaces
-# 就没有，所以这边也不放。要看状态就 `sh status.sh --print`。
+# 模块里【没有 action.sh】（v3.14 起删掉了：配置入口统一交给 App 的通知，
+# 不在管理器里再多挂一个"执行"按钮）。要看状态就 `sh status.sh --print`。
 if [ "$PRINT" = 1 ]; then
     printf '%s\n%s\n%s\n' "$S1" "$S2" "$S3"
 fi

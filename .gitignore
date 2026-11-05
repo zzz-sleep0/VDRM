@@ -1,6 +1,10 @@
 # 构建产物
 *.apk
 *.so
+# 例外：APK 里要打包的预编译 JNI 库。【必须入库】——CI 只跑 gradle，
+# 没有 NDK 重编它；不给这条放行，release 出来的 APK 里就没有
+# libvdrm_consumer.so，装上直接崩（System.loadLibrary 失败）。
+!app/src/main/jniLibs/**/*.so
 /build/
 app/build/
 app/.cxx/
@@ -25,3 +29,27 @@ __pycache__/
 # 装配产物 / 各组件编出来的载荷（都不入库）
 vdrm-lkm-*.zip
 vdrm-ko-ddk/*.ko
+# 本地手工装配出来的发布目录（正式产物由 CI 的 release 出）
+dist/
+
+# 容器侧测试二进制（源码保留）
+test/atomic_probe
+test/conn_probe
+test/pool_keep
+test/pool_stat
+test/prop_probe
+test/restore_probe
+test/kms_flip_test
+test/vdrm_smoke
+test/drmpair
+test/eglprobe5
+
+# 内核模块构建产物（源码入库，产物不入库）
+vdrm-ko-ddk/*.o
+vdrm-ko-ddk/*.mod
+vdrm-ko-ddk/*.mod.o
+vdrm-ko-ddk/.*.cmd
+vdrm-ko-ddk/driver/*.o
+vdrm-ko-ddk/driver/.*.cmd
+vdrm-ko-ddk/Module.symvers
+vdrm-ko-ddk/modules.order

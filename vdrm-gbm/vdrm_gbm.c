@@ -17,6 +17,7 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -170,11 +171,36 @@ static void *vdrm_open_dri_backend(void)
 		}
 	}
 
-	return dlopen("dri_gbm.so", RTLD_NOW | RTLD_LOCAL);
+	void *lib = dlopen("dri_gbm.so", RTLD_NOW | RTLD_LOCAL);
+
+	if (!lib) {
+		/* 静默失败的话，用户只会看到"合成器起不来"。dlerror 是唯一线索。*/
+		fprintf(stderr, "vdrm_gbm: 加载 dri_gbm.so 失败（发行版 Mesa 缺 GBM "
+				"后端？）：%s\n", dlerror());
+	}
+	return lib;
 }
 
 const struct gbm_backend *gbmint_get_backend(const struct gbm_core *core)
 {
+	/* 版本对齐检查：本后端是按 GBM_BACKEND_ABI_VERSION 编的，loader 会把自己的
+	 * core_version 传进来，取 min(backend, core) 才是这次会话真正生效的版本。
+	 * Mesa 只做"追加字段 + 抬版本号"的话两者不等也能跑；一旦它改了布局或语义，
+	 * 现象会是"gbm 分配出奇怪的东西/合成器起不来"，这条日志就是第一现场。*/
+	static int warned;
+
+	if (!warned) {
+		uint32_t core_v = core ? core->v0.core_version : 0;
+
+		warned = 1;
+		if (core_v != GBM_BACKEND_ABI_VERSION) {
+			fprintf(stderr, "vdrm_gbm: GBM 后端 ABI 版本不一致 "
+				"（本后端 %u，loader %u）—— 若分配异常，按发行版 "
+				"Mesa 的 gbm_backend_abi.h 重编本 .so\n",
+				(unsigned)GBM_BACKEND_ABI_VERSION, (unsigned)core_v);
+		}
+	}
+
 	if (!dri_backend) {
 		void *lib = vdrm_open_dri_backend();
 		if (lib) {

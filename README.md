@@ -15,7 +15,8 @@
 
 **在你自己的手机上，跑一个完整的 Linux 桌面。**
 
-默认 **1920x1080@120**；比例不合适时，用模块的 Action 切到真实分辨率。
+默认 **1920x1080@120**；比例不合适时，在 App 的常驻通知里一键切（见
+[通知里的配置面](#通知里的配置面)）。
 
 ---
 
@@ -34,7 +35,7 @@
 去 GitHub Releases 下最新的 `weekly-YYYY-Www`：
 
 ```
-vdrm-lkm-v2.0.zip      ← 模块（六个 KMI 的 .ko + mkpool + Action 脚本）
+vdrm-lkm-*.zip         ← 模块（六个 KMI 的 .ko + mkpool + 启动脚本）
 vdrm_gbm.so            ← 容器里的 GBM shim
 vdrm-debug.apk         ← Android App
 ```
@@ -49,9 +50,12 @@ vdrm-debug.apk         ← Android App
 
 用管理器安装 `vdrm-lkm-***.zip`，然后**重启**。
 
-> ⚠️ **不同机型要补屏蔽表**：把你**自己手机** 的 `/vendor/etc/excluded-input-devices.xml` 里按照模块内置文件的格式加上 `vdrm-kbd`、`vdrm-ptr`、`vdrm-touch` 三个设备名，再用修补过的文件覆盖模块内置文件。
-> **必须装 metamodule**，针对设备的排除列表覆盖才生效。三个都要：`vdrm-kbd`（键盘）、`vdrm-ptr`（指针）、
-> `vdrm-touch`（触摸）。少一个就会出现大鼠标或幽灵触摸。
+> 虚拟键鼠**不用再靠屏蔽表**了：模块在加载时（`post-fs-data.sh` / `service.sh`）会把
+> `/dev/input/eventN` 换成一个 0600 的、归 root 的节点，Android 的 InputReader 打不开就看不见
+> （细节见 `module/common.sh` 第 3 节）。这是一次性动作，不再常驻 watcher；手动 reload 后用
+> `tools/vdrm_up.sh --reload` 或在 shell 里跑一次 `vdrm_hide_input` 即可。模块里那份
+> `excluded-input-devices.xml` 只当 Android ≤16 的兜底，16 以上没人读它
+> （Android 17 的 `dumpsys input` 里 `ExcludedDeviceNames` 恒为 `[]`）。
 
 ### 2. 装 App
 
@@ -99,23 +103,62 @@ privileged=nomask
 - 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs），用于获取硬件加速(可选)
 - 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（Arch发行版是这个路径，别的发行版需要自行寻找对应路径）
 
+**`vdrm_gbm.so` 的兼容性**（它不是普通链接库，是 **GBM 后端**：libgbm 看到
+card1 的驱动名是 `vdrm`，就去后端目录找 `vdrm_gbm.so` 并加载它；它再把一切委托给
+发行版的 `dri_gbm.so`，只把分配改走 DRM dumb 路径）
+
+跨发行版能用，但有三个前提：
+
+| 条件 | 说明 |
+|---|---|
+| **glibc ≥ 2.34** | 产物只依赖 `libc.so.6` + `ld-linux-aarch64.so.1`。Alpine 之类的 musl 发行版、Debian 11 这类老 glibc 不行（要自己重编） |
+| **发行版 Mesa 带 `dri_gbm.so`** | 它靠 `dlopen("dri_gbm.so")` 转发；裁掉了 GBM 后端的 Mesa 不行 |
+| **Mesa 的 GBM 后端 ABI 只做"追加式"演进** | 我们按 `GBM_BACKEND_ABI_VERSION=1` 编译，loader 取 `min(backend, core)`。Mesa 若改了布局/语义，要按它的 `gbm_backend_abi.h` 重编 |
+
+它**不依赖** mesa-for-android-container：那套是渲染侧（card0 / EGL / msm-kgsl），
+而 `vdrm_gbm.so` 只管 card1 上的 dumb buffer 分配。真出问题时它会往 stderr 打原因
+（`dlopen` 失败、或 ABI 版本不一致）。
+
+自己重编：
+
+```sh
+cd vdrm-gbm && make      # 只依赖 gcc + 发行版的 gbm.h
+```
+
 **已知合成器的最小适配**
 
 | 合成器 | 要做的 |
 |---|---|
-| **niri** | 放 udev 规则（见下）+ `~/.config/niri/config.kdl` 末尾加 `debug { render-drm-device "/dev/dri/renderD128" }`；`MESA_LOADER_DRIVER_OVERRIDE=msm` |
+| **niri** | 不需要任何额外配置：`XDG_RUNTIME_DIR=… LIBSEAT_BACKEND=noop MESA_LOADER_DRIVER_OVERRIDE=msm niri` 直接起（见下） |
 | **KWin** | `KWIN_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=kgsl` |
 | **Hyprland** | `AQ_DRM_DEVICES=/dev/dri/card1`；`MESA_LOADER_DRIVER_OVERRIDE=ksgl` |
 
-niri 的 udev 规则，存成 `/etc/udev/rules.d/99-vdrm-primary.rules`：
+**niri 的启动命令**就是普通的 niri，容器里没有 TTY，只多两个环境变量：
 
-```
-SUBSYSTEM=="drm", KERNEL=="card0", ENV{ID_SEAT}="seat0"
-SUBSYSTEM=="drm", KERNEL=="card1", ENV{ID_SEAT}="seat0"
-SUBSYSTEM=="drm", KERNEL=="renderD128", ENV{ID_SEAT}="seat0"
+```sh
+mkdir -p /tmp/xdg && chmod 700 /tmp/xdg     # XDG_RUNTIME_DIR 必须存在且 0700
+XDG_RUNTIME_DIR=/tmp/xdg \
+LIBSEAT_BACKEND=noop \
+MESA_LOADER_DRIVER_OVERRIDE=msm \
+niri
 ```
 
-改完重启容器（或 `udevadm trigger`）。
+两个变量的理由（都是实测过的，不是保险起见）：
+
+- `LIBSEAT_BACKEND=noop`：容器里没有能激活的 seat 会话。装的 seatd 也一样 ——
+  niri 会打印 `session is not active, starting libinput in paused state`，
+  然后一个输出都不碰（`frames_pushed` 一直是 0）。`noop` 是让 niri 以 root
+  直接开 DRM 设备。
+- `MESA_LOADER_DRIVER_OVERRIDE=msm`：不设的话 mesa 加载器给这台设备挑不到
+  硬件驱动，niri 会报 `failed to initialize renderer, falling back to primary
+  gpu: software EGL renderers are skipped`，接着 `no allocator available`，
+  不出图。
+
+> **不需要** udev 规则，也不需要 `debug { render-drm-device … }`。
+> 那是早期没有 `renderD129` 的时候，niri 会把只有 card1 的设备当成"没有渲染节点"
+> 才要那么写；现在 render 节点在位，niri 自己就会选中它：
+> `using as the render node: "/dev/dri/renderD128"`、`this is the primary node`。
+> 只有在它真挑错 GPU 时，才用 `render-drm-device` 手动指一下。
 
 > 由于niri对mesa后端的识别缺陷，目前只有msm后端可用，其他后端会被识别为软件渲染导致niri不工作
 
@@ -131,37 +174,102 @@ SUBSYSTEM=="drm", KERNEL=="renderD128", ENV{ID_SEAT}="seat0"
 mode=1920x1080
 ```
 
-### 用 Action 切
+### 运行时切（不用重启）
 
-模块管理器里点 **Action**，5 秒内：
+一条命令走完 **prepare → 补槽 → commit（EDID + hotplug）**：
 
-| 按键 | 结果 |
-|---|---|
-| **音量上** | 按真实分辨率取最大 **16:9**（例如 1920x1080），居中留黑边 |
-| **音量下** | 真实横屏分辨率（例如 2376x1080），铺满，摄像头挖空压在桌面上 |
-| **不按** | 保持当前配置 |
-
-结果写入 `mode.conf`，**重启后生效**。
-
-也可以直接改 `/data/adb/modules/vdrm-lkm/mode.conf`：
-
-```
-mode=1920x1080
-# mode=2376x1080
-# mode=auto
+```sh
+su -c '/data/adb/modules/vdrm-lkm/vdrm_mkpool --mode 2376x1080'
 ```
 
-> 这里已经初见端倪了，mode.conf中的分辨率设置优先级是要高于内核模块内置分辨率的，可以试着自行调试
+它等价于：
 
-### 怎么选
+```sh
+echo 2376x1080 > /sys/module/vdrm/parameters/mode   # 只 prepare，不发 hotplug
+# mkpool 按目标尺寸补 6 个槽
+echo 1 > /sys/module/vdrm/parameters/commit         # 真正广播
+```
 
-- **1920x1080（音量上）**：带黑边、避开挖空，合成器负担小，优先选这个
-- **真实分辨率（音量下）**：铺满，挖空会压在桌面上；如果卡就切回 1920
+池由 `vdrm_mkpool --mode` 建好（`mode_slots` 是当前目标尺寸的槽数），App 会自动
+重新 forge。只写 `mode` 不写 `commit` 的话合成器收不到 hotplug，会一直按旧档跑。
+`cat /sys/module/vdrm/parameters/mode_slots` 应该回到 6；槽的分配占用现在会在
+合成器销毁 dumb buffer 时释放，来回切不会把池耗光。
 
-> 120 模式在部分机型上实际只呈现 60 次/秒；想要更稳就用 1920 模式。
+### 另外两个运行时参数：刷新率和 DPI
+
+和 `mode` 一样的两段式（**写参数只准备，写 `commit` 才生效**）。它们只改 EDID，
+不改几何，所以**不需要重建池**：
+
+```sh
+echo 90  > /sys/module/vdrm/parameters/refresh    # 24..240，默认 120（实时生效）
+echo 256 > /sys/module/vdrm/parameters/edid_dpi   # 0..1000，0 = 默认 305dpi
+echo 1   > /sys/module/vdrm/parameters/commit     # 一次性广播（EDID + hotplug）
+```
+
+`refresh` 决定 EDID 里的 preferred 档，合成器也仍可在报出去的几档
+（`refresh` / 120 / 90 / 60）之间自己切。
+
+`edid_dpi` 要单独说一句：它只是 EDID 里的**物理尺寸**，合成器**只在输出创建时读一次**
+（niri 实测 `scale ≈ dpi/128`）。改完不重启合成器，屏幕上不会有任何变化 —— 想要
+"字立刻变大变小"请用通知里的 `scale 1.5`，那条走的是合成器自己的比例。开机种子
+写在 `mode.conf` 的 `refresh=` / `dpi=`。
+
+`GET_INFO.flags` 是**能力位图**（ABI 2）：想知道当前这份 `.ko` 支不支持某个
+运行时参数，看它有没有对应的位，别比版本号。App 日志里那行
+`opened /dev/vdrm fd=.. abi=2 caps=0x1ff [mode,refresh,dpi,...]` 就是它。
+
+### 开机默认档：`mode.conf`
+
+日常切换用通知（下面那一节），`mode.conf` 只是**开机种子**；在通知里切过档之后
+App 会把它写回这个文件，所以重启还是上一次的选择。
+
+```
+mode=1920x1080      # 开机默认档
+#refresh=120        # 开机默认刷新率
+#dpi=256            # 开机默认 EDID DPI（只在合成器启动时读一次）
+```
+
+- **1920x1080**：带黑边、避开摄像头挖孔，合成器负担最小，推荐
+- **真实分辨率**（比如 `2780x1264`）：铺满，挖孔会压在桌面上；卡就切回 1920
 
 ---
 
+## 通知里的配置面
+
+装好之后会有一条常驻通知，它就是这个项目的**控制台** —— 容器占着整块屏，App 的
+界面缩在窗口里平时碰不到，通知栏是唯一随时可达、又不用另造 IPC/权限模型的地方。
+
+```
+1920x1080@120                     ← 标题：当前档位
+就绪                              ← 正文：上一条命令的结果
+[全面屏]  [切横竖]  [命令]
+```
+
+**三个按钮**
+
+| 按钮 | 作用 |
+|---|---|
+| `全面屏` / `黑边屏` | **一个按钮两个文本**：现在是什么档，就显示"切到另一档"。全面屏 = 真实横屏尺寸铺满；黑边屏 = 1920x1080 居中留黑边（避开摄像头挖孔）。切换会**保持当前横竖** |
+| `切横竖` | 把当前档宽高对调（`1920x1080 ↔ 1080x1920`、`2780x1264 ↔ 1264x2780`） |
+| `命令` | 展开输入框，输入下面这些命令 |
+
+**命令**（输入框里的灰字就是"当前配置的可执行写法"，想改哪个数字挪过去改一下即可）
+
+| 命令 | 作用 | 实时 |
+|---|---|---|
+| `input 0` / `input 1` | 手机触摸当**鼠标**（相对位移，触控板手感）/ 当**触控屏**（按哪点哪） | 下一次触摸 |
+| `refresh 90` | 刷新率（24..240） | ✅ |
+| `scale 1.5` | UI 缩放 —— **真正让字变大的那个**，走 `niri msg output … scale` | ✅ |
+| `commit` | 只广播参数（极少用） | — |
+
+> `scale` 和 `mode.conf` 里的 `dpi=` 是两件事：`dpi` 只改 EDID 里的物理尺寸，
+> 合成器只在**启动时**读一次，运行中改毫无反应；`scale` 是合成器自己的比例，
+> 改完立刻生效。
+
+**前提**：命令要 root（走 `su`），通知要通知权限；`scale` 还需要容器里 niri 在跑
+（它会自动找活着的 niri socket，重启过也不会连错）。
+
+---
 ## 声音
 
 `vdrm.ko` 会同时注册一张虚拟声卡：**48 kHz / 立体声 / S16_LE**，名字是 `vdrm`。
@@ -243,25 +351,36 @@ aplay -l             # 能看到 card ...: vdrm
 - `ls -l /dev/vdrm` 是 `crw-rw-rw-`、标签 `gpu_device`
 - 容器里放声音，**手机扬声器出声**
 
+想量化地确认，看这三个（前两个是内核参数，第三个是通知）：
+
+```sh
+cat /sys/module/vdrm/parameters/mode      # 你要求的档，比如 1920x1080
+cat /sys/module/vdrm/parameters/active    # 合成器【真正】编进 pipe 的尺寸，要等于 mode
+cat /sys/module/vdrm/parameters/frames_pushed   # 动一下鼠标，这个数应该跟着涨
+```
+
+`mode` 对、`active` 不对 = 合成器没跟上（多半是那个尺寸 HWC 扫不出去，见"已知局限"）。
+两个都对、`frames_pushed` 不涨 = 没有帧在走（合成器没出图，或 App 没在前台）。
+
 ---
 
 ## 出问题先看这里
 
 | 情况 | 怎么做 |
 |---|---|
-| **全黑屏**，合成器在跑 | 重启；确认 `ls -l /dev/vdrm` 是 666 + `gpu_device`；`cat /sys/module/vdrm/parameters/flip_done_immediate` 是 N；用 Action 重选分辨率并重启 |
+| **全黑屏**，合成器在跑 | 重启；确认 `ls -l /dev/vdrm` 是 666 + `gpu_device`；在通知里切一次档；再看 `cat /sys/module/vdrm/parameters/active` 是否等于 `mode` |
 | App 打不开 `/dev/vdrm` | `su -c 'chmod 666 /dev/vdrm; chcon u:object_r:gpu_device:s0 /dev/vdrm'`，确认模块 service.sh 跑过 |
-| **手机上冒出个大鼠标** | 用管理器装模块；给模块里的 `excluded-input-devices.xml` 打 `vendor_configs_file` 标签；确认装了 metamodule |
-| **Android 多出触摸屏/幽灵触摸** | 在 `/vendor/etc/excluded-input-devices.xml` 里补 `vdrm-touch`（三个设备一起），装 metamodule 后重启 |
+| **手机上冒出个大鼠标 / Android 多出触摸屏、幽灵触摸** | `ls -l /dev/input/event*`：vdrm 那三个应该是 `crw------- root root`。被改回 `crw-rw---- root input` 就手动补一刀：`su -c '. /data/adb/modules/vdrm-lkm/common.sh; vdrm_hide_input'`（reload 场景用 `tools/vdrm_up.sh --reload`） |
 | 合成器**起不来 / 说没有渲染器** | 按合成器设 Mesa 后端：niri / Hyprland=`msm`，KWin=`kgsl` |
 | niri 报 `error opening primary GPU DRM node` | 确认容器里有 `card0`（完整硬件访问 / `enable_gpu_mode=1`，或显式 bind `/dev/dri/card0`） |
 | niri 报 `primary node is missing, display-only devices may not work` | 可忽略，不影响出图 |
-| niri 没起来 / 没输出 | 检查 `/etc/udev/rules.d/99-vdrm-primary.rules` 三行、`render-drm-device`；重启或 `udevadm trigger` |
+| niri 没起来 / 没输出 | 看日志里有没有 `software EGL renderers are skipped`（缺 `MESA_LOADER_DRIVER_OVERRIDE=msm`）或 `session is not active`（缺 `LIBSEAT_BACKEND=noop`）；`niri msg outputs` 里 `Virtual-3` 要是 `Current mode` 有值 |
 | KWin / Hyprland 没输出 | `KWIN_DRM_DEVICES=/dev/dri/card1` / `AQ_DRM_DEVICES=/dev/dri/card1` |
-| **120 模式但感觉只有 60** | 用 Action 选 1920 模式 |
-| **全面屏模式很卡** | 用 Action 选音量上（1920 带黑边），重启 |
-| **Action 按音量键没反应** | 直接编辑 `mode.conf`，或换物理音量键再试 |
+| **120 模式但感觉只有 60** | 在通知里切到黑边屏（1920x1080） |
+| **全面屏模式很卡** | 在通知里切到黑边屏（1920x1080） |
+| **通知里切档没反应** | 看 `cat /sys/module/vdrm/parameters/active` 有没有跟着变；没变多半是那个尺寸 HWC 扫不出去（见"已知局限"） |
 | **装 CI 的 APK 提示签名冲突** | 先卸载旧 App 再装 |
+| **无线 adb 老是掉** | 这不再随模块发布。仓库 `tools/adbd_keep.sh` 里留了一份自用版本（每 20 秒把 TCP 5555 重挂一遍），需要就自己 `setsid sh tools/adbd_keep.sh` 起 |
 | **没声音**，但 `aplay` 不报错 | 确认 App 开着；`cat /sys/module/vdrm/parameters/dropped_bytes` 是否在涨；`ls -l /dev/snd` |
 | 容器里 `aplay -l` 看不到 `vdrm` | 容器没绑 `/dev/snd`（见"配容器"）；宿主机 `lsmod \| grep vdrm` 要有 |
 | 播放卡顿/爆音 | 看 `dropped_bytes`；App 被后台限流时也会掉；先试 1920 模式降负载 |
@@ -280,7 +399,8 @@ python3 make-module.py
 cd vdrm-mkpool && make CC=/data/data/com.termux/files/usr/bin/aarch64-linux-android-clang
 
 # vdrm_gbm.so（容器 aarch64 glibc，只依赖 libc）
-cd vdrm-gbm && gcc -shared -fPIC -O2 -Wall -o vdrm_gbm.so vdrm_gbm.c
+# 注意构建机的 glibc 就是产物的 glibc 下限；CI 固定在 ubuntu-22.04 构建
+cd vdrm-gbm && make
 
 # APK
 gradle assembleDebug
@@ -297,14 +417,33 @@ gradle assembleDebug
    PulseAudio；这不是 VDRM 的 PCM 问题，需要时可单独排查容器音频栈
 3. 硬件解码是树外内容，不在本仓库/CI 中；H.264/HEVC B 帧在部分 Firefox 版本上
    会受浏览器送帧节奏影响，详见上文“硬件解码（树外，可选）”
-4. 部分依赖高级设备特性的部分功能无法使用(如多屏协同，合成器录屏等)
+4. **某些分辨率上不了屏。** 现象是档切了、`mode`/`active` 都对，但画面不动。
+   原因不在驱动：HWC 会按 gralloc 的 stride 规则重建平面布局，真实 pitch 不是
+   那条规则固定点的 buffer 会 `ADDFB2` 失败 —— 而 GPU 合成（以及截图）看起来
+   完全正常，所以很难查。通知里的两个预置档（1920x1080 / 真实分辨率）都避开了
+   这类尺寸；自己用 `mkpool --mode` 试别的尺寸时请以 `active` 是否跟上为准
+5. **帧时序是“不等 SF 上屏”换来的流畅。** 默认档位下 flip-done 在下一个 vblank
+   就完成，不等 SurfaceFlinger 的 present —— 这样子 `frames_reuse` 会缓慢增长
+   （合成器重提交了一块 SF 可能还在显示的显存）。实测视觉无撕裂；万一在别的
+   机器上看到“局部色块”，把它当开关用：
+   ```sh
+   echo 1 > /sys/module/vdrm/parameters/safe_present   # 退回保守模式（慢，但绝不覆写）
+   echo 0 > /sys/module/vdrm/parameters/safe_present   # 回到默认（快）
+   ```
+   保守模式实测会掉到十几~三十帧，它只是排障和兼容用的退路，不是常态
+6. 部分依赖高级设备特性的部分功能无法使用(如多屏协同，合成器录屏等)
 
 ## 鸣谢
 
 - Goldzxcbug、Superturtlee：项目引路与参考项目
 - Dere3046：普适化工具与排查思路
 - lfdevs：[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)：硬件加速驱动
-- anland：初期思路与键鼠触控优化
+- [anland](https://github.com/SuperTurtleDev/anland)：初期思路与键鼠触控优化。
+  **本项目的帧时序方案直接来自它的开发分支**（tag `6.0`…`6.2`，见
+  `services/waylandbridge/awl_sc.cpp` 头部的设计注释）——"帧完成"必须从 vsync
+  那一拍发出去、而不是从 SurfaceFlinger 的完成回调发，正是它先量出来的
+  （我们从 30fps 变成 88fps 就是照这条改的），连"某些尺寸 HWC 扫不出去"那个
+  坑也是它记下来的。上游是另一套更完整的实现，值得一并看。
 
 ## 许可
 
