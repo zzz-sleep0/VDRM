@@ -76,6 +76,7 @@ public class ForegroundService extends Service {
     private volatile String nMode = "";
     private volatile String nRefresh = "";     /* 当前刷新率，输入框提示用 */
     private volatile String nScale   = "";     /* 当前合成器 scale，输入框提示用 */
+    private static final String PREF_SCALE = "niri_scale";   /* 读不到时用它当默认值 */
     private volatile String nFull = "";        /* 全面屏那一档（真实横屏尺寸） */
 
     private volatile boolean refreshing;
@@ -240,8 +241,12 @@ public class ForegroundService extends Service {
 
         if (!nRefresh.isEmpty())
             sb.append(" · refresh ").append(nRefresh);
-        if (!nScale.isEmpty())
-            sb.append(" · scale ").append(nScale);
+        /* scale 必须带数字：合成器没跑（或不是 niri）时读不到当前值，就退到
+         * 上次成功设过的值，再不行给 1 —— 提示行永远是"能直接照着改"的模板，
+         * 不能只剩一个光秃秃的 scale。*/
+        sb.append(" · scale ").append(!nScale.isEmpty() ? nScale
+                : getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
+                        .getString(PREF_SCALE, "1"));
 
         return new RemoteInput.Builder(KEY_CMD).setLabel(sb.toString()).build();
     }
@@ -504,10 +509,9 @@ public class ForegroundService extends Service {
      *   scale N       0.5..3.0，改合成器的 scale（实时生效 —— 这才是"UI 变大变小"）
      *   commit        只广播（改完参数不想重建池时用）
      *
-     * 为什么不放 dpi：`edid_dpi` 只改 EDID 里的物理尺寸，合成器（niri）的
-     * scale 是它自己配置里的值，不会因为 EDID 变了就重算 —— 改完屏幕上毫无
-     * 变化，看起来就是"假的"。它只在合成器**启动前**有意义，所以留在
-     * mode.conf 的 `dpi=` 里，不进通知。
+     * 为什么不放 dpi：`edid_dpi` 只改 EDID 里报的物理尺寸，合成器据此给出来的
+     * 比例并不等于 dpi/128（实测 0→2.25、256→2.0、384→2.25），拿来精调 UI 不
+     * 靠谱；要变大变小直接用 scale。它留在 mode.conf 的 `dpi=` 里，不进通知。
      *
      * 分辨率不进这里：日常只有"黑边/全面屏"两档，做成按钮了。任意 WxH 现在
      * 内核侧也支持（第 48 项），但没有场景，留着只会让人以为这是主要入口。
@@ -601,9 +605,9 @@ public class ForegroundService extends Service {
     /**
      * UI 缩放：改的是**合成器**的 scale，不是 EDID 的 dpi。
      *
-     * `edid_dpi` 只影响 EDID 里的物理尺寸，合成器只在输出**创建时**读它一次，
-     * 之后改毫无反应 —— 所以通知里那个 dpi 看着就是"假的"。真正实时能变的
-     * 是 `niri msg output <name> scale N`，这里就是转一次容器命令。
+     * `edid_dpi` 只影响 EDID 里的物理尺寸（commit 后合成器会重读，但换算出来的
+     * 比例并不等于 dpi/128，不能精调 UI）。真正能直接改大小的是
+     * `niri msg output <name> scale N`，这里就是转一次容器命令。
      *
      * 输出名不写死：从 `niri msg outputs` 第一行括号里取（Virtual-3 之类），
      * 换机器/换合成器不用改。
@@ -625,7 +629,13 @@ public class ForegroundService extends Service {
          * 用 `niri msg version` 探活，第一个活的就是它。*/
         String r = niriRun("NIRI_SOCKET=$N niri msg output \"$O\" scale " + arg + " 2>&1");
 
-        return r.isEmpty() ? ("scale " + arg + " ✔") : ("scale 失败: " + r);
+        if (r.isEmpty()) {
+            nScale = arg;
+            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                    .putString(PREF_SCALE, arg).apply();
+            return "scale " + arg + " ✔";
+        }
+        return "scale 失败: " + r;
     }
 
     /**
@@ -656,7 +666,11 @@ public class ForegroundService extends Service {
         String r = niriRun("NIRI_SOCKET=$N niri msg outputs 2>/dev/null"
                 + " | sed -n \"s/.*Scale: *//p\" | head -1").trim();
         /* 只接受纯数字，别把报错文本塞进提示行 */
-        return r.matches("[0-9]+(\\.[0-9]+)?") ? r : "";
+        if (!r.matches("[0-9]+(\\.[0-9]+)?"))
+            return "";
+        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_SCALE, r).apply();
+        return r;
     }
 
     /**

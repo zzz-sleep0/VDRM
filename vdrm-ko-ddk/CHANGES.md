@@ -2331,3 +2331,28 @@ niri: ERROR connector mode list missing current mode
 2. **"合成器录屏无法使用"没有依据。** `wf-recorder` 在这套环境里只打印
    `selected region 0,0 853x480`、不落文件（截图 `grim` 正常，尺寸随 mode 变）。
    测不出结论，就把 README 第 6 条改成"没保证、自己验"，不再断言能用/不能用。
+
+---
+
+## 本版本第四十四项：通知的 scale 参数、删掉 metamodule / 排除列表、文档补 root 声明
+
+1. **App：通知输入框的灰字提示里，`scale` 以前可能不带数字。** 提示行是
+   `input 1 · refresh 120 · scale 2.25` 这种"当前配置的可执行写法"，但 `scale`
+   是从合成器读的，niri 没跑（或容器名不对）时读到空串，那一项就整个消失了 ——
+   照着改自然报错。现在**一定带数字**：读到当前值用当前的，否则用上次成功设置过的
+   值（`SharedPreferences` 的 `niri_scale`），再没有就给 `1`；设置成功和读取成功
+   都会记下来。
+2. **模块：删掉 `system/vendor/etc/excluded-input-devices.xml`。** 新版 Android
+   的 InputManagerService 根本不读这个文件，键鼠排除早就改走"把 `/dev/input/eventN`
+   换成 0600 root 节点"那条路（`vdrm_hide_input`），这份 XML 是纯残留。同时清掉
+   `uninstall.sh` / `status.sh` 里关于 metamodule 和那份 XML 的说明，
+   `make-module.py` 的文件清单注释同步更新；模块 zip 因此少一个文件。
+3. **文档：**
+   - 前置条件不再要求 metamodule；
+   - 「装 App」开头直接写明 **App 需要 root**（`su` 开 `/dev/vdrm`、读参数、跑
+     `niri msg`）；
+   - 「配合成器」的差异表补一行：**root 跑合成器要用一个 systemd 服务把手机真实的
+     输入设备排除掉**，并给出规则 + `Type=oneshot` 服务写法。实测
+     `systemctl enable --now vdrm-input` 之后 `touchpanel` 是
+     `LIBINPUT_IGNORE_DEVICE=1`、`vdrm-touch` 是 `0`；
+   - App 里两处"合成器只在启动时读 `dpi`"的注释，按第十项的实测结论改掉。

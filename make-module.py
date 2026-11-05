@@ -7,7 +7,7 @@
 组件各编各的，这里只做装配：
 
     module/                  模块本身（module.prop、service.sh、status.sh、
-                             uninstall.sh、system/vendor/etc/…xml）—— 入库
+                             uninstall.sh、mode.conf、common.sh）—— 入库
     vdrm-ko-ddk/             .ko 源码；DDK/CI 编出六个 KMI 一批，文件名【就是 KMI】
                                  vdrm-ko-ddk/vdrm-android14-6.1.ko
                              —— 这是契约，service.sh 按它精确匹配，别改名

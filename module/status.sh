@@ -23,8 +23,6 @@ PRINT=0
 #   - 三台 vdrm-* 的 /dev/input/eventN 必须是我们自己 mknod 的 0600 root:root
 #     （0600 才是"Android 打不开"的关键；ueventd 建的那份是 0660 root:input）
 # 节点由 post-fs-data.sh / service.sh 在加载后一次性删掉重建；不再需要常驻进程。
-# 以前这里比的是 /vendor/etc/excluded-input-devices.xml 的 md5 —— Android 17
-# 根本不读那个文件（InputManagerService 里没人调用），所以那个 🟢 是假绿。
 VKM=0
 for f in /sys/class/input/event*/device/name; do
     [ -e "$f" ] || continue

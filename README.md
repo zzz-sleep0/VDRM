@@ -24,7 +24,7 @@
 
 | | |
 |---|---|
-| **手机** | 已 root（KernelSU / Magisk / APatch），**并装了 metamodule** |
+| **手机** | 已 root（KernelSU / Magisk / APatch） |
 | **容器** | [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS)（或任何能起 Linux 容器、能指定设备节点的方案） |
 | **合成器** | 容器里装一个。niri / KWin / Hyprland 都验过 |
 
@@ -53,11 +53,12 @@ vdrm-debug.apk         ← Android App
 > 虚拟键鼠**不用再靠屏蔽表**了：模块在加载时（`post-fs-data.sh` / `service.sh`）会把
 > `/dev/input/eventN` 换成一个 0600 的、归 root 的节点，Android 的 InputReader 打不开就看不见
 > （细节见 `module/common.sh` 第 3 节）。这是一次性动作，不再常驻 watcher；手动 reload 后用
-> `tools/vdrm_up.sh --reload` 或在 shell 里跑一次 `vdrm_hide_input` 即可。模块里那份
-> `excluded-input-devices.xml` 只当 Android ≤16 的兜底，16 以上没人读它
-> （Android 17 的 `dumpsys input` 里 `ExcludedDeviceNames` 恒为 `[]`）。
+> `tools/vdrm_up.sh --reload` 或在 shell 里跑一次 `vdrm_hide_input` 即可。
 
 ### 2. 装 App
+
+**App 需要 root**（它要开 `/dev/vdrm`、读 `/sys/module/vdrm/parameters/*`、在容器里跑
+`niri msg`，全靠 `su`）。
 
 装 `vdrm-debug.apk`。
 
@@ -95,6 +96,7 @@ privileged=nomask
 | `MESA_LOADER_DRIVER_OVERRIDE` | 同理，Mesa 没有 `vdrm` 的 DRI 驱动，不指定就退软件渲染（合成器报"没有渲染器"） | `msm`（推荐）或 `kgsl`，实测都能跑 |
 | `LIBSEAT_BACKEND=noop` | 容器里没有 logind/seatd 会话，wlroots 拿不到 seat | 只对 niri / Hyprland / sway 需要，KWin 不用 |
 | `XDG_RUNTIME_DIR` | 没有 logind 帮你建 | 建一个当前用户可写的目录（`/tmp/xdg` 就行） |
+| 排除多余设备 | **用 root 跑**时，手机真实的触摸/电源键/指纹也会被合成器收进来 | 配一个 systemd 服务，开机把那些设备标成 `LIBINPUT_IGNORE_DEVICE=1`（只留 vdrm 三个） |
 
 除这四处，**它就是一台普通显示器**。实测热插拔时 niri 日志就是普通的
 `connector changed: Virtual-3` 然后按新 EDID 换档；`grim` 截屏、`niri msg` /
@@ -117,7 +119,7 @@ dbus-run-session -- startplasma-wayland     # KDE 只用后两个变量
 别误判。
 
 **用 root 跑**：能打开手机真实的输入设备（`touchpanel` / `pmic_pwrkey` / 指纹），
-合成器会跟 Android 抢按键 —— 加一条 udev 规则让 libinput 只认 vdrm 那三个：
+合成器会跟 Android 抢按键 —— 需要一个 **systemd 服务**把它们排除掉，只留 vdrm 三个：
 
 ```sh
 # /etc/udev/rules.d/99-vdrm-input.rules
@@ -125,7 +127,9 @@ ACTION=="add|change", SUBSYSTEM=="input", ENV{LIBINPUT_IGNORE_DEVICE}="1"
 ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="vdrm-*", ENV{LIBINPUT_IGNORE_DEVICE}="0"
 ```
 
-（普通用户不用这条：没权限，打不开。）
+开机要有人套用这条规则，所以配一个 oneshot 服务（`Type=oneshot` + `RemainAfterExit=yes`
++ `ExecStart=/usr/bin/udevadm control --reload` / `udevadm trigger --subsystem-match=input --action=change`，
+`WantedBy=basic.target`）。普通用户跑不需要这些东西：它没权限，打不开那些设备。
 
 **`vdrm_gbm.so` 是什么**：一个 GBM 后端（libgbm 看到 card1 的驱动名是 `vdrm`，
 就来加载 `vdrm_gbm.so`；它转给发行版的 `dri_gbm.so`，只把分配改成 DRM dumb 路径）。
@@ -234,9 +238,9 @@ mode=1920x1080      # 开机默认档
 | `scale 1.5` | UI 缩放 —— **真正让字变大的那个**，走 `niri msg output … scale` | ✅ |
 | `commit` | 只广播参数（极少用） | — |
 
-> `scale` 和 `mode.conf` 里的 `dpi=` 是两件事：`dpi` 只改 EDID 里的物理尺寸，
-> 合成器只在**启动时**读一次，运行中改毫无反应；`scale` 是合成器自己的比例，
-> 改完立刻生效。
+> `scale` 和 `mode.conf` 里的 `dpi=` 是两件事：`dpi` 只改 EDID 里报的物理尺寸
+> （合成器据此算出来的比例不等于 `dpi/128`，精调不了），`scale` 是合成器自己的
+> 比例，改完立刻生效 —— 所以通知里放的是 `scale`。
 
 **前提**：命令要 root（走 `su`），通知要通知权限；`scale` 还需要容器里 niri 在跑
 （它会自动找活着的 niri socket，重启过也不会连错）。
