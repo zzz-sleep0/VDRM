@@ -274,4 +274,40 @@ vdrm: pipe enable 1920x1080 period=8333333 ns
 ### 附：三章之外
 
 安装、配容器、起合成器、排障表在 `README.md`；每一项改动的根因与证据在
-`vdrm-ko-ddk/CHANGES.md`（按项目顺序编号，54 项）。
+`vdrm-ko-ddk/CHANGES.md`（按项目顺序编号，42 项）。
+
+---
+
+## 附录 A：容器 / 合成器实测矩阵
+
+环境：Arch Linux ARM 容器、Mesa 27.0.0、niri 26.04、Hyprland 0.57.1、
+KWin/Plasma 6.8.2、sway 1.12，全部用**非 root 用户**（uid 1001，组
+`video,input,audio,droidspaces-gpu`）。判据一律是 15 秒内
+`/sys/module/vdrm/parameters/frames_pushed` 涨不涨。
+
+| 设置 | niri | Hyprland | KWin / Plasma | sway |
+|---|---|---|---|---|
+| `msm`（+ `LIBSEAT_BACKEND=noop`） | +197 | +1160 | +888（不需要 noop） | +13（空闲无damage） |
+| `kgsl`（+ noop） | +465 | +1381 | +1048 | — |
+| 不设 `MESA_LOADER_DRIVER_OVERRIDE` | 0 帧，`software EGL renderers are skipped` | 崩 | 1 秒内 SIGTRAP | — |
+| 不设 `LIBSEAT_BACKEND=noop` | 0 帧，`Failed to open session: Function not implemented (os error 38)` | `CBackend::create() failed!` | 不受影响 | — |
+| 删掉 `/usr/lib/gbm/vdrm_gbm.so` | 0 帧 | 0 帧 | 0 帧 | 0 帧 |
+| 不给任何 DRM 设备变量 | 出图 | 出图 | 出图 | 出图（card0 打开失败后自己换 card1） |
+
+标准行为抽查（niri）：
+- 热插拔 1920x1080 → 2780x1264：日志只有 `connector changed: Virtual-3` 然后
+  `picking mode: Mode { name: "2780x1264" … }`，合成器不重启；
+- `grim` 截屏尺寸 = 当前 mode（scale ≠ 1 时是逻辑尺寸；niri 自己会给这块屏挑
+  2.25 这类缩放值，属于 niri 的策略，不是驱动行为）；
+- `niri msg outputs` 报 `Current mode: 1920x1080 @ 120.000 Hz (preferred)`；
+- `niri msg output Virtual-3 scale 1.5`、workspace、`foot` 等客户端都按标准工作。
+
+两个容易误判的地方：
+
+1. **容器里没有 `card0`。** droidspaces 不绑真 GPU 的主节点（`/dev/dri/by-path/` 里
+   `platform-ae00000.qcom,mdss_mdp-card -> ../card0` 是悬空链接），所以**不需要**
+   "删掉 card0" 的 udev 规则 —— 实测把那条规则去掉、`udevadm trigger` 之后 card0
+   也不会出现。合成器卡在设备选择时先看 `ls /dev/dri`。
+2. **缺 render 组和缺 Mesa 覆盖的报错是同一句**
+   （`no allocator available for device`），一个查组、一个查
+   `MESA_LOADER_DRIVER_OVERRIDE`，别只查一头。
