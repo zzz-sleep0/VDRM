@@ -523,7 +523,13 @@ static const struct file_operations vdrm_audio_in_fops = {
 	.release        = vdrm_audio_in_release,
 	.unlocked_ioctl = vdrm_audio_in_ioctl,
 	.mmap           = vdrm_audio_in_mmap,
+	/* 6.12 把 no_llseek 删了（统一到 noop_llseek）。我们不需要 deny 语义：
+	 * 容器里的 ALSA 库不会 lseek 字符设备。*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	.llseek         = noop_llseek,
+#else
 	.llseek         = no_llseek,
+#endif
 };
 
 static struct miscdevice g_audio_in_misc = {
