@@ -68,8 +68,10 @@ input 1 · refresh 120 · scale 2.25
 两个容易混的东西：
 
 - `scale` 是**合成器的比例**（真正让字变大变小）；`mode.conf` 里的 `dpi=` 只改
-  EDID 里的物理尺寸，合成器**只在启动时读一次** —— 所以运行中改 `dpi` 屏幕毫无反应，
-  这也是为什么通知里放的是 `scale` 而不是 `dpi`。
+  EDID 里的物理尺寸。实测（niri 26.04）：`edid_dpi` + `commit` 之后**当场**就换成新
+  的物理尺寸，不需要重启合成器；但合成器据此给的比例并不严格是 `dpi/128`
+  （`0`→160x90mm/2.25、`256`→190x100mm/2.0、`384`→120x70mm/2.25），拿它精调缩放
+  不靠谱 —— 这也是通知里放 `scale` 而不是 `dpi` 的原因。
 - `input 0` 之后光标是相对的（手指拖动 → 指针走）；`input 1` 是绝对的（点哪就是哪）。
   切的时候会先把所有触点抬起，不会留一个"按住"。
 
@@ -297,8 +299,8 @@ KWin/Plasma 6.8.2、sway 1.12，全部用**非 root 用户**（uid 1001，组
 标准行为抽查（niri）：
 - 热插拔 1920x1080 → 2780x1264：日志只有 `connector changed: Virtual-3` 然后
   `picking mode: Mode { name: "2780x1264" … }`，合成器不重启；
-- `grim` 截屏尺寸 = 当前 mode（scale ≠ 1 时是逻辑尺寸；niri 自己会给这块屏挑
-  2.25 这类缩放值，属于 niri 的策略，不是驱动行为）；
+- `grim` 截屏尺寸 = 当前 mode（scale ≠ 1 时拿到的是逻辑尺寸，本次测试里 scale 被
+  niri 依物理尺寸定成 2.25/3，属于合成器行为，不是驱动行为）；
 - `niri msg outputs` 报 `Current mode: 1920x1080 @ 120.000 Hz (preferred)`；
 - `niri msg output Virtual-3 scale 1.5`、workspace、`foot` 等客户端都按标准工作。
 

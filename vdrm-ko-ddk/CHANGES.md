@@ -2316,3 +2316,18 @@ niri: ERROR connector mode list missing current mode
 权限和宿主机不同 —— `card1` 是 `0660 root:video`、`renderD128` 是
 `0660 root:droidspaces-gpu`、vdrm 三个输入设备是 `0660 root:input`；宿主机上那三个
 输入设备仍是 `vdrm_hide_input` 造的 `0600 root:root`。
+
+---
+
+## 本版本第四十三项：又两处文档断言，实测后改掉
+
+1. **`edid_dpi` 不是"合成器只在启动时读一次"。** 实测（niri 26.04）：`edid_dpi` +
+   `commit`（会 hotplug）之后，同一个 niri 实例里物理尺寸当场就变（`dpi=0`
+   → 160x90 mm，改成 `320` → 150x80 mm，再改回 `0` → 160x90 mm）。原来 README 写
+   "运行中改 dpi 屏幕毫无反应"是错的。
+   但**它不能精调缩放**：niri 依据物理尺寸给的比例并不严格等于 `dpi/128` ——
+   `dpi=0`→scale 2.25、`256`→2.0、`305`→2.25、`384`→2.25、`512`→2.25。
+   所以"字要变大变小用通知里的 `scale`"这个结论仍然成立，只是理由要改成上面这条。
+2. **"合成器录屏无法使用"没有依据。** `wf-recorder` 在这套环境里只打印
+   `selected region 0,0 853x480`、不落文件（截图 `grim` 正常，尺寸随 mode 变）。
+   测不出结论，就把 README 第 6 条改成"没保证、自己验"，不再断言能用/不能用。
