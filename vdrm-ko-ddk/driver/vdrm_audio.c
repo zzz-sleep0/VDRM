@@ -846,7 +846,9 @@ static snd_pcm_uframes_t vdrm_pcm_pointer(struct snd_pcm_substream *sub)
 	 * App 跟不上时 consumed 自然小于时间进度，hw_ptr 就退化成"消费者进度"，
 	 * 于是容器写满就挡回去 —— 这正是我们要的背压。*/
 	hw = consumed;
-	if (rt->state == SNDRV_PCM_STATE_RUNNING && rt->rate) {
+	/* 5.15 起 snd_pcm_runtime.state 被挪进 status->state（6.1 两处都有）。
+	 * 用 status 那份，跨版本都成立。*/
+	if (rt->status && rt->status->state == SNDRV_PCM_STATE_RUNNING && rt->rate) {
 		u64 ns = ktime_get_ns() - g_hw_t0;
 		u64 timed = g_hw_base + div_u64(ns, 1000000000ULL) * rt->rate +
 			    div_u64((ns % 1000000000ULL) * rt->rate, 1000000000ULL);

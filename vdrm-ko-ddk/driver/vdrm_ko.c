@@ -35,7 +35,11 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
+/* 5.10 还没有这个头（prepare_fb 的实现那时叫 drm_gem_fb_prepare_fb，
+ * 声明在 drm_gem_framebuffer_helper.h 里）。5.15 起才有。*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 #include <drm/drm_gem_atomic_helper.h>
+#endif
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_crtc.h>
@@ -513,7 +517,11 @@ static void vdrm_app_signal(void)
 
 	spin_lock_irqsave(&g_app_ctx_lock, flags);
 	if (g_app_ctx)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+		eventfd_signal(g_app_ctx);      /* 6.9 起去掉了 count 参数 */
+#else
 		eventfd_signal(g_app_ctx, 1);
+#endif
 	spin_unlock_irqrestore(&g_app_ctx_lock, flags);
 }
 
@@ -2094,7 +2102,13 @@ static void vdrm_setup_driver(void)
 	/* 分配占用的真正释放点：合成器销毁 dumb 缓冲时把槽放回可用集合。
 	 * 不设它的话，一个槽在整场合成器会话里只能发一次，来回切分辨率会把
 	 * 32 个槽耗光（dumb_create 6s 后 ENOSPC）。*/
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+	/* 6.6 起 struct drm_driver 没有 dumb_destroy 了（DESTROY_DUMB 走
+	 * drm_gem_handle_delete）。新内核上靠 vdrm_dumb_create 开头的
+	 * vdrm_slot_reap_closed() 懒回收 + postclose 兜底 —— 效果一样，
+	 * 只是"槽何时变空闲"晚一次 dumb_create。*/
 	g_driver.dumb_destroy              = vdrm_dumb_destroy;
+#endif
 	/* M5: 放开 import_attach（drm_gem_dumb_map_offset 会拒导入对象）*/
 	g_driver.dumb_map_offset           = vdrm_dumb_map_offset;
 	/* 这个内核把 PRIME ioctl 做成了驱动级回调：
@@ -2610,7 +2624,13 @@ static int vdrm_pipe_prepare_fb(struct drm_simple_display_pipe *pipe,
 
 	/* 设备内核只导出 drm_gem_plane_helper_prepare_fb（simple 那层没导出），
 	 * 效果一样：它把显式 fence 和 dma-buf 的隐式 fence 串进 new_state->fence。*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 	ret = drm_gem_plane_helper_prepare_fb(&pipe->plane, new_state);
+#else
+	/* 5.10：语义一样（把显式 fence + dma-buf 隐式 fence 串进
+	 * new_state->fence），只是名字/头不同。*/
+	ret = drm_gem_fb_prepare_fb(&pipe->plane, new_state);
+#endif
 	if (ret)
 		return ret;
 
