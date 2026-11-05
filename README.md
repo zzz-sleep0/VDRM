@@ -1,7 +1,7 @@
 ## 前置声明
 理论上该模块仅适用于5.10-android13到6.12-android16对应KMI内遵循G(O)KI标准的内核。
 
-如果你的内核声明已经达到该模块支持的KMI，但是内核本身并未遵循G(O)KI标准，请务必在刷入该模块前加载其中对应你内核版本的内核模块进行兼容性测试，兼容性测试的标准之一为与内核同一KMI的内核模块加载(insmod)是否导致设备重启（这一步不会伤害你的设备，因为内核模块是运行在内存中的，并未通过模块方式固化加载），如有重启，请勿刷入此模块，如没有重启，可以刷入该模块并跟着README指导进行进一步部署并进行进一步的兼容性测试（这也不会对你的设备造成永久性伤害，因为加载模块本身并不会导致设备启动失败，你可以后续在你的root管理器中卸载它）
+如果你的内核声明已经达到该模块支持的KMI，但内核本身并未遵循G(O)KI标准，**先别刷**：按文末「注意」里的方式单独 `insmod` 试一次。
 
 对于KMI不在支持范围内的内核，该模块不会加载内核模块因此不会实质性生效；不遵循以上声明，由此模块引发的问题作者概不负责！
 
@@ -77,15 +77,14 @@ privileged=nomask
 
 容器里因此自然就有 `/dev/dri/card1`（虚拟卡）、`/dev/input`、`/dev/snd`
 （`/proc/asound/cards` 第 0 张就是 `vdrm`）、`/dev/vdrm`。
-（`enable_gpu_mode=1` 要直通真 GPU 时，再补 `bind_mounts=/dev/dri/card1:/dev/dri/card1`。）
 
 容器里的节点是容器 udev 生成的，权限和宿主机不同 —— 用普通用户跑合成器时按
-属组加：`video`（card1）、`render`/`droidspaces-gpu`（真 GPU 的 render 节点）、
+属组加：`video`（card1）、`render` / `droidspaces-gpu`（render 节点）、
 `input`（`/dev/input/event*`）、放声再加 `audio`。
 
 ### 4. 配合成器
 
-- **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs）可选，不是必须：这一节的实测用的是发行版自带的 Mesa
+- 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs），用于获取硬件加速
 - 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（发行版的 GBM 后端目录，Arch 是这个路径）
 
 **和在一台普通 Linux 机器上起合成器相比，只有四处不同：**
@@ -346,7 +345,6 @@ cat /sys/module/vdrm/parameters/frames_pushed   # 动一下鼠标，这个数应
 | **手机上冒出个大鼠标 / Android 多出触摸屏、幽灵触摸** | **宿主机**上 `ls -l /dev/input/event*`：vdrm 那三个（`vdrm-kbd/ptr/touch`）应该是 `crw------- root root`，那是 `vdrm_hide_input` 一次性删掉重建的结果。被改回 `crw-rw---- root input` 就手动补一刀：`su -c '. /data/adb/modules/vdrm-lkm/common.sh; vdrm_hide_input'`（reload 场景用 `tools/vdrm_up.sh --reload`）。容器里看到的权限是容器 udev 自己给的（vdrm 三个是 `crw-rw---- root:input`），容器内靠 `LIBINPUT_IGNORE_DEVICE` 规则把其余设备全忽略 |
 | 合成器**起不来 / 说没有渲染器 / 没输出** | 对照上面「配合成器」的四处差异：漏 `MESA_LOADER_DRIVER_OVERRIDE` → niri `software EGL renderers are skipped`、KWin 1 秒 SIGTRAP、Hyprland 崩；漏 `LIBSEAT_BACKEND=noop` → niri `Failed to open session`、Hyprland `CBackend::create() failed!` |
 | 普通用户跑：能起但不出图 / 没触摸 | 缺组：`video`（card1）、`render` 或 `droidspaces-gpu`（render 节点）、`input`（`/dev/input/event*`）。缺 render 组报的和漏设 Mesa 覆盖一模一样（`no allocator available for device`） |
-| niri 报 `primary node is missing, display-only devices may not work` / `got vblank after 0ns` | 都可忽略，不影响出图 |
 | **120 模式但感觉只有 60 / 全面屏很卡** | 在通知里切到黑边屏（1920x1080） |
 | **通知里切档没反应** | 看 `cat /sys/module/vdrm/parameters/active` 有没有跟着变；没变多半是那个尺寸 HWC 扫不出去（见"已知局限"） |
 | **装 CI 的 APK 提示签名冲突** | 先卸载旧 App 再装 |
@@ -403,6 +401,15 @@ gradle assembleDebug
 6. 依赖高级设备特性的功能没保证：多屏协同这类没测过；合成器录屏（`wf-recorder`）
    实测只打印 `selected region`、不落文件，而截图（`grim`）正常 —— 想用就自己验一下，
    别默认能用
+
+## 注意
+
+- **先单独 `insmod` 验一遍。** 开了「完整硬件访问权限」之后，容器里新装或升级驱动
+  （Mesa、内核模块等）**可能导致一次软重启**。所以不要跳过模块自己的兼容性检验：
+  用自己 KMI 的那个 `.ko` 单独 `insmod`，不重启再继续往下装。
+- **设备排除。** Android 侧不用管：模块加载时会把虚拟键鼠的 `/dev/input/event*`
+  换成 0600 root 节点，系统 InputReader 打不开就看不见。容器侧只在**用 root 跑
+  合成器**时才需要那条 `LIBINPUT_IGNORE_DEVICE` 规则（见「配合成器」）。
 
 ## 鸣谢
 
