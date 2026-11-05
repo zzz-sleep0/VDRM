@@ -88,7 +88,7 @@ privileged=nomask
 - 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs），用于获取硬件加速
 - 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（发行版的 GBM 后端目录，Arch 是这个路径）
 
-**和在一台普通 Linux 机器上起合成器相比，只有四处不同：**
+**和在一台普通 Linux 机器上起合成器相比，只有下面这些不同（前四条人人要，最后一条只有 root 跑才要）：**
 
 | 差异 | 为什么 | 怎么做 |
 |---|---|---|
@@ -98,7 +98,7 @@ privileged=nomask
 | `XDG_RUNTIME_DIR` | 没有 logind 帮你建 | 建一个当前用户可写的目录（`/tmp/xdg` 就行） |
 | 排除多余设备 | **用 root 跑**时，手机真实的触摸/电源键/指纹也会被合成器收进来 | 配一个 systemd 服务，开机把那些设备标成 `LIBINPUT_IGNORE_DEVICE=1`（只留 vdrm 三个） |
 
-除这四处，**它就是一台普通显示器**。实测热插拔时 niri 日志就是普通的
+除这些，**它就是一台普通显示器**。实测热插拔时 niri 日志就是普通的
 `connector changed: Virtual-3` 然后按新 EDID 换档；`grim` 截屏、`niri msg` /
 `swaymsg` / `hyprctl`、缩放、workspace、客户端应用全是标准行为，没有 vdrm 专用参数。
 
