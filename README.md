@@ -152,7 +152,8 @@ niri / KWin 照常出图、`grim` 截图正常；注入 8 个鼠标事件后容�
 ### 4. 配合成器
 
 - 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs），用于获取硬件加速
-- 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（发行版的 GBM 后端目录，Arch 是这个路径）
+- 把 **`vdrm_gbm.so` 放到容器的 GBM 后端目录**：Arch/Debian 是 `/usr/lib/gbm/`，
+  Fedora/openSUSE 这类 lib64 发行版是 **`/usr/lib64/gbm/`**（`ls -d /usr/lib*/gbm` 确认）
 
 **和在一台普通 Linux（这里是Arch） 机器上起合成器相比，只有下面这些不同（前四条人人要，最后一条只有 root 跑才要）：**
 
@@ -416,6 +417,8 @@ cat /sys/module/vdrm/parameters/frames_pushed   # 动一下鼠标，这个数应
 | **手机上冒出个大鼠标 / Android 多出触摸屏、幽灵触摸** | **宿主机**上 `ls -l /dev/input/event*`：vdrm 那三个（`vdrm-kbd/ptr/touch`）应该是 `crw------- root root`，那是 `vdrm_hide_input` 一次性删掉重建的结果。被改回 `crw-rw---- root input` 就手动补一刀：`su -c '. /data/adb/modules/vdrm-lkm/common.sh; vdrm_hide_input'`（reload 场景用 `tools/vdrm_up.sh --reload`）。容器里看到的权限是容器 udev 自己给的（vdrm 三个是 `crw-rw---- root:input`），容器内靠 `LIBINPUT_IGNORE_DEVICE` 规则把其余设备全忽略 |
 | 合成器**起不来 / 说没有渲染器 / 没输出** | 对照上面「配合成器」的四处差异：漏 `MESA_LOADER_DRIVER_OVERRIDE` → niri `software EGL renderers are skipped`、KWin 1 秒 SIGTRAP、Hyprland 崩；漏 `LIBSEAT_BACKEND=noop` → niri `Failed to open session`、Hyprland `CBackend::create() failed!` |
 | 普通用户跑：能起但不出图 / 没触摸 | 缺组：`video`（card1）、`render` 或 `droidspaces-gpu`（render 节点）、`input`（`/dev/input/event*`）。缺 render 组报的和漏设 Mesa 覆盖一模一样（`no allocator available for device`） |
+| **KDE 起不来 / 日志刷屏 `org.bluez.obex` 反复激活** | 容器里没有 BlueZ，kded6 的 bluedevil 模块会不停请求 OBEX 服务（实测 20 秒 1000+ 行）。停用它：`mv /usr/lib64/qt6/plugins/kf6/kded/bluedevil.so{,.disabled}`（Fedora 路径；Arch 是 `/usr/lib/qt6/plugins/kf6/kded/`），或 mask 掉 `/usr/share/dbus-1/services/org.bluez.obex.service`。`kded6rc` 里写 `autoload=false` 实测不管用 |
+| KDE 日志里 `org.freedesktop.systemd1` / `imsettings` 激活失败 | 容器里没有 user systemd / Fedora 的输入法服务，属常态噪音，可忽略 |
 | **120 模式但感觉只有 60 / 全面屏很卡** | 在通知里切到黑边屏（1920x1080） |
 | **通知里切档没反应** | 看 `cat /sys/module/vdrm/parameters/active` 有没有跟着变；没变多半是那个尺寸 HWC 扫不出去（见"已知局限"） |
 | **装 CI 的 APK 提示签名冲突** | 先卸载旧 App 再装 |
