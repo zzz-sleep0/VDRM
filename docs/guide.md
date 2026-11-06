@@ -342,4 +342,20 @@ udevadm trigger … → Failed to write 'change' to '…/uevent': Read-only file
 触摸和按键，只能强制重启。现在的脚本：先用**自己的 fsname** 挂 tmpfs、挂完再确认一次，
 任何一步不对就退出，绝不碰下面的宿主机节点。写自己的容器脚本时请照这个顺序。
 
-**坑二**：模块重新加载后 `eventN` 会变，需要 `systemctl restart vdrm-input`。
+****坑二**：光建 `/dev/input/eventN` 还不够 —— libinput 走 libudev 枚举，没有
+`ID_INPUT` 属性会直接跳过设备，表现是"合成器起来了、画面正常，但完全没有输入"。
+`/sys` 只读时 `udevadm trigger` 跑不了（`Failed to write 'change' …: Read-only file
+system`），所以服务要自己写 `/run/udev/data/c13:*`：
+
+```
+I:<usec>
+E:ID_INPUT=1
+E:ID_INPUT_MOUSE=1          # vdrm-ptr
+E:ID_INPUT_TOUCHSCREEN=1    # vdrm-touch
+E:ID_INPUT_KEY=1 + E:ID_INPUT_KEYBOARD=1   # vdrm-kbd
+```
+
+补上之后 `libinput list-devices` 能列出 `vdrm-kbd`(keyboard) / `vdrm-ptr`(pointer) /
+`vdrm-touch`(touch)，触摸才真正进来。
+
+**坑三**：模块重新加载后 `eventN` 会变，需要 `systemctl restart vdrm-input`。
