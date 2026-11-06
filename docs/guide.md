@@ -62,7 +62,7 @@ input 1 · refresh 120 · scale 2.25
 |---|---|---|
 | `input 0` / `input 1` | 手机触摸注入到哪个虚拟设备：`vdrm-ptr`（REL 相对位移，触控板手感）/ `vdrm-touch`（ABS_MT 绝对坐标，按哪点哪） | 下一次触摸 |
 | `refresh 90` | 写 `refresh` 参数 + `commit`（重算 EDID + hotplug） | 立刻 |
-| `scale 1.5` | 容器里 `niri msg output <名> scale 1.5` | 立刻 |
+| `scale 1.5` | 容器里按合成器走自己的 IPC：niri `msg output <名> scale` / sway `swaymsg output <名> scale` / hypr `hyprctl keyword monitor`（容器名、输出名都自动找） | 立刻 |
 | `commit` | 只广播参数，不重建池 | 立刻 |
 
 两个容易混的东西：

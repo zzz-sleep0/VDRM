@@ -58,9 +58,7 @@ public class ForegroundService extends Service {
     private static final String KEY_CMD = "cmd";
 
     private static final String MODDIR = "/data/adb/modules/vdrm-lkm";
-    /* 容器名和 droidspaces 路径：改了容器名要一起改。只有 scale 用到它们 ——
-     * UI 缩放是合成器的概念，只能通过 niri 的 IPC 调。*/
-    private static final String CT = "Arch-dev";
+    /* droidspaces 的路径。容器名不写死：compRun() 会遍历正在运行的那些。*/
     private static final String DS = "/data/local/Droidspaces/bin/droidspaces";
     private static final String P = "/sys/module/vdrm/parameters";
 
@@ -602,15 +600,99 @@ public class ForegroundService extends Service {
         return mode == MainActivity.INPUT_TOUCH ? "input 触控屏 ✔" : "input 鼠标 ✔";
     }
 
+    /* ==================== 合成器 scale ==================== */
+
+    /* 下面两段脚本都是"自己找活着的合成器"：niri → sway → Hyprland，谁在就用谁。
+     * 约定：
+     *   - 里面一律用双引号，因为外层要整段塞进 `bash -lc '...'`；
+     *   - 找到并成功 → 打印 ok（写）/ 打印数字（读）；都没找到 → 打印 no-supported-compositor。
+     * 容器名也不写死：外层的 compRun() 会挨个试正在运行的容器。*/
+
+    private static final String SH_RT = "RT=\"${XDG_RUNTIME_DIR:-/tmp/xdg}\"; ";
+
+    private static String shSetScale(String v) {
+        return SH_RT
+            + "for S in $(ls -t \"$RT\"/niri.wayland-*.sock 2>/dev/null); do "
+            +   "NIRI_SOCKET=\"$S\" niri msg version >/dev/null 2>&1 || continue; "
+            +   "O=$(NIRI_SOCKET=\"$S\" niri msg outputs 2>/dev/null | head -1 "
+            +       "| sed -n \"s/.*(\\(.*\\)).*/\\1/p\"); "
+            +   "[ -n \"$O\" ] || continue; "
+            +   "NIRI_SOCKET=\"$S\" niri msg output \"$O\" scale " + v + " >/dev/null 2>&1 "
+            +     "&& { echo ok; exit 0; }; "
+            + "done; "
+            + "for S in $(ls -t \"$RT\"/sway-ipc.*.sock 2>/dev/null); do "
+            +   "SWAYSOCK=\"$S\" swaymsg -t get_version >/dev/null 2>&1 || continue; "
+            +   "O=$(SWAYSOCK=\"$S\" swaymsg -t get_outputs 2>/dev/null "
+            +       "| sed -n \"s/^Output \\([^ ]*\\).*/\\1/p\" | head -1); "
+            +   "[ -n \"$O\" ] || continue; "
+            +   "SWAYSOCK=\"$S\" swaymsg output \"$O\" scale " + v + " >/dev/null 2>&1 "
+            +     "&& { echo ok; exit 0; }; "
+            + "done; "
+            + "for D in \"$RT\"/hypr/*/; do "
+            +   "[ -d \"$D\" ] || continue; "
+            +   "sig=$(basename \"$D\"); "
+            +   "HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl monitors >/dev/null 2>&1 || continue; "
+            +   "O=$(HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl -j monitors 2>/dev/null "
+            +       "| sed -n \"s/.*\\\"name\\\": *\\\"\\([^\\\" ]*\\)\\\".*/\\1/p\" | head -1); "
+            +   "[ -n \"$O\" ] || continue; "
+            +   "HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl keyword monitor "
+            +     "\"$O,preferred,auto," + v + "\" >/dev/null 2>&1 "
+            +     "&& { echo ok; exit 0; }; "
+            + "done; "
+            + "echo no-supported-compositor";
+    }
+
+    private static final String SH_READ_SCALE = SH_RT
+        + "for S in $(ls -t \"$RT\"/niri.wayland-*.sock 2>/dev/null); do "
+        +   "NIRI_SOCKET=\"$S\" niri msg version >/dev/null 2>&1 || continue; "
+        +   "r=$(NIRI_SOCKET=\"$S\" niri msg outputs 2>/dev/null "
+        +       "| sed -n \"s/.*Scale: *//p\" | head -1); "
+        +   "[ -n \"$r\" ] && { echo \"$r\"; exit 0; }; "
+        + "done; "
+        + "for S in $(ls -t \"$RT\"/sway-ipc.*.sock 2>/dev/null); do "
+        +   "SWAYSOCK=\"$S\" swaymsg -t get_version >/dev/null 2>&1 || continue; "
+        +   "r=$(SWAYSOCK=\"$S\" swaymsg -t get_outputs 2>/dev/null "
+        +       "| sed -n \"s/.*\\\"scale\\\": *\\\"\\([0-9.]*\\)\\\".*/\\1/p\" | head -1); "
+        +   "[ -n \"$r\" ] && { echo \"$r\"; exit 0; }; "
+        + "done; "
+        + "for D in \"$RT\"/hypr/*/; do "
+        +   "[ -d \"$D\" ] || continue; "
+        +   "sig=$(basename \"$D\"); "
+        +   "HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl monitors >/dev/null 2>&1 || continue; "
+        +   "r=$(HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl -j monitors 2>/dev/null "
+        +       "| sed -n \"s/.*\\\"scale\\\": *\\([0-9.]*\\).*/\\1/p\" | head -1); "
+        +   "[ -n \"$r\" ] && { echo \"$r\"; exit 0; }; "
+        + "done; "
+        + "echo no-supported-compositor";
+
+    /**
+     * 在"正在运行的容器"里跑一段脚本：容器名不写死。
+     *
+     * 做法是遍历 `/data/local/Droidspaces/Containers/` 下的名字，`run -- true`
+     * 探活（没跑的容器会直接失败），再在里面跑 inner。合成器脚本找不到就返回
+     * `no-supported-compositor`，那就换下一个容器试。
+     */
+    private String compRun(String inner) {
+        String cmd = "for C in $(ls /data/local/Droidspaces/Containers 2>/dev/null); do "
+                + DS + " -n \"$C\" run -- true >/dev/null 2>&1 || continue; "
+                + "OUT=$(" + DS + " -n \"$C\" run -- bash -lc '" + inner + "' 2>/dev/null); "
+                + "[ \"$OUT\" = no-supported-compositor ] && continue; "
+                + "echo \"$OUT\"; exit 0; "
+                + "done; "
+                + "echo no-supported-compositor";
+        return sh(cmd);
+    }
+
     /**
      * UI 缩放：改的是**合成器**的 scale，不是 EDID 的 dpi。
      *
      * `edid_dpi` 只影响 EDID 里的物理尺寸（commit 后合成器会重读，但换算出来的
-     * 比例并不等于 dpi/128，不能精调 UI）。真正能直接改大小的是
-     * `niri msg output <name> scale N`，这里就是转一次容器命令。
-     *
-     * 输出名不写死：从 `niri msg outputs` 第一行括号里取（Virtual-3 之类），
-     * 换机器/换合成器不用改。
+     * 比例并不等于 dpi/128，不能精调 UI）。真正能直接改大小的是合成器自己的 IPC：
+     *   niri  `niri msg output <name> scale N`
+     *   sway  `swaymsg output <name> scale N`
+     *   hypr  `hyprctl keyword monitor <name>,preferred,auto,N`
+     * 输出名都从各自的状态里取，不写死。niri 实测；sway / Hyprland 是同样的思路，
+     * 在容器里没跑通 IPC（`swaymsg`/`hyprctl` 超时），失败会明确报出来。
      */
     private String setScale(String arg) {
         double d;
@@ -623,48 +705,21 @@ public class ForegroundService extends Service {
         if (d < 0.5 || d > 3.0)
             return "scale 范围 0.5..3.0";
 
-        /* 找 socket 要小心：niri 的 IPC socket 名字里带 pid，niri 重启之后
-         * 旧文件会留在 /tmp/xdg 里 —— 直接取第一个会连到死 socket
-         * （"Invalid argument (os error 22)"）。所以按修改时间从新到旧试，
-         * 用 `niri msg version` 探活，第一个活的就是它。*/
-        String r = niriRun("NIRI_SOCKET=$N niri msg output \"$O\" scale " + arg + " 2>&1");
+        String r = compRun(shSetScale(arg));
 
-        if (r.isEmpty()) {
+        if ("ok".equals(r)) {
             nScale = arg;
             getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
                     .putString(PREF_SCALE, arg).apply();
             return "scale " + arg + " ✔";
         }
-        return "scale 失败: " + r;
-    }
-
-    /**
-     * 在容器里跑一段 niri IPC，自动挑一个**活着**的 socket。
-     *
-     * niri 的 socket 名字带 pid，重启之后旧文件会留在 /tmp/xdg 里 —— 直接取
-     * 第一个会连到死 socket（"Invalid argument (os error 22)"）。所以按修改
-     * 时间从新到旧试，用 `niri msg version` 探活。
-     *
-     * 传进来的 ipc 片段里可以用 $N（活 socket）和 $O（输出名，从
-     * `niri msg outputs` 第一行的括号里取，Virtual-3 之类，不写死）。
-     */
-    private String niriRun(String ipc) {
-        String inner = "N=; for S in $(ls -t /tmp/xdg/niri.wayland-*.sock 2>/dev/null); "
-                + "do if NIRI_SOCKET=$S niri msg version >/dev/null 2>&1; "
-                + "then N=$S; break; fi; done; "
-                + "[ -z \"$N\" ] && { echo no-live-niri; exit 1; }; "
-                + "O=$(NIRI_SOCKET=$N niri msg outputs 2>/dev/null | head -1"
-                + " | sed -n \"s/.*(\\(.*\\)).*/\\1/p\"); "
-                + "[ -z \"$O\" ] && { echo no-output; exit 1; }; "
-                + ipc;
-
-        return sh(DS + " -n " + CT + " run -- bash -lc '" + inner + "'");
+        return "scale 失败: " + ("no-supported-compositor".equals(r)
+                ? "容器里没找到活着的 niri / sway / Hyprland" : r);
     }
 
     /** 读当前 scale（"2.25" 这种）；读不到返回空串 */
     private String readScale() {
-        String r = niriRun("NIRI_SOCKET=$N niri msg outputs 2>/dev/null"
-                + " | sed -n \"s/.*Scale: *//p\" | head -1").trim();
+        String r = compRun(SH_READ_SCALE).trim();
         /* 只接受纯数字，别把报错文本塞进提示行 */
         if (!r.matches("[0-9]+(\\.[0-9]+)?"))
             return "";

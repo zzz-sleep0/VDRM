@@ -289,7 +289,7 @@ mode=1920x1080      # 开机默认档
 |---|---|---|
 | `input 0` / `input 1` | 手机触摸当**鼠标**（相对位移，触控板手感）/ 当**触控屏**（按哪点哪） | 下一次触摸 |
 | `refresh 90` | 刷新率（24..240） | ✅ |
-| `scale 1.5` | UI 缩放 —— **真正让字变大的那个**，走 `niri msg output … scale` | ✅ |
+| `scale 1.5` | UI 缩放 —— **真正让字变大的那个**，走合成器自己的 IPC（niri `msg output … scale` / sway `output … scale` / hypr `keyword monitor`），容器名和输出名都自动找 | ✅ |
 | `commit` | 只广播参数（极少用） | — |
 
 > `scale` 和 `mode.conf` 里的 `dpi=` 是两件事：`dpi` 只改 EDID 里报的物理尺寸
