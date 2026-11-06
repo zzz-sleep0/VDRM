@@ -313,3 +313,27 @@ KWin/Plasma 6.8.2、sway 1.12，全部用**非 root 用户**（uid 1001，组
 2. **缺 render 组和缺 Mesa 覆盖的报错是同一句**
    （`no allocator available for device`），一个查组、一个查
    `MESA_LOADER_DRIVER_OVERRIDE`，别只查一头。
+
+---
+
+## 附录 B：不开「完整硬件访问」的容器
+
+`enable_hw_access=1` 会让容器里的 `/sys` 变可写 —— 容器里装/升级驱动时就可能把整机
+软重启一次。所以更稳的配置是**不开硬件访问**，把设备逐个绑进来，再用一个小
+systemd 服务代替 udev 建节点（脚本：`tools/vdrm-container-setup.sh`）。
+
+实测（Arch、Mesa 27、`/sys` 只读、非 root 用户）：
+
+```
+sysfs on /sys type sysfs (ro,relatime,seclabel)
+udevadm trigger … → Failed to write 'change' to '…/uevent': Read-only file system
+```
+
+| 检查 | 结果 |
+|---|---|
+| niri / KWin | 出图（`frames_pushed` 在涨）、`grim` 截 1920x1080 |
+| 输入 | 注入 8 个事件 → 容器内 `dd` 读到 192 字节（`/dev/input/event8`，0660 root:input） |
+| 音频 | `pcmC0D0p` 能被普通用户打开（服务把 vdrm 那张卡的节点改成 root:audio 0660） |
+| 容器重启 | 服务开机自动生效，`/dev/input` 里只有 vdrm 三个设备 |
+
+坑：模块重新加载后 `eventN` 会变，需要 `systemctl restart vdrm-input`。
