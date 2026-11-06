@@ -76,3 +76,16 @@ jobs:
           else
             gh release create "$TAG" assets/* --title "$TITLE" --notes "$NOTES"
           fi
+
+          # 模块包的文件名带版本号，所以 --clobber 只能覆盖同名的那一个；
+          # 版本一升，旧 zip 就会留在 release 里（还会和 SHA256SUMS 对不上）。
+          # 这里只保留这次构建出来的那个，其余 vdrm-lkm-*.zip 全部删掉。
+          CUR=$(ls assets | sed -n 's/^\(vdrm-lkm-.*\.zip\)$/\1/p' | head -1)
+          if [ -n "$CUR" ]; then
+            gh release view "$TAG" --json assets -q '.assets[].name' |
+            while read -r n; do
+              case "$n" in
+                vdrm-lkm-*.zip) [ "$n" = "$CUR" ] || gh release delete-asset "$TAG" "$n" -y ;;
+              esac
+            done
+          fi
