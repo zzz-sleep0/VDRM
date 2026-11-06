@@ -78,23 +78,26 @@ bind_mounts=/dev/dri:/dev/dri,/dev/input:/dev/input,/dev/snd:/dev/snd,/dev/vdrm:
 ```
 
 **为什么不开**：开了之后 `/sys` 在容器里是**可写**的，容器里装或升级驱动（Mesa 之类）
-会往 `/sys` 写，可能把整机软重启一次。不开的话 `/sys` 是只读的
+会往 `/sys` 写，可能把整机软重启一次。不开的话 `/sys` 只读
 （`mount | grep ' /sys '` → `ro`），装什么驱动都随便。
 
-代价是容器里没有 udev 替你建节点、也没有 `LIBINPUT_IGNORE_DEVICE` 这类属性可用，
-所以用一个小 systemd 服务顶上（脚本在仓库 `tools/vdrm-container-setup.sh`）：
+代价是容器里没有 udev 可用：`/sys` 只读，`udevadm trigger` 直接失败
+（`Failed to write 'change' to '…/event8/uevent': Read-only file system`），
+于是设备节点和 `ID_INPUT*` 属性都不会有人建。解决办法是**用 systemd 的 oneshot 顶替 udev**：
+容器里 systemd 一定是 PID 1，让它开机跑一次脚本就行。脚本在仓库
+`tools/vdrm-container-setup.sh`：
 
 ```sh
-install -m 755 vdrm-container-setup.sh /usr/local/sbin/
+install -m 755 vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
 cat > /etc/systemd/system/vdrm-input.service <<'EOF'
 [Unit]
 Description=vdrm: only expose the virtual input devices
-After=local-fs.target
-Before=display-manager.service
+After=local-fs.target            # 要写 /dev、/run/udev/data，等挂载就绪
+Before=display-manager.service   # 合成器起来前必须做完，libinput 只在启动时枚举
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=oneshot                     # 一次性任务，跑完就退出
+RemainAfterExit=yes              # 但让 systemd 记住"已完成"（状态 active）
 ExecStart=/usr/local/sbin/vdrm-container-setup
 
 [Install]
@@ -103,33 +106,48 @@ EOF
 systemctl enable --now vdrm-input
 ```
 
-它做三件事：
+**它开机干三件事（顺序不能换）**
 
-1. 把 `/dev/input`、`/dev/snd` 换成只含 vdrm 设备的 tmpfs
-   （输入节点 `0666`，声卡 `root:audio 0660`）——手机真实的触摸/电源键/指纹**根本不会出现
-   在容器里**，root 也不用再靠 udev 规则排除；
-2. 给这三台设备写 `/run/udev/data/c13:*` 条目（`ID_INPUT` / `ID_INPUT_MOUSE` /
-   `ID_INPUT_TOUCHSCREEN` / `ID_INPUT_KEYBOARD`）——**这一步不能省**：libinput 走
-   libudev 枚举，没有这些属性它会直接跳过设备，表现是"合成器起来了、画面也正常，
-   但完全没输入"；不开硬件访问时 `/sys` 只读、`udevadm trigger` 跑不了，所以只能自己写；
-3. 顺带把 vdrm 那张声卡的 `/dev/snd` 节点也建好。
+1. `mount --make-rprivate /dev`，再用 tmpfs **顶掉** `/dev/input`、`/dev/snd`；
+2. 在 tmpfs 里 `mknod` 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）
+   并建 `vdrm-kbd` / `vdrm-ptr` / `vdrm-touch` 软链 —— 手机真实的触摸/电源键/指纹
+   **根本不会出现在容器里**，root 跑合成器也不用再做设备排除；
+3. 往 `/run/udev/data/c13:<minor>` 写属性：`ID_INPUT` + `MOUSE` / `TOUCHSCREEN` /
+   `KEYBOARD`。**这一步不能省** —— libinput 走 libudev 枚举，没有这些属性会直接
+   跳过设备，表现是"合成器起来了、画面正常、但完全没输入"。
+
+链条就是这样：
+
+```
+libinput → libudev 枚举 /sys/class/input/event*
+         → 读 /run/udev/data/c13:<minor> 拿 ID_INPUT*（没有就跳过设备）
+         → 打开 /dev/input/eventN（0666，谁来都能读）
+```
 
 > ⚠️ **不要手动在容器里 `rm` / `chmod` `/dev/input`、`/dev/snd`**：这两个目录是宿主机
 > 目录的 bind mount，里面是**同一批 inode** —— 在容器里删一个节点，宿主机上就真的没了。
 > （踩过一次：删掉 `/dev/input/event*` 之后 Android 直接没有触摸和按键，只能强制重启。）
-> 脚本的正确顺序是**先用 tmpfs 把目录顶掉、确认挂上了**，再在 tmpfs 里 mknod；
-> 挂不上就直接退出，不去动下面的宿主机节点。
+> 脚本里所以先挂 tmpfs、**用我们自己的 fsname 确认挂上了**才动，任何一步不对就 `exit 1`。
 
-**实测**（Arch 容器、Mesa 27、`/sys` 只读、容器重启后全自动）：
-`libinput list-devices` 列出 `vdrm-kbd`(keyboard) / `vdrm-ptr`(pointer) /
-`vdrm-touch`(touch)；niri / KWin 照常出图、`grim` 截图正常；
-普通用户能读到虚拟鼠标事件（注入 8 个事件后 `dd` 读到 192 字节）；
+**怎么确认它对**
+
+```sh
+systemctl is-active vdrm-input          # active
+ls /dev/input/                          # 只有 event7/8/9 + vdrm-kbd/ptr/touch
+libinput list-devices | grep -E '^Device'
+#   Device: vdrm-kbd      Capabilities: keyboard
+#   Device: vdrm-ptr      Capabilities: pointer
+#   Device: vdrm-touch    Capabilities: touch
+```
+
+**实测**（Arch 容器、Mesa 27、`/sys` 只读、容器重启后全自动）：上面三条都对；
+niri / KWin 照常出图、`grim` 截图正常；注入 8 个鼠标事件后容器内 `dd` 读到 192 字节；
 `plughw:vdrm,0` 能打开。
 
 > 模块重新加载后 `eventN` 编号会变，记得 `systemctl restart vdrm-input`。
 
-容器里的节点权限和宿主机不同（`/dev/dri/card1` 是 `0666`、render 节点也是），
-用普通用户跑合成器时仍按属组加：`video`、`render` / `droidspaces-gpu`、`input`（放声再加 `audio`）。
+容器里 `/dev/dri/card1` 和 render 节点是 `0666`；用普通用户跑合成器时按属组加
+`video`、`render` / `droidspaces-gpu`、`input`、放声再加 `audio`。
 
 ### 4. 配合成器
 
