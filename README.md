@@ -1,17 +1,18 @@
 ## 前置声明
-理论上该模块仅适用于5.10-android13到6.12-android16对应KMI内遵循G(O)KI标准的内核。
+理论上该模块仅适用于5.10-android13到6.12-android16对应KMI内遵循GKI/OKI标准的内核。
 
-如果你的内核声明已经达到该模块支持的KMI，但内核本身并未遵循G(O)KI标准，**先别刷**：按文末「注意」里的方式单独 `insmod` 试一次。
+对于不同的内核，本模块的处理方式和Dere3046大佬的_patchHarmony项目处理方式类似，如果那个项目在你的内核上可以运行，理论上这个项目也可以
 
-对于KMI不在支持范围内的内核，该模块不会加载内核模块因此不会实质性生效；不遵循以上声明，由此模块引发的问题作者概不负责！
+如果你的内核声明已经达到该模块支持的KMI，但内核本身并未遵循GKI/OKI标准，且没有对应的_patchHarmony部署成功先例，**先别刷.zip模块**：按文末「注意」里的方式单独 `insmod` 试一次，否则请做好音量键救砖甚至格式化data分区的准备！
+
+对于KMI不在支持范围内的内核，该模块不会加载内核模块因此不会实质性生效
 
 # VDRM
 
-把一台 Android 手机变成**虚拟 DRM 显示器**（`/dev/vdrm`，虚拟 `card1`），
-让 Linux 合成器（niri / KWin / Hyprland / sway …）跑在容器里、画面显示在手机屏幕上，
-同时提供一套**通用**的虚拟键鼠和一张虚拟声卡。
-不是投屏，也不是 X11 转发 —— 容器里的合成器看到的就是一块真实的 DRM 卡。
-虚拟键鼠走**内核 evdev**，所以任何用 libinput 的合成器都通用。
+把一台 Android 手机通过新建内核节点与容器化对节点进行隔离，让容器看到一台**虚拟 DRM 显示器**（`card1`, `renderD129`），安卓测app通过和相应的内核节点（/dev/vdrm）通信从而显示容器内画面
+让 Linux 标准合成器（niri / KWin / Hyprland / sway …）以接近原生的方式跑在容器里、画面显示在手机屏幕上，
+同时提供一套**通用**的虚拟键鼠和虚拟声卡。
+
 
 **在你自己的手机上，跑一个完整的 Linux 桌面。**
 
@@ -48,7 +49,7 @@ vdrm-debug.apk         ← Android App
 
 ### 1. 装模块
 
-用管理器安装 `vdrm-lkm-***.zip`，然后**重启**。
+用你的root管理器安装 `vdrm-lkm-***.zip`，然后**重启**。
 
 > 虚拟键鼠**不用再靠屏蔽表**了：模块在加载时（`post-fs-data.sh` / `service.sh`）会把
 > `/dev/input/eventN` 换成一个 0600 的、归 root 的节点，Android 的 InputReader 打不开就看不见
@@ -57,14 +58,13 @@ vdrm-debug.apk         ← Android App
 
 ### 2. 装 App
 
-**App 需要 root**（它要开 `/dev/vdrm`、读 `/sys/module/vdrm/parameters/*`、在容器里跑
-`niri msg`，全靠 `su`）。
+**App 需要 root**（它要读写`/sys/module/vdrm/parameters/*`、修改模块配置，全靠 `su`）。
 
 装 `vdrm-debug.apk`。
 
-- CI 的 debug APK 和你自己签名的包**签名不同**；如果手机上已经装了别的签名版本，先卸载再装。
+- CI 的 debug APK 和你自己签名的包可能**签名不同**；如果手机上已经装了别的签名版本，先卸载再装。
 - 模块启动时已经把 `/dev/vdrm` 设成 `0666`、标签 `gpu_device`；不需要 chown，第一次安装/重装直接可用。
-- App 是横屏全屏；1920 模式居中留黑边，真实分辨率模式铺满（摄像头挖空会压在桌面上）。
+- App 默认是横屏 1920x1080 ；1920 模式居中留黑边，真实分辨率模式铺满（摄像头挖空会压在桌面上）。
 - **模块和 App 要一起更新**：音频靠 App 的 `VDRM_AUDIO_KICK` 唤醒容器里的写者，新 `.ko` 配旧 APK 会周期性卡顿（10 秒一次 `-EIO`）。
 
 ### 3. 配容器
@@ -75,6 +75,8 @@ vdrm-debug.apk         ← Android App
 enable_hw_access=1     # 整份 /dev 就进来了，不用逐个 bind_mounts
 privileged=nomask
 ```
+
+*这里注意⚠️*：由于你的容器开启了´硬件访问´和´nomask´特权，所以对于部分驱动软件的下载与更新可能因为容器对/sys和/proc的写入而导致设备软重启，这个是开硬件访问后不可避免的（正在研究新的规避方法）
 
 容器里因此自然就有 `/dev/dri/card1`（虚拟卡）、`/dev/input`、`/dev/snd`
 （`/proc/asound/cards` 第 0 张就是 `vdrm`）、`/dev/vdrm`。
@@ -88,21 +90,19 @@ privileged=nomask
 - 打上 **[mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)**（lfdevs），用于获取硬件加速
 - 把 **`vdrm_gbm.so` 放到容器的 `/usr/lib/gbm/`**（发行版的 GBM 后端目录，Arch 是这个路径）
 
-**和在一台普通 Linux 机器上起合成器相比，只有下面这些不同（前四条人人要，最后一条只有 root 跑才要）：**
+**和在一台普通 Linux（这里是Arch） 机器上起合成器相比，只有下面这些不同（前四条人人要，最后一条只有 root 跑才要）：**
 
 | 差异 | 为什么 | 怎么做 |
 |---|---|---|
-| `vdrm_gbm.so` | libgbm 按 DRM 驱动名找 GBM 后端，`vdrm` 没有 | 拷进 `/usr/lib/gbm/` |
-| `MESA_LOADER_DRIVER_OVERRIDE` | 同理，Mesa 没有 `vdrm` 的 DRI 驱动，不指定就退软件渲染（合成器报"没有渲染器"） | `msm`（推荐）或 `kgsl`，实测都能跑 |
+| `vdrm_gbm.so` | libgbm 按 DRM 驱动名找 GBM 后端，`vdrm` 没有mesa上游的承认，必须自己加 | 拷进 `/usr/lib/gbm/` |
+| `MESA_LOADER_DRIVER_OVERRIDE` | 同理，Mesa 没有 `vdrm` 的 DRI 驱动，不指定就退软件渲染（合成器报"没有渲染器"） | `msm`或 `kgsl`，实测都能跑 |
 | `LIBSEAT_BACKEND=noop` | 容器里没有 logind/seatd 会话，wlroots 拿不到 seat | 只对 niri / Hyprland / sway 需要，KWin 不用 |
 | `XDG_RUNTIME_DIR` | 没有 logind 帮你建 | 建一个当前用户可写的目录（`/tmp/xdg` 就行） |
-| 排除多余设备 | **用 root 跑**时，手机真实的触摸/电源键/指纹也会被合成器收进来 | 配一个 systemd 服务，开机把那些设备标成 `LIBINPUT_IGNORE_DEVICE=1`（只留 vdrm 三个） |
+| 排除多余设备 | **用容器内的 root 用户跑**时，手机真实的触摸/电源键/指纹也会被合成器收进来 | 配一个 systemd 服务，开机把那些设备标成 `LIBINPUT_IGNORE_DEVICE=1`（只留 vdrm 三个） |
 
-除这些，**它就是一台普通显示器**。实测热插拔时 niri 日志就是普通的
-`connector changed: Virtual-3` 然后按新 EDID 换档；`grim` 截屏、`niri msg` /
-`swaymsg` / `hyprctl`、缩放、workspace、客户端应用全是标准行为，没有 vdrm 专用参数。
+除这些，**它就是一台普通显示器**，客户端应用全是标准行为，没有 vdrm 专用参数。
 
-**启动命令**就是各自的标准命令（niri 26.04 / Hyprland 0.57.1 / Plasma 6.8.2 /
+**启动命令**就是合成器各自的标准命令（注意安卓上用noop环境变量规避tty）（niri 26.04 / Hyprland 0.57.1 / Plasma 6.8.2 /
 sway 1.12 都在 Arch 容器、Mesa 27、普通用户下出过图）：
 
 ```sh
@@ -118,7 +118,7 @@ dbus-run-session -- startplasma-wayland     # KDE 只用后两个变量
 `MESA_LOADER_DRIVER_OVERRIDE` 一模一样**（`no allocator available for device`），
 别误判。
 
-**用 root 跑**：能打开手机真实的输入设备（`touchpanel` / `pmic_pwrkey` / 指纹），
+**用 root 用户跑**：能打开手机真实的输入设备（`touchpanel` / `pmic_pwrkey` / 指纹），
 合成器会跟 Android 抢按键 —— 需要一个 **systemd 服务**把它们排除掉，只留 vdrm 三个：
 
 ```sh
@@ -132,7 +132,7 @@ ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="vdrm-*", ENV{LIBINPUT_IG
 `WantedBy=basic.target`）。普通用户跑不需要这些东西：它没权限，打不开那些设备。
 
 **`vdrm_gbm.so` 是什么**：一个 GBM 后端（libgbm 看到 card1 的驱动名是 `vdrm`，
-就来加载 `vdrm_gbm.so`；它转给发行版的 `dri_gbm.so`，只把分配改成 DRM dumb 路径）。
+就来加载 `vdrm_gbm.so`；它转给mesa的 `dri_gbm.so`，只把分配改成 VDRM dumb 路径）。
 跨发行版前提两个：glibc ≥ 2.34、发行版 Mesa 带 `dri_gbm.so`；ABI 改了要重编
 （`cd vdrm-gbm && make`，只要 gcc + `gbm.h`）。
 
@@ -197,7 +197,7 @@ echo 1   > /sys/module/vdrm/parameters/commit     # 一次性广播（EDID + hot
 ### 开机默认档：`mode.conf`
 
 日常切换用通知（下面那一节），`mode.conf` 只是**开机种子**；在通知里切过档之后
-App 会把它写回这个文件，所以重启还是上一次的选择。
+App 会把它写回这个文件，所以重启还是上一次做好的选择。
 
 ```
 mode=1920x1080      # 开机默认档
@@ -205,8 +205,8 @@ mode=1920x1080      # 开机默认档
 #dpi=256            # 开机默认 EDID DPI（改完 commit 会 hotplug，合成器会重读）
 ```
 
-- **1920x1080**：带黑边、避开摄像头挖孔，合成器负担最小，推荐
-- **真实分辨率**（比如 `2780x1264`）：铺满，挖孔会压在桌面上；卡就切回 1920
+- **1920x1080（通知中的黑边屏）**：带黑边、避开摄像头挖孔，合成器负担最小，推荐
+- **真实分辨率（通知中的全面屏）**（比如 `2780x1264`）：铺满，挖孔会压在桌面上；卡就切回 1920
 
 ---
 
@@ -225,11 +225,11 @@ mode=1920x1080      # 开机默认档
 
 | 按钮 | 作用 |
 |---|---|
-| `全面屏` / `黑边屏` | **一个按钮两个文本**：现在是什么档，就显示"切到另一档"。全面屏 = 真实横屏尺寸铺满；黑边屏 = 1920x1080 居中留黑边（避开摄像头挖孔）。切换会**保持当前横竖** |
+| `全面屏` / `黑边屏` | **一个按钮两个文本**：现在是什么档，就显示"切到另一档"。全面屏 = 真实横屏尺寸铺满；黑边屏 = 1920x1080 居中留黑边（避开摄像头挖孔） |
 | `切横竖` | 把当前档宽高对调（`1920x1080 ↔ 1080x1920`、`2780x1264 ↔ 1264x2780`） |
 | `命令` | 展开输入框，输入下面这些命令 |
 
-**命令**（输入框里的灰字就是"当前配置的可执行写法"，想改哪个数字挪过去改一下即可）
+**命令**（输入框里的灰字就是"当前配置的可执行写法"，想改哪个数字按照配置中填写前缀，参数改一下即可）
 
 | 命令 | 作用 | 实时 |
 |---|---|---|
@@ -242,8 +242,8 @@ mode=1920x1080      # 开机默认档
 > （合成器据此算出来的比例不等于 `dpi/128`，精调不了），`scale` 是合成器自己的
 > 比例，改完立刻生效 —— 所以通知里放的是 `scale`。
 
-**前提**：命令要 root（走 `su`），通知要通知权限；`scale` 还需要容器里 niri 在跑
-（它会自动找活着的 niri socket，重启过也不会连错）。
+**前提**：命令要 root（走 `su`），通知要通知权限；`scale` 还需要容器里 合成器 在跑
+（它会自动找活着的合成器socket，重启过也不会连错）。
 
 ---
 ## 声音
@@ -406,14 +406,14 @@ gradle assembleDebug
    实测只打印 `selected region`、不落文件，而截图（`grim`）正常 —— 想用就自己验一下，
    别默认能用
 
-## 注意
+## 注意（如果你的内核在支持的KMI中，但是疑似较大程度上不符合GKI标准，请重点阅读这里）
 
-- **先单独 `insmod` 验一遍。** 开了「完整硬件访问权限」之后，容器里新装或升级驱动
-  （Mesa、内核模块等）**可能导致一次软重启**。所以不要跳过模块自己的兼容性检验：
+- **先记一下你的/dev/input/event*下都有什么设备**，后面要用
+- **先单独 `insmod` 验一遍。** 不要跳过模块自己的兼容性检验：
   用自己 KMI 的那个 `.ko` 单独 `insmod`，不重启再继续往下装。
-- **设备排除。** Android 侧不用管：模块加载时会把虚拟键鼠的 `/dev/input/event*`
-  换成 0600 root 节点，系统 InputReader 打不开就看不见。容器侧只在**用 root 跑
-  合成器**时才需要那条 `LIBINPUT_IGNORE_DEVICE` 规则（见「配合成器」）。
+- **设备排除。**
+- 内核模块模块加载后自己把虚拟键鼠的 `/dev/input/event*`（相比于你加载内核模块之前多出来的那几个）换成 0600 root 节点，系统 InputReader 打不开就看不见。
+- 容器侧只在**用 root 跑合成器**时才需要那条 `LIBINPUT_IGNORE_DEVICE` 规则（见「配合成器」）。
 
 ## 鸣谢
 
