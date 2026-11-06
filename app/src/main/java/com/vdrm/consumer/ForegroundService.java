@@ -40,7 +40,7 @@ import java.util.concurrent.Executors;
  * 这一版刻意做小（先看形状，之后再砍）：
  *   - 只有一个 channel、一条通知，不分"状态/干活"两档；
  *   - 不轮询：只在启动、收到命令、以及 App 回到前台时刷新；
- *   - 命令只留 6 条；reload / niri 转发 / 日志抓取都没进来。
+ *   - 命令只留 3 条（input / refresh / commit）；scale / reload / 日志抓取都没进来。
  */
 public class ForegroundService extends Service {
 
@@ -58,8 +58,6 @@ public class ForegroundService extends Service {
     private static final String KEY_CMD = "cmd";
 
     private static final String MODDIR = "/data/adb/modules/vdrm-lkm";
-    /* droidspaces 的路径。容器名不写死：compRun() 会遍历正在运行的那些。*/
-    private static final String DS = "/data/local/Droidspaces/bin/droidspaces";
     private static final String P = "/sys/module/vdrm/parameters";
 
     /** su 一律串行跑：并发 exec 三条 su 会把输入法/系统 su 服务搞到超时 */
@@ -73,8 +71,6 @@ public class ForegroundService extends Service {
      * nMode 来自每次 refresh，两个预置来自 `wm size`，开机算一次就够。*/
     private volatile String nMode = "";
     private volatile String nRefresh = "";     /* 当前刷新率，输入框提示用 */
-    private volatile String nScale   = "";     /* 当前合成器 scale，输入框提示用 */
-    private static final String PREF_SCALE = "niri_scale";   /* 读不到时用它当默认值 */
     private volatile String nFull = "";        /* 全面屏那一档（真实横屏尺寸） */
 
     private volatile boolean refreshing;
@@ -226,7 +222,7 @@ public class ForegroundService extends Service {
      * 放的是**当前配置本身**，而且是可直接执行的写法 —— 想改哪个数字，
      * 照着把光标挪过去改一下就行，不用记格式：
      *
-     *     input 1 · refresh 120 · scale 2.0
+     *     input 1 · refresh 120
      *
      * 所以它既是状态，又是模板。以前这里写的是 `input 0|1 · refresh 90 …`
      * 那种"格式说明"，每台机器都一样、没有信息量。
@@ -239,12 +235,6 @@ public class ForegroundService extends Service {
 
         if (!nRefresh.isEmpty())
             sb.append(" · refresh ").append(nRefresh);
-        /* scale 必须带数字：合成器没跑（或不是 niri）时读不到当前值，就退到
-         * 上次成功设过的值，再不行给 1 —— 提示行永远是"能直接照着改"的模板，
-         * 不能只剩一个光秃秃的 scale。*/
-        sb.append(" · scale ").append(!nScale.isEmpty() ? nScale
-                : getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
-                        .getString(PREF_SCALE, "1"));
 
         return new RemoteInput.Builder(KEY_CMD).setLabel(sb.toString()).build();
     }
@@ -308,9 +298,6 @@ public class ForegroundService extends Service {
                         nTitle = m + "@" + r;
                         if (nText.isEmpty() || nText.startsWith("正在"))
                             nText = "就绪";
-                        /* 输入框提示要"当前值 + 可直接照着改"，所以 scale 也得读
-                         * 一次（只在刷新时读，不是每帧）。*/
-                        nScale = readScale();
                     }
                 }
             } finally {
@@ -504,19 +491,23 @@ public class ForegroundService extends Service {
      *
      *   input 0|1     0 = 鼠标（触控板相对位移），1 = 触控屏（直接触摸）
      *   refresh N     24..240，写参数 + commit（实时生效）
-     *   scale N       0.5..3.0，改合成器的 scale（实时生效 —— 这才是"UI 变大变小"）
      *   commit        只广播（改完参数不想重建池时用）
+     *
+     * 为什么没有 scale：缩放是**合成器**的事（wl_output.scale、字体/光标尺寸、
+     * XWayland 缩放都跟着它走），DRM 设备表达不了，跨合成器也没有统一接口。
+     * 让用户在自己的合成器配置里写一次即可（README 有每家的写法）；这里硬拉
+     * 只能按合成器写 N 套适配，而且重采样还不如原生清晰。
      *
      * 为什么不放 dpi：`edid_dpi` 只改 EDID 里报的物理尺寸，合成器据此给出来的
      * 比例并不等于 dpi/128（实测 0→2.25、256→2.0、384→2.25），拿来精调 UI 不
-     * 靠谱；要变大变小直接用 scale。它留在 mode.conf 的 `dpi=` 里，不进通知。
+     * 靠谱。它留在 mode.conf 的 `dpi=` 里，不进通知。
      *
      * 分辨率不进这里：日常只有"黑边/全面屏"两档，做成按钮了。任意 WxH 现在
      * 内核侧也支持（第 48 项），但没有场景，留着只会让人以为这是主要入口。
      */
     private void runCommand(String cmd) {
         if (cmd.isEmpty()) {
-            nText = "空命令：input 0|1 / refresh 90 / scale 1.5";
+            nText = "空命令：input 0|1 / refresh 90 / commit";
             post();
             return;
         }
@@ -531,9 +522,6 @@ public class ForegroundService extends Service {
                 break;
             case "input":
                 res = setInput(arg);
-                break;
-            case "scale":
-                res = setScale(arg);
                 break;
             case "commit":
                 res = commit() ? "commit ✔" : "commit 失败";
@@ -598,134 +586,6 @@ public class ForegroundService extends Service {
         Native.nativeSendTouch(0, new int[0], new float[0],
                                new float[0], new float[0]);
         return mode == MainActivity.INPUT_TOUCH ? "input 触控屏 ✔" : "input 鼠标 ✔";
-    }
-
-    /* ==================== 合成器 scale ==================== */
-
-    /* 下面两段脚本都是"自己找活着的合成器"：niri → sway → Hyprland，谁在就用谁。
-     * 约定：
-     *   - 里面一律用双引号，因为外层要整段塞进 `bash -lc '...'`；
-     *   - 找到并成功 → 打印 ok（写）/ 打印数字（读）；都没找到 → 打印 no-supported-compositor。
-     * 容器名也不写死：外层的 compRun() 会挨个试正在运行的容器。*/
-
-    private static final String SH_RT = "RT=\"${XDG_RUNTIME_DIR:-/tmp/xdg}\"; ";
-
-    private static String shSetScale(String v) {
-        return SH_RT
-            + "for S in $(ls -t \"$RT\"/niri.wayland-*.sock 2>/dev/null); do "
-            +   "NIRI_SOCKET=\"$S\" niri msg version >/dev/null 2>&1 || continue; "
-            +   "O=$(NIRI_SOCKET=\"$S\" niri msg outputs 2>/dev/null | head -1 "
-            +       "| sed -n \"s/.*(\\(.*\\)).*/\\1/p\"); "
-            +   "[ -n \"$O\" ] || continue; "
-            +   "NIRI_SOCKET=\"$S\" niri msg output \"$O\" scale " + v + " >/dev/null 2>&1 "
-            +     "&& { echo ok; exit 0; }; "
-            + "done; "
-            + "for S in $(ls -t \"$RT\"/sway-ipc.*.sock 2>/dev/null); do "
-            +   "SWAYSOCK=\"$S\" swaymsg -t get_version >/dev/null 2>&1 || continue; "
-            +   "O=$(SWAYSOCK=\"$S\" swaymsg -t get_outputs 2>/dev/null "
-            +       "| sed -n \"s/^Output \\([^ ]*\\).*/\\1/p\" | head -1); "
-            +   "[ -n \"$O\" ] || continue; "
-            +   "SWAYSOCK=\"$S\" swaymsg output \"$O\" scale " + v + " >/dev/null 2>&1 "
-            +     "&& { echo ok; exit 0; }; "
-            + "done; "
-            + "for D in \"$RT\"/hypr/*/; do "
-            +   "[ -d \"$D\" ] || continue; "
-            +   "sig=$(basename \"$D\"); "
-            +   "HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl monitors >/dev/null 2>&1 || continue; "
-            +   "O=$(HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl -j monitors 2>/dev/null "
-            +       "| sed -n \"s/.*\\\"name\\\": *\\\"\\([^\\\" ]*\\)\\\".*/\\1/p\" | head -1); "
-            +   "[ -n \"$O\" ] || continue; "
-            +   "HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl keyword monitor "
-            +     "\"$O,preferred,auto," + v + "\" >/dev/null 2>&1 "
-            +     "&& { echo ok; exit 0; }; "
-            + "done; "
-            + "echo no-supported-compositor";
-    }
-
-    private static final String SH_READ_SCALE = SH_RT
-        + "for S in $(ls -t \"$RT\"/niri.wayland-*.sock 2>/dev/null); do "
-        +   "NIRI_SOCKET=\"$S\" niri msg version >/dev/null 2>&1 || continue; "
-        +   "r=$(NIRI_SOCKET=\"$S\" niri msg outputs 2>/dev/null "
-        +       "| sed -n \"s/.*Scale: *//p\" | head -1); "
-        +   "[ -n \"$r\" ] && { echo \"$r\"; exit 0; }; "
-        + "done; "
-        + "for S in $(ls -t \"$RT\"/sway-ipc.*.sock 2>/dev/null); do "
-        +   "SWAYSOCK=\"$S\" swaymsg -t get_version >/dev/null 2>&1 || continue; "
-        +   "r=$(SWAYSOCK=\"$S\" swaymsg -t get_outputs 2>/dev/null "
-        +       "| sed -n \"s/.*\\\"scale\\\": *\\\"\\([0-9.]*\\)\\\".*/\\1/p\" | head -1); "
-        +   "[ -n \"$r\" ] && { echo \"$r\"; exit 0; }; "
-        + "done; "
-        + "for D in \"$RT\"/hypr/*/; do "
-        +   "[ -d \"$D\" ] || continue; "
-        +   "sig=$(basename \"$D\"); "
-        +   "HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl monitors >/dev/null 2>&1 || continue; "
-        +   "r=$(HYPRLAND_INSTANCE_SIGNATURE=\"$sig\" hyprctl -j monitors 2>/dev/null "
-        +       "| sed -n \"s/.*\\\"scale\\\": *\\([0-9.]*\\).*/\\1/p\" | head -1); "
-        +   "[ -n \"$r\" ] && { echo \"$r\"; exit 0; }; "
-        + "done; "
-        + "echo no-supported-compositor";
-
-    /**
-     * 在"正在运行的容器"里跑一段脚本：容器名不写死。
-     *
-     * 做法是遍历 `/data/local/Droidspaces/Containers/` 下的名字，`run -- true`
-     * 探活（没跑的容器会直接失败），再在里面跑 inner。合成器脚本找不到就返回
-     * `no-supported-compositor`，那就换下一个容器试。
-     */
-    private String compRun(String inner) {
-        String cmd = "for C in $(ls /data/local/Droidspaces/Containers 2>/dev/null); do "
-                + DS + " -n \"$C\" run -- true >/dev/null 2>&1 || continue; "
-                + "OUT=$(" + DS + " -n \"$C\" run -- bash -lc '" + inner + "' 2>/dev/null); "
-                + "[ \"$OUT\" = no-supported-compositor ] && continue; "
-                + "echo \"$OUT\"; exit 0; "
-                + "done; "
-                + "echo no-supported-compositor";
-        return sh(cmd);
-    }
-
-    /**
-     * UI 缩放：改的是**合成器**的 scale，不是 EDID 的 dpi。
-     *
-     * `edid_dpi` 只影响 EDID 里的物理尺寸（commit 后合成器会重读，但换算出来的
-     * 比例并不等于 dpi/128，不能精调 UI）。真正能直接改大小的是合成器自己的 IPC：
-     *   niri  `niri msg output <name> scale N`
-     *   sway  `swaymsg output <name> scale N`
-     *   hypr  `hyprctl keyword monitor <name>,preferred,auto,N`
-     * 输出名都从各自的状态里取，不写死。niri 实测；sway / Hyprland 是同样的思路，
-     * 在容器里没跑通 IPC（`swaymsg`/`hyprctl` 超时），失败会明确报出来。
-     */
-    private String setScale(String arg) {
-        double d;
-
-        try {
-            d = Double.parseDouble(arg);
-        } catch (Exception e) {
-            return "scale 要数字，例如 1.5";
-        }
-        if (d < 0.5 || d > 3.0)
-            return "scale 范围 0.5..3.0";
-
-        String r = compRun(shSetScale(arg));
-
-        if ("ok".equals(r)) {
-            nScale = arg;
-            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                    .putString(PREF_SCALE, arg).apply();
-            return "scale " + arg + " ✔";
-        }
-        return "scale 失败: " + ("no-supported-compositor".equals(r)
-                ? "容器里没找到活着的 niri / sway / Hyprland" : r);
-    }
-
-    /** 读当前 scale（"2.25" 这种）；读不到返回空串 */
-    private String readScale() {
-        String r = compRun(SH_READ_SCALE).trim();
-        /* 只接受纯数字，别把报错文本塞进提示行 */
-        if (!r.matches("[0-9]+(\\.[0-9]+)?"))
-            return "";
-        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                .putString(PREF_SCALE, r).apply();
-        return r;
     }
 
     /**

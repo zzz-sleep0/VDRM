@@ -241,8 +241,23 @@ echo 1   > /sys/module/vdrm/parameters/commit     # 一次性广播（EDID + hot
 （niri 实测：物理尺寸当场就变，不用重启合成器）。但**字大不大由合成器自己的 scale
 决定**，niri 会按物理尺寸给一个初始比例、数值不严格等于 `dpi/128`（实测
 `0`→160x90mm/scale 2.25、`256`→190x100mm/2.0、`384`→120x70mm/2.25），所以拿它精调
-缩放不靠谱 —— 要"字变大变小"用通知里的 `scale 1.5`，那条直接下给合成器。开机种子
+缩放不靠谱 —— 要"字变大变小"请直接配合成器自己的 scale（见下）。开机种子
 写在 `mode.conf` 的 `refresh=` / `dpi=`。
+
+### UI 缩放：合成器自己的事，VDRM 不碰
+
+缩放不是显示设备能表达的东西（`wl_output.scale`、字体/光标尺寸、XWayland 缩放
+都由合成器决定，我们硬做只能重采样）。在合成器配置里写一次就行：
+
+| 合成器 | 写法 |
+|---|---|
+| **niri** | `output "Virtual-3" { scale 1.5 }`（改完 `niri msg action reload-config`，或直接 `niri msg output Virtual-3 scale 1.5`） |
+| **sway** | `output Virtual-3 scale 1.5`（`swaymsg reload`，或 `swaymsg output Virtual-3 scale 1.5`） |
+| **Hyprland** | `monitor=Virtual-3,preferred,auto,1.5`（`hyprctl reload`） |
+| **KWin** | 系统设置 → 显示和监视器 → 缩放，或 `kscreen-doctor` |
+
+> 想要"UI 整体大一点/小一点"还有一条 VDRM 原生的路：换档（1920 黑边屏 ↔ 真实
+> 分辨率）。它改的是**硬件事实**（分辨率），所有合成器一致，代价是清晰度/性能。
 
 `GET_INFO.flags` 是**能力位图**（ABI 2）：想知道当前这份 `.ko` 支不支持某个
 运行时参数，看它有没有对应的位，别比版本号。App 日志里那行
@@ -289,15 +304,13 @@ mode=1920x1080      # 开机默认档
 |---|---|---|
 | `input 0` / `input 1` | 手机触摸当**鼠标**（相对位移，触控板手感）/ 当**触控屏**（按哪点哪） | 下一次触摸 |
 | `refresh 90` | 刷新率（24..240） | ✅ |
-| `scale 1.5` | UI 缩放 —— **真正让字变大的那个**，走合成器自己的 IPC（niri `msg output … scale` / sway `output … scale` / hypr `keyword monitor`），容器名和输出名都自动找 | ✅ |
 | `commit` | 只广播参数（极少用） | — |
 
-> `scale` 和 `mode.conf` 里的 `dpi=` 是两件事：`dpi` 只改 EDID 里报的物理尺寸
-> （合成器据此算出来的比例不等于 `dpi/128`，精调不了），`scale` 是合成器自己的
-> 比例，改完立刻生效 —— 所以通知里放的是 `scale`。
+> `scale` 不在通知里：它是合成器的属性，放在你自己合成器的配置里（见「UI 缩放」）。
+> `mode.conf` 里的 `dpi=` 只改 EDID 里报的物理尺寸，合成器据此算出来的比例不等于
+> `dpi/128`，精调不了，所以也不进通知。
 
-**前提**：命令要 root（走 `su`），通知要通知权限；`scale` 还需要容器里 合成器 在跑
-（它会自动找活着的合成器socket，重启过也不会连错）。
+**前提**：命令要 root（走 `su`），通知要通知权限。
 
 ---
 ## 声音

@@ -2461,3 +2461,28 @@ libinput list-devices:
 ```
 
 服务 `active`、退出码 0；同一时刻宿主 `/dev/input` 仍是 13 个节点（没被碰）。
+
+---
+
+## 本版本第四十九项：把 scale 从通知里拿掉（缩放归合成器）
+
+`scale` 是 App 里唯一一处"按合成器写 N 套适配"的功能，属于方向不对：
+
+- `wl_output.scale` 是**合成器**的状态，还牵着字体、光标主题、XWayland 缩放；
+- DRM 里没有任何字段能表达"这块屏按 1.5× 排"，跨合成器也没有统一协议
+  （wlr-output-management 只有 wlroots 系认，KWin 不认）；
+- App 硬拉只能逐家实现 IPC，而且我们做的是重采样，比合成器原生缩放更糊。
+
+所以直接删掉：命令白名单回到 `input` / `refresh` / `commit` 三条，输入框灰字变成
+`input 1 · refresh 120`，`setScale`/`readScale`/`compRun` 与那两段合成器脚本一并删除。
+README 里新增「UI 缩放：合成器自己的事」，给出每家的写法：
+
+| 合成器 | 写法 |
+|---|---|
+| niri | `output "Virtual-3" { scale 1.5 }` / `niri msg output Virtual-3 scale 1.5` |
+| sway | `output Virtual-3 scale 1.5` / `swaymsg output Virtual-3 scale 1.5` |
+| Hyprland | `monitor=Virtual-3,preferred,auto,1.5` / `hyprctl reload` |
+| KWin | 系统设置 → 显示和监视器 → 缩放，或 `kscreen-doctor` |
+
+想要"整体 UI 大小"的另一条路（VDRM 原生、所有合成器一致）是换档：黑边屏 1920×1080
+↔ 真实分辨率 —— 改的是硬件事实（分辨率），代价是清晰度/性能。

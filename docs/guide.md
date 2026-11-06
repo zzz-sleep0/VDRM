@@ -55,23 +55,25 @@
 输入框里的灰字就是**当前配置的可执行写法**，想改哪个数字挪过去改一下即可：
 
 ```
-input 1 · refresh 120 · scale 2.25
+input 1 · refresh 120
 ```
 
 | 命令 | 背后做什么 | 生效时机 |
 |---|---|---|
 | `input 0` / `input 1` | 手机触摸注入到哪个虚拟设备：`vdrm-ptr`（REL 相对位移，触控板手感）/ `vdrm-touch`（ABS_MT 绝对坐标，按哪点哪） | 下一次触摸 |
 | `refresh 90` | 写 `refresh` 参数 + `commit`（重算 EDID + hotplug） | 立刻 |
-| `scale 1.5` | 容器里按合成器走自己的 IPC：niri `msg output <名> scale` / sway `swaymsg output <名> scale` / hypr `hyprctl keyword monitor`（容器名、输出名都自动找） | 立刻 |
 | `commit` | 只广播参数，不重建池 | 立刻 |
 
 两个容易混的东西：
 
-- `scale` 是**合成器的比例**（真正让字变大变小）；`mode.conf` 里的 `dpi=` 只改
-  EDID 里的物理尺寸。实测（niri 26.04）：`edid_dpi` + `commit` 之后**当场**就换成新
-  的物理尺寸，不需要重启合成器；但合成器据此给的比例并不严格是 `dpi/128`
-  （`0`→160x90mm/2.25、`256`→190x100mm/2.0、`384`→120x70mm/2.25），拿它精调缩放
-  不靠谱 —— 这也是通知里放 `scale` 而不是 `dpi` 的原因。
+- **缩放不在通知里**：`wl_output.scale` 是合成器自己的状态（还牵着字体、光标、
+  XWayland 缩放），设备侧表示不了。在合成器配置里写一次：niri `output "Virtual-3" { scale 1.5 }`、
+  sway `output Virtual-3 scale 1.5`、Hyprland `monitor=Virtual-3,preferred,auto,1.5`、
+  KWin 用系统设置/`kscreen-doctor`。
+- `mode.conf` 里的 `dpi=` 只改 EDID 里的物理尺寸。实测（niri 26.04）：`edid_dpi` +
+  `commit` 之后**当场**就换成新的物理尺寸，不需要重启合成器；但它推出来的比例并不
+  严格是 `dpi/128`（`0`→160x90mm/2.25、`256`→190x100mm/2.0、`384`→120x70mm/2.25），
+  拿来精调缩放不靠谱。
 - `input 0` 之后光标是相对的（手指拖动 → 指针走）；`input 1` 是绝对的（点哪就是哪）。
   切的时候会先把所有触点抬起，不会留一个"按住"。
 
