@@ -336,4 +336,10 @@ udevadm trigger … → Failed to write 'change' to '…/uevent': Read-only file
 | 音频 | `pcmC0D0p` 能被普通用户打开（服务把 vdrm 那张卡的节点改成 root:audio 0660） |
 | 容器重启 | 服务开机自动生效，`/dev/input` 里只有 vdrm 三个设备 |
 
-坑：模块重新加载后 `eventN` 会变，需要 `systemctl restart vdrm-input`。
+**坑一（很要命）**：容器里的 `/dev/input`、`/dev/snd` 是宿主机目录的 bind mount，
+里面是同一批 inode —— 在容器里 `rm` 一个节点，宿主机上就真的没了。第一版脚本就因为
+"以为已经挂了 tmpfs 其实没挂"删掉了宿主机 `/dev/input/event*`，Android 当场没有
+触摸和按键，只能强制重启。现在的脚本：先用**自己的 fsname** 挂 tmpfs、挂完再确认一次，
+任何一步不对就退出，绝不碰下面的宿主机节点。写自己的容器脚本时请照这个顺序。
+
+**坑二**：模块重新加载后 `eventN` 会变，需要 `systemctl restart vdrm-input`。
