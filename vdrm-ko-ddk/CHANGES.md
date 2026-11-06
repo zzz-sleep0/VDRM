@@ -2398,3 +2398,30 @@ mknod 的 `crw------- root root`（0600）—— 普通用户打不开，udev �
 
 > 注意：模块重新加载后 `eventN` 编号会变，要 `systemctl restart vdrm-input`；
 > 这一步目前得手工，除非再写个监听模块加载的 timer。
+
+---
+
+## 本版本第四十七项：容器侧脚本的事故与修正（**千万别在容器里动 /dev/input**）
+
+第四十六项那套容器方案第一版写错了，代价是真机事故：
+
+- 容器里的 `/dev/input`、`/dev/snd` 是宿主机目录的 **bind mount**，里面是**同一批 inode**；
+- 第一版脚本以为"先 `mount tmpfs` 再删"是幂等的，但判断写成了
+  `grep -q ' /dev/input ' /proc/mounts` —— bind mount 本身就满足这个条件，于是 **tmpfs
+  根本没挂**，接下来的 `rm -f /dev/input/event*` 删的是**宿主机**的节点；
+- 结果：Android 的 InputReader 一个输入设备都看不到，触摸/按键全废，只能强制重启恢复。
+
+修正版（现在的 `tools/vdrm-container-setup.sh`）：
+
+1. 用 `mount --make-rprivate /dev` 兜底（实测容器里在 `/dev` 下挂东西本来也不会回流到
+   宿主机，这道只是保险）；
+2. 用**我们自己的 fsname**（`vdrm-input` / `vdrm-snd`）判断是否已经挂上，**挂完再确认一次**；
+   两次判断任何一次失败就 `exit 1`，绝不往下走；
+3. 之后所有 `rm` / `mknod` / `chown` / `chmod` 都只发生在 tmpfs 里。
+
+实测（容器重启后）：服务 `active`、退出码 0；容器里 `/dev/input` 只有
+`event7/8/9` + 三个名字软链，`/dev/snd` 只有 `controlC0 / pcmC0D0p / pcmC0D1c / timer`；
+同一时刻**宿主机 `/dev/input` 仍是 13 个节点、权限 `crw-rw---- root input` 不变**；
+niri 照常出图、`grim` 1920x1080、普通用户能开 `pcmC0D0p`。
+
+教训写进 README 的警告框：容器里的 `/dev/*` 如果是 bind mount，**在容器里删节点 = 在宿主机删节点**。
