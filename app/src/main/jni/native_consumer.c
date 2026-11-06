@@ -58,6 +58,8 @@
 #include "vdrm_audio.h"
 
 #include <android/hardware_buffer.h>
+#include <android/choreographer.h>
+#include <android/looper.h>
 #include <android/surface_control.h>
 
 /* A/B：把 KPM 池里的东西变回 AHB（见 ahb_forge.c）*/
@@ -1518,10 +1520,99 @@ static int forge_pool(struct consumer *c)
 
 /* ======================== render loop ======================== */
 
+/* ==================== vsync tick（对齐 anland） ====================
+ *
+ * anland 的做法是「一 vsync 一 latch」：节拍来自 Android 的 AChoreographer，
+ * 客户端每拍最多提交一帧。我们原来只靠 in-flight 计数兜着，合成器推得比 SF
+ * 消费快时就会反复覆写还在扫描输出的槽（frames_reuse 高、面板闪）。
+ *
+ * 这里起一个独立线程：prepare 自己的 ALooper → AChoreographer 每拍回调 →
+ * 记 seq、写 eventfd 叫醒渲染循环。渲染循环只在 seq 前进时才允许提交；
+ * 100ms 没有新拍（或 tick 通道不可用）就放行，避免把合成器饿死。
+ */
+static int              g_tick_fd = -1;
+static volatile int     g_tick_on;
+static volatile int     g_tick_seq;
+static volatile uint64_t g_tick_ms;
+static int              g_tick_used;
+static AChoreographer  *g_choreo;
+static ALooper         *g_tick_looper;
+static pthread_t        g_tick_tid;
+static int              g_tick_started;
+static unsigned long long g_tick_defer;
+
+static void tick_cb(int64_t frame_time_ns, void *data)
+{
+    (void)frame_time_ns;
+    (void)data;
+    __atomic_add_fetch(&g_tick_seq, 1, __ATOMIC_RELAXED);
+    g_tick_ms = now_ms();
+    if (g_tick_fd >= 0) {
+        uint64_t one = 1;
+        ssize_t r = write(g_tick_fd, &one, sizeof(one));
+        (void)r;
+    }
+    if (g_tick_on && g_choreo)
+        AChoreographer_postFrameCallback(g_choreo, tick_cb, NULL);
+}
+
+static void *tick_thread(void *arg)
+{
+    (void)arg;
+    g_tick_looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+    if (!g_tick_looper) {
+        LOGE("tick: ALooper_prepare failed");
+        return NULL;
+    }
+    g_choreo = AChoreographer_getInstance();
+    if (!g_choreo) {
+        LOGE("tick: AChoreographer unavailable");
+        return NULL;
+    }
+    AChoreographer_postFrameCallback(g_choreo, tick_cb, NULL);
+    while (g_tick_on)
+        ALooper_pollOnce(-1, NULL, NULL, NULL);
+    return NULL;
+}
+
+static void tick_start(void)
+{
+    if (g_tick_started)
+        return;
+    g_tick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_tick_fd < 0) {
+        LOGE("tick: eventfd failed err=%d", errno);
+        return;
+    }
+    g_tick_on = 1;
+    if (pthread_create(&g_tick_tid, NULL, tick_thread, NULL) != 0) {
+        LOGE("tick: pthread_create failed");
+        g_tick_on = 0;
+        close(g_tick_fd);
+        g_tick_fd = -1;
+        return;
+    }
+    g_tick_started = 1;
+    LOGI("tick: vsync gating on (one latch per tick)");
+}
+
+static void tick_stop(void)
+{
+    g_tick_on = 0;
+    if (g_tick_looper)
+        ALooper_wake(g_tick_looper);
+    if (g_tick_fd >= 0) {
+        uint64_t one = 1;
+        ssize_t r = write(g_tick_fd, &one, sizeof(one));
+        (void)r;
+    }
+}
+
 static void *render_loop(void *arg)
 {
     struct consumer *c = arg;
     LOGI("render loop started");
+    tick_start();
     int loop_count = 0;
     uint64_t stat_ev = 0, stat_show = 0;
     uint32_t prev_show_seq = 0;
@@ -1565,18 +1656,23 @@ static void *render_loop(void *arg)
 
         /* 等 KPM 的帧事件：直接 poll/read /dev/vdrm 自带的队列。
          * （不再依赖 KPM 写 App 的 memfd——那条路内核侧 VFS 会 EACCES。）*/
-    struct pollfd pfds[4] = {
+    struct pollfd pfds[5] = {
         { .fd = g_vdrm_fd, .events = POLLIN },
         { .fd = c->stop_fd, .events = POLLIN },
         { .fd = g_release_wake_fd, .events = POLLIN },
-        { .fd = c->event_fd, .events = POLLIN }
+        { .fd = c->event_fd, .events = POLLIN },
+        { .fd = g_tick_fd, .events = POLLIN }
     };
-    /* 500ms 超时只是兜底；正常由帧事件或内核 mode eventfd 唤醒 */
-    int pr = poll(pfds, 4, 500);
+    /* 500ms 超时只是兜底；正常由帧事件 / mode eventfd / vsync tick 唤醒 */
+    int pr = poll(pfds, 5, 500);
         if (!c->running || pfds[1].revents) break;
         if (pfds[2].revents) {
             uint64_t wake;
             while (read(g_release_wake_fd, &wake, sizeof(wake)) > 0) {}
+        }
+        if (pfds[4].revents) {
+            uint64_t tk;
+            while (read(g_tick_fd, &tk, sizeof(tk)) > 0) {}
         }
         if (pfds[3].revents) {
             uint64_t ev;
@@ -1636,6 +1732,19 @@ static void *render_loop(void *arg)
             stat_ev++;
         }
         if (!have_pending) continue;
+
+        /* anland 对齐：一 vsync 一 latch。
+         * 没有新的 Choreographer 拍就把 pending 留着（poll 会被 tick_fd 叫醒），
+         * 超过 100ms 没拍就放行兜底；tick 通道起不来时完全不拦。*/
+        if (g_tick_started && g_tick_on) {
+            int tk = __atomic_load_n(&g_tick_seq, __ATOMIC_RELAXED);
+
+            if (tk == g_tick_used && now_ms() - g_tick_ms < 100) {
+                g_tick_defer++;
+                continue;
+            }
+            g_tick_used = tk;
+        }
 
         /* in-flight 上限。之前写死 3：宿主 120Hz、合成器推 118 帧时，App 会
          * 被这个上限卡在 ~80 帧，贴帧间隔不均匀（慢速动画上就是"一顿一顿"）。
@@ -1747,6 +1856,8 @@ static void *render_loop(void *arg)
     }
 
     /* 停止时把还没处理的 pending 还掉（否则那个槽要等 App 进程退出才回来）。*/
+    tick_stop();
+
     if (have_pending) {
         return_unsubmitted(pending.id);
         have_pending = false;
