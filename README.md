@@ -490,6 +490,11 @@ gradle assembleDebug
   用自己 KMI 的那个 `.ko` 单独 `insmod`，不重启再继续往下装。
 - **设备排除。**
 - 内核模块模块加载后自己把虚拟键鼠的 `/dev/input/event*`（相比于你加载内核模块之前多出来的那几个）换成 0600 root 节点，系统 InputReader 打不开就看不见。
+
+- ```
+  chown root:root /dev/input/event*
+  chmod 0600 /dev/input/event*
+  ```
 - 容器侧不用再单独排除：按「配容器」装好那个 systemd 服务后，容器里只有 vdrm 三个虚拟设备，
   手机真实的触摸/电源键/指纹看不见（root 跑合成器也一样）。
 
