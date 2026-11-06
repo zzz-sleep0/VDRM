@@ -38,6 +38,19 @@ for pair in "vdrm-input input" "vdrm-snd snd"; do
 done
 
 # ---- 输入：只放 vdrm 三个虚拟设备 ----
+#
+# 光有 /dev 节点还不够：libinput 走 libudev 枚举，没有 ID_INPUT* 属性它会直接跳过
+# 这个设备（表现为"合成器起来了但完全没输入"）。不开「完整硬件访问」时 /sys 是只读的，
+# udevadm trigger 跑不了，所以这里手写 /run/udev/data 条目 —— 就是 udev 自己会写的那份。
+udev_tag() {   # $1=名字  → 返回 "ID_INPUT=1 ID_INPUT_XXX=1 ..."
+    case "$1" in
+        vdrm-kbd)   echo "ID_INPUT=1 ID_INPUT_KEY=1 ID_INPUT_KEYBOARD=1" ;;
+        vdrm-ptr)   echo "ID_INPUT=1 ID_INPUT_MOUSE=1" ;;
+        vdrm-touch) echo "ID_INPUT=1 ID_INPUT_TOUCHSCREEN=1" ;;
+        *)          echo "ID_INPUT=1" ;;
+    esac
+}
+mkdir -p /run/udev/data
 n=0
 for p in /sys/class/input/event*/device/name; do
     [ -e "$p" ] || continue
@@ -46,10 +59,14 @@ for p in /sys/class/input/event*/device/name; do
     ev=$(basename "$(dirname "$(dirname "$p")")")
     d=$(cat "/sys/class/input/$ev/dev" 2>/dev/null) || continue
     [ -n "$d" ] || continue
-    mknod "/dev/input/$ev" c "${d%%:*}" "${d##*:}" 2>/dev/null || continue
+    [ -c "/dev/input/$ev" ] || mknod "/dev/input/$ev" c "${d%%:*}" "${d##*:}" 2>/dev/null || continue
     chown root:input "/dev/input/$ev" 2>/dev/null || true
     chmod 660 "/dev/input/$ev"
     ln -sf "$ev" "/dev/input/$name"
+    {
+        echo "I:$(date +%s)000000"
+        for kv in $(udev_tag "$name"); do echo "E:$kv"; done
+    } > "/run/udev/data/c$d"
     n=$((n + 1))
 done
 
@@ -62,7 +79,7 @@ if [ -n "$card" ]; then
         nm=$(basename "$s")
         d=$(cat "$s/dev" 2>/dev/null) || continue
         [ -n "$d" ] || continue
-        mknod "/dev/snd/$nm" c "${d%%:*}" "${d##*:}" 2>/dev/null || continue
+        [ -c "/dev/snd/$nm" ] || mknod "/dev/snd/$nm" c "${d%%:*}" "${d##*:}" 2>/dev/null || continue
         chown root:audio "/dev/snd/$nm" 2>/dev/null || true
         chmod 660 "/dev/snd/$nm"
         m=$((m + 1))

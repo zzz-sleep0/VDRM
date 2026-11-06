@@ -103,9 +103,16 @@ EOF
 systemctl enable --now vdrm-input
 ```
 
-它做两件事：把 `/dev/input`、`/dev/snd` 换成只含 vdrm 设备的 tmpfs
-（`root:input` / `root:audio`，`0660`）。这样手机真实的触摸/电源键/指纹
-**根本不会出现在容器里**，root 也不用再靠 udev 规则排除。
+它做三件事：
+
+1. 把 `/dev/input`、`/dev/snd` 换成只含 vdrm 设备的 tmpfs
+   （`root:input` / `root:audio`，`0660`）——手机真实的触摸/电源键/指纹**根本不会出现
+   在容器里**，root 也不用再靠 udev 规则排除；
+2. 给这三台设备写 `/run/udev/data/c13:*` 条目（`ID_INPUT` / `ID_INPUT_MOUSE` /
+   `ID_INPUT_TOUCHSCREEN` / `ID_INPUT_KEYBOARD`）——**这一步不能省**：libinput 走
+   libudev 枚举，没有这些属性它会直接跳过设备，表现是"合成器起来了、画面也正常，
+   但完全没输入"；不开硬件访问时 `/sys` 只读、`udevadm trigger` 跑不了，所以只能自己写；
+3. 顺带把 vdrm 那张声卡的 `/dev/snd` 节点也建好。
 
 > ⚠️ **不要手动在容器里 `rm` / `chmod` `/dev/input`、`/dev/snd`**：这两个目录是宿主机
 > 目录的 bind mount，里面是**同一批 inode** —— 在容器里删一个节点，宿主机上就真的没了。
@@ -113,8 +120,10 @@ systemctl enable --now vdrm-input
 > 脚本的正确顺序是**先用 tmpfs 把目录顶掉、确认挂上了**，再在 tmpfs 里 mknod；
 > 挂不上就直接退出，不去动下面的宿主机节点。
 
-**实测**（Arch 容器、Mesa 27、`/sys` 只读）：niri / KWin 照常出图、`grim` 截图正常、
-普通用户能读到虚拟鼠标事件（注入 8 个事件后 `dd` 读到 192 字节）、
+**实测**（Arch 容器、Mesa 27、`/sys` 只读、容器重启后全自动）：
+`libinput list-devices` 列出 `vdrm-kbd`(keyboard) / `vdrm-ptr`(pointer) /
+`vdrm-touch`(touch)；niri / KWin 照常出图、`grim` 截图正常；
+普通用户能读到虚拟鼠标事件（注入 8 个事件后 `dd` 读到 192 字节）；
 `plughw:vdrm,0` 能打开。
 
 > 模块重新加载后 `eventN` 编号会变，记得 `systemctl restart vdrm-input`。

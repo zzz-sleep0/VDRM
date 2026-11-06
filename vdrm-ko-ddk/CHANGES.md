@@ -2425,3 +2425,39 @@ mknod 的 `crw------- root root`（0600）—— 普通用户打不开，udev �
 niri 照常出图、`grim` 1920x1080、普通用户能开 `pcmC0D0p`。
 
 教训写进 README 的警告框：容器里的 `/dev/*` 如果是 bind mount，**在容器里删节点 = 在宿主机删节点**。
+
+---
+
+## 本版本第四十八项：不开硬件访问时，光有 /dev 节点还不够 —— 要补 udev 数据库
+
+第四十六项那套方案里漏了一环：只把 `/dev/input/eventN` 建出来，`libinput` 还是看不见。
+
+原因：libinput 走 libudev 枚举，会跳过没有 `ID_INPUT` 属性的设备。不开硬件访问时
+`/sys` 只读、`udevadm trigger` 无法执行（`Failed to write 'change' to '…/uevent':
+Read-only file system`），所以 `/run/udev/data/c13:*` 一个条目都没有 —— 表现就是
+**合成器起得来、画面正常，但完全没有输入**。
+
+补法（已进 `tools/vdrm-container-setup.sh`）：建节点的时候顺手把 udev 数据库条目写上，
+格式就是 udev 自己写的那份：
+
+```
+I:<usec>
+E:ID_INPUT=1
+E:ID_INPUT_MOUSE=1        # vdrm-ptr
+E:ID_INPUT_TOUCHSCREEN=1  # vdrm-touch
+E:ID_INPUT_KEY=1 + E:ID_INPUT_KEYBOARD=1   # vdrm-kbd
+```
+
+顺手修了一个幂等性 bug：原来 `mknod … || continue` 在节点已存在时会 `continue`，
+导致"重启服务就不干活"（打印 `输入 0 个设备`）；改成 `[ -c 节点 ] || mknod … || continue`。
+
+实测（容器重启后，`/sys` 只读、普通用户）：
+
+```
+libinput list-devices:
+  Device: vdrm-kbd    Capabilities: keyboard
+  Device: vdrm-ptr    Capabilities: pointer
+  Device: vdrm-touch  Capabilities: touch
+```
+
+服务 `active`、退出码 0；同一时刻宿主 `/dev/input` 仍是 13 个节点（没被碰）。
