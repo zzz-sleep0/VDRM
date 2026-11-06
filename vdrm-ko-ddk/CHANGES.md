@@ -2356,3 +2356,45 @@ niri: ERROR connector mode list missing current mode
      `systemctl enable --now vdrm-input` 之后 `touchpanel` 是
      `LIBINPUT_IGNORE_DEVICE=1`、`vdrm-touch` 是 `0`；
    - App 里两处"合成器只在启动时读 `dpi`"的注释，按第十项的实测结论改掉。
+
+---
+
+## 本版本第四十六项：不开「完整硬件访问」也能跑（容器侧用 systemd 服务代替 udev）
+
+README 里那句"开了硬件访问后软重启不可避免"是可以绕开的。实际测下来，软重启的根源是
+`enable_hw_access=1` 让容器里的 `/sys` 变成**可写**（容器里装/升级驱动会往 `/sys` 写）；
+不开的话：
+
+```
+sysfs on /sys type sysfs (ro,relatime,seclabel)
+udevadm trigger --subsystem-match=input --action=change
+  → input6: Failed to write 'change' to '.../input6/uevent': Read-only file system
+```
+
+问题在于：没有硬件访问时，`/dev/input` 只是宿主机的 bind mount，vdrm 那三个节点是模块
+mknod 的 `crw------- root root`（0600）—— 普通用户打不开，udev 属性也一概没有，所以
+"虚拟键鼠不识别"。
+
+**替代方案**（已实装成 `tools/vdrm-container-setup.sh` + 一个 oneshot 服务）：
+
+1. 容器配置：`enable_hw_access=0` + 逐个 `bind_mounts`（`/dev/dri`、`/dev/input`、
+   `/dev/snd`、`/dev/vdrm*`、`/dev/kgsl-3d0`、`/dev/dma_heap`）；
+2. 服务把 `/dev/input` 换成 tmpfs，只按 `/sys/class/input/*/device/name` 里的 `vdrm-*`
+   建三个节点（`root:input 0660`）并留名字软链 —— 手机真实的触摸/电源键/指纹根本不会
+   出现在容器里，root 跑合成器也不用再做设备排除；
+3. 顺带把 vdrm 那张声卡的 `/dev/snd` 节点改成 `root:audio 0660`（`/proc/asound/cards`
+   里 index 0 就是 vdrm）。
+
+### 实测（Arch 容器、Mesa 27、`/sys` 只读、普通用户 `vtest`）
+
+| 检查 | 结果 |
+|---|---|
+| niri | 起得来，`Current mode 1920x1080@120`、`frames_pushed` 在涨 |
+| KWin | `kwin_wayland --drm` 15 秒，`frames_pushed` +2 |
+| 截图 | `grim` → `P6 1920 1080` |
+| 输入 | 宿主注入 8 个 REL 事件后，容器内 `dd if=/dev/input/event8 bs=24` 读到 192 字节 |
+| 音频 | `su - vtest -c 'exec 3<>/dev/snd/pcmC0D0p'` → `pcm-ok` |
+| 容器重启 | 服务 `enabled/active`，`/dev/input` 里只有 vdrm 三个设备，niri 照常出图 |
+
+> 注意：模块重新加载后 `eventN` 编号会变，要 `systemctl restart vdrm-input`；
+> 这一步目前得手工，除非再写个监听模块加载的 timer。

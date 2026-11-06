@@ -69,21 +69,53 @@ vdrm-debug.apk         ← Android App
 
 ### 3. 配容器
 
-**容器没有特殊配置，就是个普通容器**。Droidspaces 实测只要：
+**不要开「完整硬件访问」（`enable_hw_access`）**，把需要的设备逐个挂进来就够：
 
 ```ini
-enable_hw_access=1     # 整份 /dev 就进来了，不用逐个 bind_mounts
+enable_hw_access=0
 privileged=nomask
+bind_mounts=/dev/dri:/dev/dri,/dev/input:/dev/input,/dev/snd:/dev/snd,/dev/vdrm:/dev/vdrm,/dev/vdrm-audio:/dev/vdrm-audio,/dev/vdrm-audio-in:/dev/vdrm-audio-in,/dev/kgsl-3d0:/dev/kgsl-3d0,/dev/dma_heap:/dev/dma_heap
 ```
 
-*这里注意⚠️*：由于你的容器开启了´硬件访问´和´nomask´特权，所以对于部分驱动软件的下载与更新可能因为容器对/sys和/proc的写入而导致设备软重启，这个是开硬件访问后不可避免的（正在研究新的规避方法）
+**为什么不开**：开了之后 `/sys` 在容器里是**可写**的，容器里装或升级驱动（Mesa 之类）
+会往 `/sys` 写，可能把整机软重启一次。不开的话 `/sys` 是只读的
+（`mount | grep ' /sys '` → `ro`），装什么驱动都随便。
 
-容器里因此自然就有 `/dev/dri/card1`（虚拟卡）、`/dev/input`、`/dev/snd`
-（`/proc/asound/cards` 第 0 张就是 `vdrm`）、`/dev/vdrm`。
+代价是容器里没有 udev 替你建节点、也没有 `LIBINPUT_IGNORE_DEVICE` 这类属性可用，
+所以用一个小 systemd 服务顶上（脚本在仓库 `tools/vdrm-container-setup.sh`）：
 
-容器里的节点是容器 udev 生成的，权限和宿主机不同 —— 用普通用户跑合成器时按
-属组加：`video`（card1）、`render` / `droidspaces-gpu`（render 节点）、
-`input`（`/dev/input/event*`）、放声再加 `audio`。
+```sh
+install -m 755 vdrm-container-setup.sh /usr/local/sbin/
+cat > /etc/systemd/system/vdrm-input.service <<'EOF'
+[Unit]
+Description=vdrm: only expose the virtual input devices
+After=local-fs.target
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vdrm-container-setup
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable --now vdrm-input
+```
+
+它做两件事：把 `/dev/input` 换成只含 vdrm 三个虚拟设备（`vdrm-kbd/ptr/touch`）的
+tmpfs（`root:input 0660`），以及把 vdrm 那张声卡的 `/dev/snd` 节点改成
+`root:audio 0660`。这样手机真实的触摸/电源键/指纹**根本不会出现在容器里**，
+root 也不用再靠 udev 规则排除。
+
+**实测**（Arch 容器、Mesa 27、`/sys` 只读）：niri / KWin 照常出图、`grim` 截图正常、
+普通用户能读到虚拟鼠标事件（注入 8 个事件后 `dd` 读到 192 字节）、
+`plughw:vdrm,0` 能打开。
+
+> 模块重新加载后 `eventN` 编号会变，记得 `systemctl restart vdrm-input`。
+
+容器里的节点权限和宿主机不同（`/dev/dri/card1` 是 `0666`、render 节点也是），
+用普通用户跑合成器时仍按属组加：`video`、`render` / `droidspaces-gpu`、`input`（放声再加 `audio`）。
 
 ### 4. 配合成器
 
@@ -98,7 +130,7 @@ privileged=nomask
 | `MESA_LOADER_DRIVER_OVERRIDE` | 同理，Mesa 没有 `vdrm` 的 DRI 驱动，不指定就退软件渲染（合成器报"没有渲染器"） | `msm`或 `kgsl`，实测都能跑 |
 | `LIBSEAT_BACKEND=noop` | 容器里没有 logind/seatd 会话，wlroots 拿不到 seat | 只对 niri / Hyprland / sway 需要，KWin 不用 |
 | `XDG_RUNTIME_DIR` | 没有 logind 帮你建 | 建一个当前用户可写的目录（`/tmp/xdg` 就行） |
-| 排除多余设备 | **用容器内的 root 用户跑**时，手机真实的触摸/电源键/指纹也会被合成器收进来 | 配一个 systemd 服务，开机把那些设备标成 `LIBINPUT_IGNORE_DEVICE=1`（只留 vdrm 三个） |
+| 排除多余设备 | 手机真实的触摸/电源键/指纹不该被合成器看到 | 「配容器」那个 systemd 服务只把 vdrm 三个设备放进 `/dev/input`（root / 普通用户都一样） |
 
 除这些，**它就是一台普通显示器**，客户端应用全是标准行为，没有 vdrm 专用参数。
 
@@ -118,18 +150,8 @@ dbus-run-session -- startplasma-wayland     # KDE 只用后两个变量
 `MESA_LOADER_DRIVER_OVERRIDE` 一模一样**（`no allocator available for device`），
 别误判。
 
-**用 root 用户跑**：能打开手机真实的输入设备（`touchpanel` / `pmic_pwrkey` / 指纹），
-合成器会跟 Android 抢按键 —— 需要一个 **systemd 服务**把它们排除掉，只留 vdrm 三个：
-
-```sh
-# /etc/udev/rules.d/99-vdrm-input.rules
-ACTION=="add|change", SUBSYSTEM=="input", ENV{LIBINPUT_IGNORE_DEVICE}="1"
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="vdrm-*", ENV{LIBINPUT_IGNORE_DEVICE}="0"
-```
-
-开机要有人套用这条规则，所以配一个 oneshot 服务（`Type=oneshot` + `RemainAfterExit=yes`
-+ `ExecStart=/usr/bin/udevadm control --reload` / `udevadm trigger --subsystem-match=input --action=change`，
-`WantedBy=basic.target`）。普通用户跑不需要这些东西：它没权限，打不开那些设备。
+**用 root 用户跑**：只要按「配容器」装好那个 systemd 服务，容器里就只剩 vdrm 三个
+虚拟设备，root 也碰不到手机的触摸/电源键/指纹 —— 不需要额外的 udev 规则或逐设备配置。
 
 **`vdrm_gbm.so` 是什么**：一个 GBM 后端（libgbm 看到 card1 的驱动名是 `vdrm`，
 就来加载 `vdrm_gbm.so`；它转给mesa的 `dri_gbm.so`，只把分配改成 VDRM dumb 路径）。
@@ -413,7 +435,8 @@ gradle assembleDebug
   用自己 KMI 的那个 `.ko` 单独 `insmod`，不重启再继续往下装。
 - **设备排除。**
 - 内核模块模块加载后自己把虚拟键鼠的 `/dev/input/event*`（相比于你加载内核模块之前多出来的那几个）换成 0600 root 节点，系统 InputReader 打不开就看不见。
-- 容器侧只在**用 root 跑合成器**时才需要那条 `LIBINPUT_IGNORE_DEVICE` 规则（见「配合成器」）。
+- 容器侧不用再单独排除：按「配容器」装好那个 systemd 服务后，容器里只有 vdrm 三个虚拟设备，
+  手机真实的触摸/电源键/指纹看不见（root 跑合成器也一样）。
 
 ## 鸣谢
 
