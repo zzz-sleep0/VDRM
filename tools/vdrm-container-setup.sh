@@ -61,7 +61,9 @@ for p in /sys/class/input/event*/device/name; do
     [ -n "$d" ] || continue
     [ -c "/dev/input/$ev" ] || mknod "/dev/input/$ev" c "${d%%:*}" "${d##*:}" 2>/dev/null || continue
     chown root:input "/dev/input/$ev" 2>/dev/null || true
-    chmod 660 "/dev/input/$ev"
+    # 0666：这个目录里只有 vdrm 三个虚拟设备，世界可读不影响任何人，
+    # 但省掉"合成器用户不在 input 组 → libinput 打不开设备"这一类问题。
+    chmod 666 "/dev/input/$ev"
     ln -sf "$ev" "/dev/input/$name"
     {
         echo "I:$(date +%s)000000"

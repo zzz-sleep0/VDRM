@@ -106,7 +106,7 @@ systemctl enable --now vdrm-input
 它做三件事：
 
 1. 把 `/dev/input`、`/dev/snd` 换成只含 vdrm 设备的 tmpfs
-   （`root:input` / `root:audio`，`0660`）——手机真实的触摸/电源键/指纹**根本不会出现
+   （输入节点 `0666`，声卡 `root:audio 0660`）——手机真实的触摸/电源键/指纹**根本不会出现
    在容器里**，root 也不用再靠 udev 规则排除；
 2. 给这三台设备写 `/run/udev/data/c13:*` 条目（`ID_INPUT` / `ID_INPUT_MOUSE` /
    `ID_INPUT_TOUCHSCREEN` / `ID_INPUT_KEYBOARD`）——**这一步不能省**：libinput 走
