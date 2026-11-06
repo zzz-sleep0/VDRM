@@ -2508,3 +2508,16 @@ README 里新增「UI 缩放：合成器自己的事」，给出每家的写法�
 顺手确认：mkpool 注册的槽 pitch（gralloc stride，256 对齐，2780 宽 = 11264）与驱动
 `g_mode_pitch`（`ALIGN(w*4,64)` = 11136）不同 —— 但 `g_mode_pitch` 只出现在 GET_INFO
 和日志里，`dumb_create` 返回的是**槽自己的 pitch**，所以不是这次的因；不动它。
+
+### 实测（android14-6.1 真机，装上补丁后的 .ko，niri 26.04）
+
+```
+起始: mode=1920x1080 active=1920x1080
+切 2780x1264 -> active=2780x1264 slots=6
+切 1920x1080 -> active=1920x1080 slots=6
+切 2780x1264 -> active=2780x1264 slots=6
+```
+
+niri 日志里 `Failed to create dumb buffer` / `error changing mode` 的出现次数：**0**（补丁前每次
+切 2780x1264 必失败一次）。通知里的「切横竖」（旧的 3 秒版本 APK）也直接生效：
+`2780x1264 -> 1264x2780`，`active` 跟上。

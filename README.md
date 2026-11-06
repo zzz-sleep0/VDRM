@@ -433,6 +433,16 @@ cat /sys/module/vdrm/parameters/frames_pushed   # 动一下鼠标，这个数应
 # 模块 zip（需要六档 .ko 和 mkpool）
 python3 make-module.py
 
+# 单个 KMI 的 .ko（本机就是 android14-6.1）：用系统自带的 clang + DDK 的 kdir
+#   （DDK 里那份 clang 是 x86-64 的，在 aarch64 主机上跑不了；系统 clang 版本
+#    与内核一致时可以直接用）
+cd vdrm-ko-ddk
+make -C /opt/ddk/kdir/android14-6.1 M=$PWD ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+     CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+     OBJDUMP=llvm-objdump STRIP=llvm-strip modules
+# 没装 dwarves（pahole）时模块 BTF 会失败：BTF 只是调试信息，给 pahole 和
+# resolve_btfids 各放一个 exit 0 的桩就能过，产物照样能加载
+
 # mkpool（NDK bionic clang）
 cd vdrm-mkpool && make CC=/data/data/com.termux/files/usr/bin/aarch64-linux-android-clang
 
