@@ -1135,7 +1135,13 @@ static int vdrm_dumb_create(struct drm_file *file, struct drm_device *dev,
 		if (pick >= 0)
 			break;
 
-		if (args->width != g_mode_w || args->height != g_mode_h)
+		/* 换档过渡期里合成器还会来要"上一档"的 buffer（它自己的
+		 * swapchain 还没换完），这种请求是合法的，不能因为尺寸不等于
+		 * 目标档就立刻打死 —— 否则合成器会把整次模式切换判成失败并退回
+		 * （niri 原话："error changing mode: Failed to create dumb
+		 * buffer"）。只有"从没对外广告过"的尺寸才立即失败，免得为一个
+		 * 永远建不出来的尺寸白等 6 秒。*/
+		if (!vdrm_res_advertised(args->width, args->height))
 			return -ENOSPC;
 		if (waited >= 6000)
 			return -ENOSPC;

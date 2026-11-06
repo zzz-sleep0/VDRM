@@ -435,9 +435,15 @@ public class ForegroundService extends Service {
         refresh();
     }
 
-    /** 最多等 3 秒，看合成器有没有真的把 active 换成 want */
+    /** 等合成器把 active 换成 want。
+     *
+     * 必须比驱动里的等待长：dumb_create 在换档过渡期会给合成器最多 6 秒
+     * 去拿新尺寸的槽（vdrm_ko.c 的 waited >= 6000）。以前这里只等 3 秒，
+     * 于是 App 先判定失败、写反方向的 mode —— 一写就把驱动的"目标档"改掉，
+     * 合成器正在等的那个请求立刻 ENOSPC，等于 App 亲手把本来能成功的切换
+     * 打断。所以这里给 7.2 秒。*/
     private boolean waitActive(String want) {
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 24; i++) {
             sleep(300);
             if (sh("cat " + P + "/active").trim().equals(want))
                 return true;

@@ -2486,3 +2486,25 @@ README 里新增「UI 缩放：合成器自己的事」，给出每家的写法�
 
 想要"整体 UI 大小"的另一条路（VDRM 原生、所有合成器一致）是换档：黑边屏 1920×1080
 ↔ 真实分辨率 —— 改的是硬件事实（分辨率），代价是清晰度/性能。
+
+---
+
+## 本版本第五十项：换档时"切横竖没反应"的真因（dumb_create 立刻 ENOSPC + App 抢跑）
+
+现象：通知里"切横竖"点了没反应，`dmesg` 里能看到目标档已经 prepare+commit，但合成器
+报 `error changing mode: ... Failed to create dumb buffer ... StorageFull`，然后退回原尺寸。
+
+两处都是时序问题：
+
+1. **驱动**：`vdrm_dumb_create()` 只要请求尺寸 ≠ 目标档（`g_mode_w/h`）就**立刻**返回
+   `-ENOSPC`，而 `g_mode` 是"写 mode 参数时"就更新成新档的。换档过渡期合成器还会来要
+   **上一档**的 buffer（它自己的 swapchain 还没换完），于是被瞬间打死 → 合成器判定整次
+   模式切换失败并回退。改成：只要这个尺寸是**对外广告过的档位**（`vdrm_res_advertised()`，
+   含 old/current），就照常进等待循环；只有从没广告过的尺寸才立即失败。
+2. **App**：`waitActive()` 只等 3 秒，而驱动那边最多等 6 秒。于是 App 先判定失败、
+   写反方向的 mode —— 一写就把驱动的目标档改掉，合成器正在等的请求立刻 ENOSPC。
+   等于 App 亲手把本来能成功的切换打断。改成 7.2 秒（24 × 300ms）。
+
+顺手确认：mkpool 注册的槽 pitch（gralloc stride，256 对齐，2780 宽 = 11264）与驱动
+`g_mode_pitch`（`ALIGN(w*4,64)` = 11136）不同 —— 但 `g_mode_pitch` 只出现在 GET_INFO
+和日志里，`dumb_create` 返回的是**槽自己的 pitch**，所以不是这次的因；不动它。
