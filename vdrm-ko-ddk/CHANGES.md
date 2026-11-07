@@ -3,6 +3,39 @@
 > 这里记的是**为什么这么改**：每一项的根因、证据、修法。
 > 只想把模块跑起来的话看 `README.md` 就够了，不必读这份。
 
+## 本版本第六十二项：设备节点交给挂载；修正输入通配和 ttynull
+
+### 1. systemd 不再创建/屏蔽/挂载设备
+
+删掉了 `tools/vdrm-container-setup.sh`、`vdrm-input.service`、`vdrm-devices.service`、
+`dev-input.mount`、`dev-snd.mount`、`vdrm-activate.service`。
+
+设备节点由容器运行时逐个 bind；systemd 只保留标准 udev/logind。容器 `/sys` 只读时
+`udevadm trigger` 会因为写 `/sys/.../uevent` 失败（实测 `Read-only file system`），
+此时应 bind 宿主 `/run/udev` 或临时 remount `/sys` rw，不再手写 `/run/udev/data`。
+
+### 2. README 的输入通配是错的
+
+原命令：
+
+```sh
+chown root:root /dev/input/event*
+chmod 0600 /dev/input/event*
+```
+
+会把手机真实触摸/电源键/指纹一起改掉。已改成按 `/sys/class/input/event*/device/name`
+过滤 `vdrm-*`，只处理 vdrm 三个 event。
+
+### 3. Android 设备表
+
+InputReader 已经打开的 event fd 不会因为 chmod 0600 自动消失；模块重载后需要重启，
+让 `post-fs-data` 在 zygote 之前隐藏。开机后 `dumpsys input | grep vdrm` 应为空。
+
+### 4. `/dev/ttynull` 不是 vdrm
+
+`/dev/ttynull` 是 Android 的 `CONFIG_NULL_TTY`（235:0），`/dev/tty0` 是 vdrm VT（4:0）。
+两者是不同 driver；容器里没有 ttynull，不要删除宿主 ttynull。若只需要 tty0，bind tty0 即可。
+
 ## 本版本第六十一项：容器 systemd 拆分 + 删除 GPU 拷贝路径
 
 ### 1. systemd 只做该做的事

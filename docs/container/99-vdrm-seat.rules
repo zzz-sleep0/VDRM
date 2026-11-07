@@ -9,7 +9,7 @@
 #     Failed to open /dev/input/eventN device (No such device)
 # （画面正常、键鼠触控全丢，很容易误判成 libinput 问题。）
 #
-# 没有 udev / /sys 只读的容器不用装这个：tools/vdrm-container-setup.sh 会直接
+# 没有 udev / /sys 只读的容器不用装这个：请 bind 宿主的 /run/udev，或 remount /sys rw 让 udev 自己扫；不要手写
 # 写 /run/udev/data（eventN 的 c13:* 和父设备的 +input:inputN），效果一样。
 
 ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="vdrm-kbd",   TAG+="seat"

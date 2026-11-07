@@ -53,54 +53,28 @@ LIBSEAT_BACKEND=noop
 `enable_hw_access` 保持 0：开了之后容器里 `/sys` 可写，装驱动可能把整机软重启。
 代价是容器里没有 udev，所以下一步用 systemd oneshot 顶替。
 
-## 3. 容器里装节点服务
+## 3. 容器设备节点
 
-用 systemd 顶替 udev：把下面这个脚本装成 oneshot，开机建 `/dev/input`、
-`/dev/snd`、`/dev/tty0..6` 和 `/run/udev/data` 属性。
+VDRM 不再用 systemd oneshot 建节点、做 tmpfs mask 或自己 mknod。设备节点由
+容器运行时按需 bind 进容器：
 
-```sh
-# 脚本（也在仓库 tools/ 里）
-curl -L -o /tmp/vdrm-container-setup.sh \
-  https://raw.githubusercontent.com/zzz-sleep0/VDRM/main/tools/vdrm-container-setup.sh
-install -m 755 /tmp/vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
-cat > /etc/systemd/system/vdrm-input.service <<'EOF'
-[Unit]
-Description=vdrm: only expose the virtual input devices
-After=local-fs.target
-# 必须在 logind 之前写好 card 的 master-of-seat 和输入设备的 seat 属性；
-# 否则 SDDM 会报 "No graphical seats found"，KWin 也拿不到 card/input。
-Before=systemd-logind.service display-manager.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/vdrm-container-setup
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable --now vdrm-input
+```text
+/dev/tty0..6       ← 宿主 vdrm VT
+/dev/dri/card1     ← 宿主虚拟 DRM
+/dev/input/eventN  ← 宿主 vdrm-kbd/ptr/touch
+/dev/snd/*         ← 宿主 vdrm 声卡
 ```
 
-它依次做四件事：`mount --make-rprivate /dev` 后用 tmpfs 顶掉 `/dev/input`、
-`/dev/snd`；mknod 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）；
-把 droidspaces 预置的 `/dev/tty1..6`（`/dev/null` 或 tmpfs）换成真正的 `4:N`；
-写 `/run/udev/data/c13:<minor>` 的 `ID_INPUT*` + `G/Q:seat`，以及父
-`inputN` 的 `+input:inputN`（只给 eventN 不够：logind 的 `TakeDevice` 是按父
-`inputN` 查 seat 的）。
+容器里不要再装 `vdrm-container-setup`，也不要 `vdrm-input.service` 去凭空
+创建这些节点。systemd 只做标准 udev/logind 的硬件激活。
 
-```sh
-systemctl is-active vdrm-input      # active
-ls /dev/input/                      # event7/8/9 + vdrm-kbd/ptr/touch
-ls -l /dev/tty0 /dev/tty1           # 4,0 / 4,1
-```
+如果容器 `/sys` 是只读的，`udevadm trigger` 会因为无法写
+`/sys/.../uevent` 失败（实测 `Read-only file system`）。这时二选一：
 
-⚠️ 别在容器里 `rm`/`chmod` `/dev/input`、`/dev/snd`：那是宿主机目录的 bind mount，
-同一批 inode，删掉宿主机上就真没了（会让 Android 失去触摸）。脚本会先挂 tmpfs 并
-用自己的 fsname 确认挂上才动手。
+- 把宿主的 `/run/udev` bind 进容器，直接复用设备属性和 seat tag；
+- 或者临时 `mount -o remount,rw /sys` 后让 udev 自己触发。
 
-模块重载后 `eventN` 编号会变：`systemctl restart vdrm-input`；KDE 也要重启
-（`systemctl restart vdrm-kde`，必要时先 `loginctl kill-session`）。
+不要再为了 seat tag 去手写 `/run/udev/data` 或 mknod。
 
 ## 4. 装 Mesa / GBM / 合成器
 
@@ -124,8 +98,7 @@ dnf install -y plasma-workspace kwin kscreen
 cat > /etc/systemd/system/vdrm-kde.service <<'EOF'
 [Unit]
 Description=VDRM: KDE session on the virtual display
-After=systemd-user-sessions.service vdrm-input.service
-Wants=vdrm-input.service
+After=systemd-user-sessions.service
 
 [Service]
 Type=simple
@@ -180,8 +153,8 @@ journalctl -b | grep "Could not determine the active graphical session"
 `docs/container/sddm/` 里有现成文件，安装步骤见
 [`docs/container/sddm/README.md`](docs/container/sddm/README.md)。核心是三件事：
 
-- `vdrm-input.service` 里加 `Before=systemd-logind.service`，并确保是**新脚本**
-  （会写 `/run/udev/data`、`/run/udev/tags`、父 `inputN`）；
+- 设备节点由容器运行时 bind，udev/logind 自己生成 seat 属性；
+  不要再让 systemd 去 mknod/mask；
 - 用 `tools/vdrm-sddm-start.sh` 包装会话：`trap '' HUP`、清 `LIBSEAT_BACKEND`，
   **保留** SDDM/PAM 给的 `DBUS_SESSION_BUS_ADDRESS=/run/user/0/bus`，然后
   `plasma-dbus-run-session-if-needed startplasma-wayland`。不 `trap` 的话，
@@ -308,9 +281,14 @@ su -c 'chcon u:object_r:gpu_device:s0 /dev/vdrm'
 **设备排除**
 
 ```sh
-# 只对 vdrm 那三个节点做
-chown root:root /dev/input/event*     
-chmod 0600 /dev/input/event*
+# 只对 vdrm 三个设备做；绝不能用 /dev/input/event* 通配，
+# 否则会把手机真实触摸/电源键/指纹一起 root:root。
+for p in /sys/class/input/event*/device/name; do
+    case "$(cat "$p" 2>/dev/null)" in vdrm-*) ;; *) continue ;; esac
+    ev=$(basename "$(dirname "$(dirname "$p")")")
+    chown root:root "/dev/input/$ev"
+    chmod 0600 "/dev/input/$ev"
+done
 ```
 
 ### 5. 用 App 打通一条帧
@@ -333,9 +311,13 @@ su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
 
 ### 容器侧不用再排除
 
-模块加载后自己把虚拟键鼠的 `/dev/input/event*`（比加载前多出来的那几个）换成 0600
-root 节点，Android 的 InputReader 打不开就看不见；容器侧装好第 3 步那个 service 后，
-容器里只有 vdrm 三个虚拟设备，手机真实的触摸/电源键/指纹看不见（root 跑合成器也一样）。
+模块加载后 `vdrm_hide_input` 只按 `vdrm-*` 名字把对应 event 节点换成
+`0600 root:root`；**不要对 `/dev/input/event*` 通配**。容器侧设备节点由运行时
+bind，不再有 systemd mknod/service。
+
+注意：如果 InputReader 已经打开过这些 event fd，改权限不会把它从 Android
+设备表里立刻移除；**模块重载后需要重启一次**，让 post-fs-data 在 zygote 之前
+完成隐藏。开机后 `dumpsys input | grep vdrm` 应该为空。
 
 ## 鸣谢
 
