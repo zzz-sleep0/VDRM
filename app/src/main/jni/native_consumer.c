@@ -498,7 +498,7 @@ static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
         return false;
     }
     s->is_copy = copied ? 1 : 0;
-    s->no_return = copied ? 1 : 0;
+    s->no_return = 0;      /* 池槽仍然在 SF release 时归还（拷贝已消费内容）*/
     if (copied)
         g_copy_frames++;
 
@@ -549,11 +549,6 @@ static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
         if (dt > g_latch_max_us)
             g_latch_max_us = dt;
     }
-
-    /* 拷贝帧：池槽的内容已经被 blit 消费掉了，立刻 RETURN 给内核。
-     * 剩下"SF 什么时候用完这块拷贝"由目标环自己的 release 回调管。*/
-    if (copied)
-        vdrm_return((int)slot);
 
     /* 记下这一帧：Surface 重建（切后台回来、息屏再亮）时新图层是空的，
      * 要马上把它贴回去，否则那块区域在新合成器推第一帧之前是黑的。*/

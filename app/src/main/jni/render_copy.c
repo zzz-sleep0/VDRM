@@ -38,7 +38,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  "VDRM", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "VDRM", __VA_ARGS__)
 
-#define RCOPY_TARGETS 5      /* 目标环：SF 手上最多 3 块，留两块给"在画/在等" */
+#define RCOPY_TARGETS 6      /* 目标环：SF 手上最多 3 块，留三块给"在画/在等" */
 #define RCOPY_SRC_CACHE 8    /* 源（池槽 AHB）→ EGLImage 的缓存 */
 
 struct rcopy_target {
@@ -454,7 +454,7 @@ bool rcopy_blit(AHardwareBuffer *src, uint32_t sw, uint32_t sh,
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	/* 必须在把池槽 RETURN 给内核之前完成：那块显存随时可能被别人画。
 	 * 先 glFlush + fence 等待；实测这一屏的 blit 很短，先按最稳的来。*/
-	glFinish();
+	glFlush();
 	{
 		unsigned long dt = (unsigned long)(mono_us() - blit_t0);
 
