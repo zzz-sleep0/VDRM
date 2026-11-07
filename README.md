@@ -147,10 +147,22 @@ mode=1920x1080
 aplay -l | grep vdrm
 ```
 
-## 注意：兼容性自测（不符合 GKI 标准的内核，先做这一步）
+## 注意：KMI 对得上，但内核疑似没遵守 GKI 标准
 
-**别先刷 zip。** 按下面的顺序单独验一遍，任何一步不对就 `rmmod` 收手，刷了 zip 只会
-更难恢复。刷之前先准备好抢救手段（音量键进 recovery / 强制重启）。
+这是最容易踩的一种：`uname -r` 落在支持的 KMI 里，模块里也**有**对应那一份 `.ko`，
+但内核其实是厂商魔改过的 —— 符号没导出、导出名被改、结构体布局动了、或者某个
+Kconfig 被关掉。表现通常是这几种：
+
+```
+insmod: failed to load vdrm-*.ko: Unknown symbol snd_pcm_lib_malloc_pages
+insmod: failed to load vdrm-*.ko: Unknown symbol drm_....        # 符号没导出
+insmod 返回 -EINVAL / probe 直接失败，dmesg 里没有 stage=register-ok
+insmod 当场 panic、手机重启                                       # 最坏情况
+```
+
+**别先刷 zip。** 刷了以后模块在开机早期加载，出问题只能在模块管理器（往往也已经
+进不去）里救，代价是音量键 recovery 甚至格式化 data。按下面六步单独验一遍，任何一步
+不对就 `rmmod` 收手；验之前先确认自己会进 recovery / 会强制重启。
 
 ### 1. 记下现状
 
