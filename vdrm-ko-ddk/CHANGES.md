@@ -3,6 +3,25 @@
 > 这里记的是**为什么这么改**：每一项的根因、证据、修法。
 > 只想把模块跑起来的话看 `README.md` 就够了，不必读这份。
 
+## 本版本第六十三项：恢复通用节点服务；输入排除用软重启
+
+之前把 `vdrm-container-setup.sh` 删掉、改成只跑 `udevadm trigger`，在 `/sys` 只读的
+容器里是错的：udev trigger 写 `/sys/.../uevent` 直接 `Read-only file system`，服务
+变成吃白饭。现在恢复通用方案：
+
+- `tools/vdrm-container-setup.sh` 恢复：tmpfs `/dev/input`、`/dev/snd`，
+  mknod vdrm input/audio/tty，写 `/run/udev/data`/tags；
+- `vdrm-input.service` 恢复为 oneshot；
+- `vdrm-devices.service`、两个 `.mount`、`vdrm-activate` 不再使用。
+
+Android 输入排除不改内核：`vdrm_hide_input` 只按 `vdrm-*` 名字把 event 节点改成
+0600 root:root。InputReader 已经打开的 fd 无法被 chmod 收回，所以手动重载或首次
+加载后做一次软重启（`stop; start`）或手机重启；开机时 post-fs-data 会在 zygote
+之前完成隐藏。软重启后 `dumpsys input | grep vdrm` 为空。
+
+`/dev/ttynull` 235:0 是 Android null tty，`/dev/tty0` 4:0 是 vdrm VT；不同 driver，
+容器里没有 ttynull，不要删宿主 ttynull。
+
 ## 本版本第六十二项：设备节点交给挂载；修正输入通配和 ttynull
 
 ### 1. systemd 不再创建/屏蔽/挂载设备

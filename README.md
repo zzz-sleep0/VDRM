@@ -53,28 +53,54 @@ LIBSEAT_BACKEND=noop
 `enable_hw_access` 保持 0：开了之后容器里 `/sys` 可写，装驱动可能把整机软重启。
 代价是容器里没有 udev，所以下一步用 systemd oneshot 顶替。
 
-## 3. 容器设备节点
+## 3. 容器里装节点服务
 
-VDRM 不再用 systemd oneshot 建节点、做 tmpfs mask 或自己 mknod。设备节点由
-容器运行时按需 bind 进容器：
+用 systemd 顶替 udev：把下面这个脚本装成 oneshot，开机建 `/dev/input`、
+`/dev/snd`、`/dev/tty0..6` 和 `/run/udev/data` 属性。
 
-```text
-/dev/tty0..6       ← 宿主 vdrm VT
-/dev/dri/card1     ← 宿主虚拟 DRM
-/dev/input/eventN  ← 宿主 vdrm-kbd/ptr/touch
-/dev/snd/*         ← 宿主 vdrm 声卡
+```sh
+# 脚本（也在仓库 tools/ 里）
+curl -L -o /tmp/vdrm-container-setup.sh \
+  https://raw.githubusercontent.com/zzz-sleep0/VDRM/main/tools/vdrm-container-setup.sh
+install -m 755 /tmp/vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
+cat > /etc/systemd/system/vdrm-input.service <<'EOF'
+[Unit]
+Description=vdrm: only expose the virtual input devices
+After=local-fs.target
+# 必须在 logind 之前写好 card 的 master-of-seat 和输入设备的 seat 属性；
+# 否则 SDDM 会报 "No graphical seats found"，KWin 也拿不到 card/input。
+Before=systemd-logind.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vdrm-container-setup
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable --now vdrm-input
 ```
 
-容器里不要再装 `vdrm-container-setup`，也不要 `vdrm-input.service` 去凭空
-创建这些节点。systemd 只做标准 udev/logind 的硬件激活。
+它依次做四件事：`mount --make-rprivate /dev` 后用 tmpfs 顶掉 `/dev/input`、
+`/dev/snd`；mknod 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）；
+把 droidspaces 预置的 `/dev/tty1..6`（`/dev/null` 或 tmpfs）换成真正的 `4:N`；
+写 `/run/udev/data/c13:<minor>` 的 `ID_INPUT*` + `G/Q:seat`，以及父
+`inputN` 的 `+input:inputN`（只给 eventN 不够：logind 的 `TakeDevice` 是按父
+`inputN` 查 seat 的）。
 
-如果容器 `/sys` 是只读的，`udevadm trigger` 会因为无法写
-`/sys/.../uevent` 失败（实测 `Read-only file system`）。这时二选一：
+```sh
+systemctl is-active vdrm-input      # active
+ls /dev/input/                      # event7/8/9 + vdrm-kbd/ptr/touch
+ls -l /dev/tty0 /dev/tty1           # 4,0 / 4,1
+```
 
-- 把宿主的 `/run/udev` bind 进容器，直接复用设备属性和 seat tag；
-- 或者临时 `mount -o remount,rw /sys` 后让 udev 自己触发。
+⚠️ 别在容器里 `rm`/`chmod` `/dev/input`、`/dev/snd`：那是宿主机目录的 bind mount，
+同一批 inode，删掉宿主机上就真没了（会让 Android 失去触摸）。脚本会先挂 tmpfs 并
+用自己的 fsname 确认挂上才动手。
 
-不要再为了 seat tag 去手写 `/run/udev/data` 或 mknod。
+模块重载后 `eventN` 编号会变：`systemctl restart vdrm-input`；KDE 也要重启
+（`systemctl restart vdrm-kde`，必要时先 `loginctl kill-session`）。
 
 ## 4. 装 Mesa / GBM / 合成器
 

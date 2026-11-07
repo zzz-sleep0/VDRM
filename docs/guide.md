@@ -323,7 +323,7 @@ KWin/Plasma 6.8.2、sway 1.12，全部用**非 root 用户**（uid 1001，组
 
 `enable_hw_access=1` 会让容器里的 `/sys` 变可写 —— 容器里装/升级驱动时就可能把整机
 软重启一次。所以更稳的配置是**不开硬件访问**，把设备逐个绑进来，再用一个小
-设备节点由容器运行时 bind；不要再让 systemd 服务代替 udev 建节点。
+systemd 服务代替 udev 建节点（脚本：`tools/vdrm-container-setup.sh`）。
 
 实测（Arch、Mesa 27、`/sys` 只读、非 root 用户）：
 

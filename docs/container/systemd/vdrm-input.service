@@ -1,0 +1,12 @@
+[Unit]
+Description=vdrm: only expose the virtual input devices
+After=local-fs.target
+Before=systemd-logind.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vdrm-container-setup
+
+[Install]
+WantedBy=multi-user.target

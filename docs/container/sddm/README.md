@@ -11,9 +11,9 @@
 - session 是 `VTNr=1 / Seat=seat0 / Active=yes`，输入通过 logind
   `TakeDevice` 进来。
 
-前提：内核模块提供虚拟 VT，容器运行时已经把 `/dev/tty0..6`、`/dev/dri/card1`、
-`/dev/input/eventN`、`/dev/snd/*` 这些设备节点 bind 进容器。seat/udev 属性由
-udev 生成，或从宿主 bind `/run/udev`；**不再用 systemd 服务 mknod/mask**。
+前提：内核模块提供虚拟 VT（`/sys/class/tty/tty0/active` 存在），并且
+`vdrm-input.service` 已按 `tools/vdrm-container-setup.sh` 建好
+`/dev/tty0..6`、输入 udev data（含父 `inputN`）和 **`/run/udev/tags`**。
 
 ## 1. 装文件
 
@@ -29,6 +29,10 @@ install -m 644 docs/container/sddm/10-vdrm.conf \
 install -d /etc/systemd/system/sddm.service.d
 install -m 644 docs/container/sddm/override.conf \
   /etc/systemd/system/sddm.service.d/override.conf
+
+install -d /etc/systemd/system/vdrm-input.service.d
+install -m 644 docs/container/sddm/order.conf \
+  /etc/systemd/system/vdrm-input.service.d/order.conf
 
 # SDDM 进程（greeter）和 user session 都要有 MESA/KWIN
 cp docs/container/sddm/environment /etc/environment
@@ -61,8 +65,9 @@ systemctl disable --now vdrm-kde
 
 `vdrm-kde.service` 还是可以留着当 fallback；两个都 enable 会抢 card1。
 
-设备节点由运行时 bind；udev/logind 在这之后自己枚举。不要再装
-`vdrm-input.service`，也不要手写 `/run/udev/data`。
+`vdrm-input.service` 必须是新脚本，并且 `Before=systemd-logind.service`：
+它现在要赶在 logind 之前写 `/run/udev/data` 和 `/run/udev/tags`。
+`order.conf` 就是干这个的。
 
 ## 3. 重启容器验证
 
@@ -73,7 +78,7 @@ systemctl reboot      # 或从宿主 droidspaces restart
 起来后：
 
 ```sh
-systemctl is-active sddm
+systemctl is-active sddm vdrm-input
 pgrep -a kwin_wayland
 loginctl show-session c1 -p Seat -p VTNr -p Active -p Service
 
@@ -98,10 +103,12 @@ XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
    PAM session。`tools/vdrm-sddm-start.sh` 里的 `trap '' HUP` 是必须的；忽略
    信号会跨 exec 保留。
 
-2. **udev tag 要由 udev 自己生成**。容器 `/sys` 只读时 `udevadm trigger`
-   会因为无法写 `/sys/.../uevent` 失败；此时不要再手写 `/run/udev/data`，
-   直接把宿主的 `/run/udev` bind 进容器，或者临时 remount `/sys` rw 让 udev
-   自己扫。seat0 的 `master-of-seat` 就来自这些 udev tag。
+2. **`/run/udev/tags` 不是 `/run/udev/data`**。logind 启动时按
+   `master-of-seat` 枚举设备，用的是 `/run/udev/tags/master-of-seat/<devid>`
+   空文件；只写 `c226:1` 的 `Q:master-of-seat`，`udevadm info` 会显示 tag，
+   但 logind 枚举不到，seat0 就没有图形设备（SDDM 报
+   `No graphical seats found`）。`vdrm-container-setup.sh` 现在会建这些 tag；
+   `vdrm-input` 必须在 logind 之前跑。
 
 ## 关于 DBus：别再用私有 `dbus-run-session`
 
