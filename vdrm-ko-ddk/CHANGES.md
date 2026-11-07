@@ -28,8 +28,7 @@ chmod 0600 /dev/input/event*
 
 ### 3. Android 设备表
 
-InputReader 已经打开的 event fd 不会因为 chmod 0600 自动消失；模块重载后需要重启，
-让 `post-fs-data` 在 zygote 之前隐藏。开机后 `dumpsys input | grep vdrm` 应为空。
+InputReader 已经打开的 event fd 不会因为 chmod 0600 自动消失；模块重载后需要重启手机，或 `stop; start` 重启 Android framework，让 InputReader 释放旧 fd；开机时 `post-fs-data` 会在 zygote 之前隐藏。开机后 `dumpsys input | grep vdrm` 应为空。
 
 ### 4. `/dev/ttynull` 不是 vdrm
 
