@@ -1,0 +1,13 @@
+[Unit]
+Description=VDRM: tty/DRM/audio device nodes
+Requires=dev-snd.mount
+After=dev-snd.mount
+Before=systemd-logind.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vdrm-container-setup devices
+
+[Install]
+WantedBy=multi-user.target

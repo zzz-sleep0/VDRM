@@ -5,54 +5,39 @@
 # 里面是【同一批 inode】。直接在容器里 rm/chmod 就是在改宿主机的节点 —— 实测删掉
 # /dev/input/event* 之后 Android 立刻没有触摸/按键，只能强制重启才恢复。
 #
-# 所以这里的铁律是：**先挂 tmpfs 把目录顶掉并确认挂上了**，之后所有 mknod/chmod
-# 都落在容器自己的 tmpfs 里；挂不上就直接退出，绝不去动下面的宿主节点。
+# tmpfs 由 systemd 的 dev-input.mount / dev-snd.mount 负责；本脚本只验证
+# 目录确实已经是 tmpfs，然后在里面创建节点，绝不去动下面的宿主节点。
 #
 # 作用：
 #   1. /dev/input 只暴露 vdrm-kbd / vdrm-ptr / vdrm-touch（root:input 0660）；
 #   2. /dev/snd 只暴露 vdrm 那张卡的节点（root:audio 0660）。
 # 这样容器不需要「完整硬件访问」（/sys 只读 → 装/升级驱动不会软重启整机）。
 #
-# 模块重新加载后 eventN 编号会变，记得 `systemctl restart vdrm-input`。
+# input 和 devices 分开：
+#   vdrm-input.service   只做 input（键鼠识别）
+#   vdrm-devices.service 只做 tty/DRM/audio 节点
+# 模块重新加载后 eventN 编号会变，记得 restart 这两个 unit。
 set -e
 
-ours() { grep -q "^$1 /dev/$2 " /proc/mounts; }
+MODE=${1:-all}
+case "$MODE" in
+    input|devices|all) ;;
+    *) echo "usage: $0 input|devices|all" >&2; exit 2 ;;
+esac
 
-# 把 /dev 的传播关系切成 rprivate，避免容器里的挂载往宿主回流（实测本来也不回流，
-# 这里是多加一道保险）。
-mount --make-rprivate /dev 2>/dev/null || true
-
-for pair in "vdrm-input input" "vdrm-snd snd"; do
-    tag=${pair%% *}
-    dir=${pair##* }
-    if ! ours "$tag" "$dir"; then
-        mount -t tmpfs -o mode=755 "$tag" "/dev/$dir" || {
-            echo "vdrm-container-setup: 无法挂载 tmpfs 到 /dev/$dir，放弃（不动宿主机节点）" >&2
-            exit 1
-        }
-    fi
-    ours "$tag" "$dir" || {
-        echo "vdrm-container-setup: /dev/$dir 不是我们的 tmpfs，放弃" >&2
-        exit 1
-    }
-done
-
-# ---- 虚拟 VT：/dev/tty0..6 ----
-#
-# 内核侧（vdrm 的 vdrm_vt）提供 major 4；但 droidspaces 会把容器的
-# /dev/tty1..6 预置成 ->/dev/null（Fedora）或 tmpfs（Arch），logind 能看见
-# /sys/class/tty/tty0/active，session 起来后却打不开 /dev/ttyN。这里换成
-# 真正的 4:N 节点。只碰 tty0..6，不碰 /dev/tty（5:0）。
-for n in 0 1 2 3 4 5 6; do
-    node=/dev/tty$n
-    if [ -c "$node" ] && [ "$(stat -c %t:%T "$node" 2>/dev/null)" = "4:$n" ]; then
-        continue
-    fi
-    umount "$node" 2>/dev/null || true
-    rm -f "$node" 2>/dev/null || true
-    mknod "$node" c 4 "$n" 2>/dev/null || true
-    chmod 666 "$node" 2>/dev/null || true
-done
+# 挂载由 systemd .mount 单元负责（dev-input.mount / dev-snd.mount）。
+# 这里先确认 /dev/input、/dev/snd 已经是我们的 tmpfs；绝不落到宿主 bind 上。
+is_tmpfs() {
+    awk -v m="$1" '$2 == m && $3 == "tmpfs" { found = 1 } END { exit !found }' /proc/mounts
+}
+if [ "$MODE" != devices ] && ! is_tmpfs /dev/input; then
+    echo "vdrm-container-setup: /dev/input 不是 tmpfs（dev-input.mount 没起来？）" >&2
+    exit 1
+fi
+if [ "$MODE" != input ] && ! is_tmpfs /dev/snd; then
+    echo "vdrm-container-setup: /dev/snd 不是 tmpfs（dev-snd.mount 没起来？）" >&2
+    exit 1
+fi
 
 mkdir -p /run/udev/data /run/udev/tags
 # libudev 的 tag 枚举走 /run/udev/tags/<tag>/<devid>，不是只看 data 里的 Q:。
@@ -63,6 +48,26 @@ udev_tag_add() {
     chmod 444 "/run/udev/tags/$1/$2" 2>/dev/null || true
 }
 
+n=0
+m=0
+
+if [ "$MODE" != input ]; then
+# ---- 虚拟 VT：/dev/tty0..6 ----
+#
+# 内核侧（vdrm 的 vdrm_vt）提供 major 4；但 droidspaces 会把容器的
+# /dev/tty1..6 预置成 ->/dev/null（Fedora）或 tmpfs（Arch），logind 能看见
+# /sys/class/tty/tty0/active，session 起来后却打不开 /dev/ttyN。这里换成
+# 真正的 4:N 节点。只碰 tty0..6，不碰 /dev/tty（5:0）。
+for tn in 0 1 2 3 4 5 6; do
+    node=/dev/tty$tn
+    if [ -c "$node" ] && [ "$(stat -c %t:%T "$node" 2>/dev/null)" = "4:$tn" ]; then
+        continue
+    fi
+    umount "$node" 2>/dev/null || true
+    rm -f "$node" 2>/dev/null || true
+    mknod "$node" c 4 "$n" 2>/dev/null || true
+    chmod 666 "$node" 2>/dev/null || true
+done
 # ---- DRM card：seat0 的 master-of-seat ----
 #
 # 不开 hw-access 时容器里的 udev 冷插拔不会给 vdrm 的 card 写 /run/udev/data；
@@ -93,6 +98,10 @@ for card in /sys/class/drm/card*; do
     udev_tag_add master-of-seat "c$d"
     udev_tag_add uaccess "c$d"
 done
+
+fi
+
+if [ "$MODE" != devices ]; then
 
 # ---- 输入：只放 vdrm 三个虚拟设备 ----
 #
@@ -151,6 +160,10 @@ for p in /sys/class/input/input*/name; do
     udev_tag_add seat "+input:$in"
 done
 
+fi
+
+if [ "$MODE" != input ]; then
+
 # ---- 声卡：只放 vdrm 那张卡 ----
 card=$(sed -n 's/^ *\([0-9][0-9]*\) \[vdrm.*/\1/p' /proc/asound/cards 2>/dev/null | head -1)
 m=0
@@ -167,4 +180,6 @@ if [ -n "$card" ]; then
     done
 fi
 
-echo "vdrm-container-setup: 输入 $n 个设备，声卡 $m 个节点"
+fi
+
+echo "vdrm-container-setup: mode=$MODE 输入 $n 个设备，声卡 $m 个节点"

@@ -3,6 +3,39 @@
 > 这里记的是**为什么这么改**：每一项的根因、证据、修法。
 > 只想把模块跑起来的话看 `README.md` 就够了，不必读这份。
 
+## 本版本第六十一项：容器 systemd 拆分 + 删除 GPU 拷贝路径
+
+### 1. systemd 只做该做的事
+
+原来 `vdrm-input.service` 一个脚本包了：tmpfs mount、tty mknod、DRM udev tag、
+input 节点、audio 节点。现在拆开：
+
+- `dev-input.mount` / `dev-snd.mount`：只负责 `/dev/input`、`/dev/snd` 的 tmpfs；
+- `vdrm-input.service`：**只做 input**（input 节点、udev data/tags、symlink）；
+- `vdrm-devices.service`：只有 tty / DRM / audio 节点。
+
+`vdrm-container-setup.sh` 改成 `input|devices|all` 三个模式；不再自己 mount，
+启动时先检查目录确实是 tmpfs，否则退出，绝不落到宿主 bind 上。
+
+### 2. 删除 GPU 拷贝
+
+零拷贝验证通过后，App 侧整条 GPU 拷贝回退删除：
+
+- 删掉 `render_copy.c/h`、`rcopy_*`、`debug.vdrm.copy`、`is_copy/no_return`；
+- 删掉 STATS 里的 copy/blit 字段；
+- `sc_latch()` 只把池槽直接交给 SF；
+- `.so` 从 76KB 降到 61848 字节。
+
+`vdrm.ko` 里没有 GPU 拷贝；kernel 侧只保留池/翻页/诊断计数器，没有对应代码可删。
+
+### 3. 验证
+
+- `systemctl is-active dev-input.mount dev-snd.mount vdrm-input vdrm-devices sddm` 全 active；
+- `/dev/input`、`/dev/snd` 都是 tmpfs；
+- `/dev/input/event7..9`、`/dev/snd/controlC0`、`/dev/tty0` 正常；
+- App `SET_EVENTFD=0`，音频 monitor 在，空闲不启 AAudio；
+- App STATS 不再有 copy/blit 字段。
+
 ## 本版本第六十项：音频按需 + tick 空闲停 + release worker 降唤醒
 
 ### 1. 音频：容器 open PCM 才启 AAudio

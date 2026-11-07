@@ -1,0 +1,12 @@
+[Unit]
+Description=VDRM: private /dev/input tmpfs
+Before=vdrm-input.service
+
+[Mount]
+What=tmpfs
+Where=/dev/input
+Type=tmpfs
+Options=mode=755
+
+[Install]
+WantedBy=multi-user.target

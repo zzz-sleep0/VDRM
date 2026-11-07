@@ -1,0 +1,12 @@
+[Unit]
+Description=VDRM: private /dev/snd tmpfs
+Before=vdrm-devices.service
+
+[Mount]
+What=tmpfs
+Where=/dev/snd
+Type=tmpfs
+Options=mode=755
+
+[Install]
+WantedBy=multi-user.target
