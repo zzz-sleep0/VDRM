@@ -69,11 +69,20 @@ enable_hw_access=0
 enable_gpu_mode=1
 allow_sandboxing=1
 privileged=nomask
-bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/eventN:/dev/input/eventN,/dev/snd/controlC0:/dev/snd/controlC0
+bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/event7:/dev/input/event7,/dev/input/event8:/dev/input/event8,/dev/input/event9:/dev/input/event9,/dev/snd/controlC0:/dev/snd/controlC0,/dev/snd/pcmC0D0p:/dev/snd/pcmC0D0p,/dev/snd/pcmC0D1c:/dev/snd/pcmC0D1c
 ```
 
 `/dev/input`、`/dev/snd` 也可以整目录 bind，但逐个节点更干净：Android 自己的
-12 个 event 节点和另一张声卡就不会跟着进容器。
+event 节点和另一张声卡就不会跟着进容器。
+
+**event 号要对上 `vdrm-kbd` / `vdrm-ptr` / `vdrm-touch` 这三个名字**，用
+`for e in /sys/class/input/event*/device/name; do echo "$e: $(cat $e)"; done` 查。
+在实测机上是 `event7/8/9`；别把手机自己的设备 bind 进去（`event10` 是耳机 jack、
+`event11` 是按键 jack、`event12` 是 `uinput_nav`，它们没有 udev 数据、不在 seat 里，
+KWin 根本不会用），那样容器里就一个可用输入都没有。
+
+ALSA 节点名也是大小写敏感的：`pcmC0D0p`（小写 p = playback），写成 `pcmC0D0P`
+会 bind 出一个没人认的节点。
 
 **`/dev/tty0..6` 是硬前提，少一个都不行**：logind 判断"这台机器有没有 VT"
 的唯一依据就是 `/dev/tty0` 存不存在（`access("/dev/tty0")`），`CanTTY` 直接由它
