@@ -3,6 +3,23 @@
 > 这里记的是**为什么这么改**：每一项的根因、证据、修法。
 > 只想把模块跑起来的话看 `README.md` 就够了，不必读这份。
 
+## 本版本第六十五项：systemd unit 权限合规
+
+`systemd-analyze verify` 直接报：
+
+```text
+Configuration file /etc/systemd/system/vdrm-udev.service is marked world-writable.
+```
+
+unit 和 sddm/logind 的 drop-in 都是 0666，systemd 不接受这种配置。已全部
+`chmod 644`：
+
+- `/etc/systemd/system/vdrm-udev.service`
+- `/etc/systemd/system/sddm.service.d/override.conf`
+- `/etc/systemd/system/systemd-logind.service.d/debug.conf`
+
+再跑 `systemd-analyze verify` 已无警告。
+
 ## 本版本第六十四项：systemd 只写 udev 数据；重载先停合成器/App，无需软重启
 
 ### 1. systemd 不碰 /dev
