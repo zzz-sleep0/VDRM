@@ -151,13 +151,14 @@ echo 0 > /sys/module/vdrm/parameters/safe_present   # 回到默认
 
 它慢得多，只作排障/兼容用，不是常态。
 
-### 10.4 App 切到后台不再限速
+### 10.4 App 切到后台会显式暂停消费
 
-以前 App 在后台时，present 不来 → flip-done 只能等兜底 → 容器被压到 ~2fps（省电）。
-现在 flip-done 不等 present 了，**后台照样全速**（实测前台 90fps / 后台 88fps）。
-如果容器里在放视频或跑动画而你又把 App 切走了，GPU/CPU 会一直被吃满。
+App 的 `onPause()` 现在会调 `nativeSetPaused(true)`：渲染线程拿到帧立刻 RETURN，
+不 latch、不拷贝，并清掉 present/held/拷贝环。回前台的 `onResume()` 先恢复，
+再 `nativeSetReady()`，`nativeStart()` 末尾也会补一发 `READY`，让内核重推当前帧。
 
-需要省电时的土办法：`echo 1 > safe_present`，副作用正好把后台限速回 2fps 那一档。
+所以后台不再攒帧；回前台如果合成器桌面完全静止，可能只看到 READY 推来的
+那一帧，动鼠标/触摸后继续更新，这是正常的。
 
 ### 10.5 Release 回调要 Android 14+ 的 API
 

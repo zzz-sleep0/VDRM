@@ -3,6 +3,396 @@
 > 这里记的是**为什么这么改**：每一项的根因、证据、修法。
 > 只想把模块跑起来的话看 `README.md` 就够了，不必读这份。
 
+## 本版本第六十项：音频按需 + tick 空闲停 + release worker 降唤醒
+
+### 1. 音频：容器 open PCM 才启 AAudio
+
+之前 `surfaceChanged -> nativeStartAudio` 直接 `audio_start + audio_cap_start`，
+AAudio 输出/输入和麦克风全程常开；真实硬件不是这样。
+
+现在拆成两段：
+
+- App 只打开 `/dev/vdrm-audio` 的 ring，并注册一个 eventfd；
+- 内核在 `vdrm_pcm_open/close`、`vdrm_cap_open/close` 时维护
+  `g_play_users/g_cap_pcm_users`，并 `eventfd_signal()`；
+- App 的 `audio_monitor_thread` 读 `VDRM_AUDIO_GET_STATE`：
+  - `play_users > 0` → `audio_start()`；
+  - 归零 2 秒 → `audio_play_stop()`；
+  - `cap_users > 0` → `audio_cap_start()`；
+  - 归零 → `audio_cap_stop()`。
+
+新增 ABI（`vdrm_audio.h`）：
+
+```c
+struct vdrm_audio_state { __u32 play_users, cap_users, flags, reserved; };
+#define VDRM_AUDIO_SET_EVENTFD _IOW('v', 0x32, int)
+#define VDRM_AUDIO_GET_STATE   _IOR('v', 0x33, struct vdrm_audio_state)
+```
+
+老模块没有这两个 ioctl：App 会打一行 `old module (no GET_STATE), fallback: playback on, capture off`
+并只保留播放；**不再常开麦克风**。容器录音要等新模块加载后再按需启用。
+
+### 2. tick 空闲停
+
+`render_loop` 现在在没有 pending 超过 500ms 时 `tick_stop()`：
+停掉 AChoreographer 线程、关掉 tick eventfd；下一帧事件再 `tick_start()`。
+`tick_stop()` 会 `pthread_join` 并复位 `g_tick_started`，不是重复启动。
+
+### 3. release worker 降唤醒
+
+没有在飞 submission 时，释放线程从 100ms 轮询改成 1000ms；
+有 submission 时仍保持 100ms，避免 stuck 扫描变慢。
+
+### 4. 验证
+
+- 新 App 在老模块上：`audio: ring opened ... idle` 后走 fallback，
+  `audio: AAudio output started` 正常；fallback **不再启动 capture**，
+  麦克风/录音指示不会常亮；
+- tick 空闲停/release 降唤醒已随 `.so` 生效；
+- 新内核模块 `vdrm.ko` 已装到 `/data/adb/modules/vdrm-lkm/`，
+  **手机重启后**才会加载新音频 ABI。
+
+### 5. 产物
+
+- `app/src/main/jniLibs/arm64-v8a/libvdrm_consumer.so` 76344 字节；
+- 源码/头文件/预编译 `.so` 已同步到宿主 `/sdcard/vdrm/app/...`；
+- `vdrm.ko` 1179384 字节，`sha256=9add6799...`，已安装待重启。
+
+## 本版本第五十九项：空闲后首帧不等 tick，救回一个 vsync 的延迟
+
+### 1. 问题
+
+`render_loop` 一直是「一 tick 一 latch」：新帧事件到了，如果当前 Choreographer tick
+已经被上次用过，就 `continue` 等下一拍。这在连续动画里是对的（保证一 tick 一帧），
+但**空闲后的第一帧**也会被白白拖一拍：
+
+- 60Hz：最多 16.7ms；
+- 120Hz：最多 8.3ms。
+
+输入/恢复的第一帧延迟里就包含这一段。
+
+### 2. 修法
+
+`render_loop` 增加 `force_latch`：
+
+- 第一次收到帧（`g_last_ev_ns == 0`），或距离上一帧 ≥50ms（空闲后第一次输入/恢复）；
+- 跳过 tick 等待，直接 latch；
+- 把 `g_tick_used` 对齐到当前 tick，下一帧仍然恢复一 tick 一 latch，不会连续两帧贴进同一拍。
+
+代码位置：
+
+```c
+force_latch = first_ev || ev_gap_ms >= 50;
+...
+if (force_latch) {
+    g_tick_used = __atomic_load_n(&g_tick_seq, __ATOMIC_RELAXED);
+    force_latch = false;
+} else if (g_tick_started && g_tick_on) {
+    ...
+}
+```
+
+连续动画（帧间隔 8–17ms）不会触发，仍然按 vsync 节拍走。
+
+### 3. 验证
+
+升级 .so 后零拷贝默认路径正常：
+
+```
+started (mode 1920x1080) win 2780x1264 6 bufs
+apply2latch=2.2–5.9ms
+latch2present=12.5–13.5ms
+deferred=0
+copy=0/0
+```
+
+首帧后 KWin 进入睡眠时，单次触摸不一定唤醒它；这条路径要等 KWin 亮屏时看
+`apply2latch`/`evgap` 的首帧值。
+
+### 4. 产物
+
+- `libvdrm_consumer.so` 74104 字节，已替换到当前安装 App；
+- 源码和预编译 `.so` 已同步到宿主 `/sdcard/vdrm/app/...`。
+
+## 本版本第五十八项：默认零拷贝 —— GPU 拷贝退为 debug 回退
+
+### 1. 结论
+
+零拷贝路径启动 KDE 验证通过，**默认改为零拷贝**。GPU 拷贝不再是常态路径，只保留
+`debug.vdrm.copy=1` 作为撕裂/兼容性排查的 debug 回退。
+
+### 2. 之前的 A/B 为什么不可信
+
+上一轮 copy/nocopy 对比里，copy 那组实际是 KWin 进入睡眠/空屏状态时测的，
+nocopy 那组是锁屏/亮屏状态；两组的 `frames_pushed`、`latch2present`、GPU 不在同一状态，
+数据没有可比性。
+
+### 3. 零拷贝启动验证
+
+App 先以 `copy=0` 启动，再分别做：
+
+- `systemctl stop sddm; systemctl start sddm`；
+- `droidspaces -n Fedora-43 restart`。
+
+两次都确认：
+
+```
+SDDM active
+kwin_wayland 起来了
+App STATS copy=0/0 blit=0/0
+frames_pushed 持续增长
+KWin 新进程没有 atomic commit / import 错误
+```
+
+旧 KWin 退出时偶尔有一条 `atomic commit failed: Permission denied`，那是 stop 阶段
+旧进程的收尾，不是新 KWin 启动失败。
+
+### 4. 代码改动
+
+`copy_wanted()` 的默认值反转：
+
+```c
+static bool g_copy_mode;   /* 默认 false = zero-copy */
+...
+g_copy_mode = false;
+if (property("debug.vdrm.copy") == "1")
+    g_copy_mode = true;
+```
+
+- 默认：池槽直接交给 SF，不再初始化 `rcopy` 环，不做每帧 EGL blit；
+- `debug.vdrm.copy=1`：恢复旧的 GPU 拷贝路径，用于对比/排障；
+- 旧的 `debug.vdrm.nocopy=1` 仍兼容，效果是强制零拷贝。
+
+`rcopy` 的代码没有删，保留为 debug 路径；默认不初始化，所以默认也省掉目标环内存。
+
+### 5. 验证与产物
+
+- Fedora 容器里 NDK r30 重编，`libvdrm_consumer.so` 74040 字节；
+- 已替换进当前安装 App 的 `lib/arm64`，App 重启后 `copy=0/0`，KDE 正常；
+- 源码和预编译 `.so` 已同步到宿主 `/sdcard/vdrm/app/...`，宿主重打 APK 即可。
+
+## 本版本第五十七项：App 切后台回来卡住 —— READY 被 surface 顺序吃掉，后台也没有显式暂停
+
+### 1. 现象
+
+App 放后台几十秒再回来，画面停在最后一帧；桌面静止时不动鼠标就一直不动。
+日志里能看到：
+
+```
+ready: ioctl (no layer yet)          ← onResume 时 Surface 还没重建
+surface changed -> rebuilt SC
+started ... re-latch last frame
+STATS events=0 shown=0 over 2s       ← 之后没有新帧，直到合成器有 damage
+```
+
+### 2. 根因一：READY 发生在 surface 之前
+
+`MainActivity.onResume()` 先调 `nativeSetReady()`，但切后台再回来时 SurfaceView 的
+`surfaceChanged` 往往在 onResume 之后才到。此时 `g_sc == NULL`，READY 打出的
+当前帧没有图层可接，被丢掉；`nativeStart()` 只把上一帧 `sc_show_last()` 贴回去，
+**没有再 READY**。KDE 桌面静止时没有新 damage，内核没有帧事件，App 就一直
+停在旧帧上。
+
+修法：`nativeStart()` 末尾补 `vdrm_ready()`；同 surface 的纯 resize 分支也补。
+这样 surface 真正可贴之后，内核一定会重推一次当前帧。
+
+### 3. 根因二：后台没有显式暂停
+
+之前靠 present 间隔猜后台，被拖拽卡 0.5s 的问题打回后改成“一律当前台”，于是
+后台期间渲染线程仍然每帧 latch。SF 在后台不消费，present 不来，
+submission/held/present 三张表只会越攒越多；回前台 force 归还只能补救一部分。
+
+修法：
+
+- Java `onPause()` → `nativeSetPaused(handle, true)`；`onResume()` 先
+  `nativeSetPaused(false)` 再 `nativeSetReady()`；
+- native 增加 `g_paused`。渲染循环在 latch 前检查：暂停时直接
+  `return_unsubmitted(target_slot)`，不 latch、不拷贝；暂停时
+  `present_flush()` + `held_expire_force(true)` + `rcopy_release_all()`；
+- `nativeSetReady` 先退出暂停/静默、归还槽，再 READY，最后重贴最后一帧。
+
+### 4. 验证与产物
+
+`app/src/main/jniLibs/arm64-v8a/libvdrm_consumer.so` 已用容器里的 NDK r30 重编。
+
+- 替换已安装 App 的 `lib/arm64/libvdrm_consumer.so` 后，后台 30s 再回来：
+  surface start 后立刻有一帧（READY 生效），之后静止桌面没有新帧是正常的；
+  触摸/移动鼠标时 `frames_pushed` 继续涨。
+- Java 的 pause/resume 需要重打 APK 才生效；源码和预编译 `.so` 已放到宿主
+  `/sdcard/vdrm/app/...`，宿主 `gradlew` 编译安装即可。
+
+### 5. 注意
+
+README 以前说“后台照样全速”；现在 App 会显式暂停消费，后台不再攒帧。
+如果确实要后台继续跑容器动画，不要靠 App 后台消费，应该让 App 保持前台
+或另做保活策略。
+
+## 本版本第五十六项：SDDM 拉起 KDE —— 从“能跑”到走 systemd user 的原生会话
+
+### 1. 第一版只是“能跑”：私有 dbus-run-session 把 KDE 打回 legacy
+
+第一版 `vdrm-sddm-start` 为了绕开 SIGHUP，做了：
+
+```sh
+unset DBUS_SESSION_BUS_ADDRESS
+exec dbus-run-session -- startplasma-wayland
+```
+
+KDE 确实起来了，但 `plasma_session` / `plasmashell` 日志里都是：
+
+```
+Failed to determine systemd version, falling back to extremely legacy forking mode.
+```
+
+原因不是没有 `systemd --user`：`user@0.service` 是 active，PID 734 一直在。
+问题是会话脚本把 PAM 给的 `/run/user/0/bus` 丢掉，另起了一个**私有** session
+bus；`plasma_session` 连不上 user manager，就只能 legacy forking。
+
+### 2. 改回原生：保留 user bus，只留 `trap '' HUP`
+
+SDDM 的 `UserSession::childModifier()` 对 Wayland user session 会：
+
+1. 打开 `/dev/tty$XDG_VTNR`，作为 stdin；
+2. `setsid()`；
+3. `ioctl(TIOCSCTTY)`；
+4. `VT_ACTIVATE`；
+5. 再 exec 会话命令。
+
+会话里的 `dbus-run-session`/KDE fork 脱离控制终端时，内核对旧 session leader
+发 SIGHUP；`/etc/sddm/wayland-session` 的直接子进程被杀，SDDM 认为会话结束，
+关 PAM session 并收掉 KWin。**这个 SIGHUP 是必须处理的**。
+
+但不需要为它另起私有 bus。现在的脚本是：
+
+```sh
+trap '' HUP
+unset LIBSEAT_BACKEND
+export DESKTOP_SESSION=plasma
+exec /usr/libexec/plasma-dbus-run-session-if-needed /usr/bin/startplasma-wayland
+```
+
+- 有 SDDM/PAM 的 `/run/user/0/bus` 时，helper 直接 exec startplasma；
+- 没有 bus 时才自己起 `dbus-run-session` 兜底；
+- `trap '' HUP` 跨 exec 保留，会话包装不会被 SIGHUP 收掉。
+
+### 3. 还要把环境变量给到 systemd --user
+
+KWin 现在由 `plasma-kwin_wayland.service` 拉起，父进程是 `systemd --user`，
+不是 `plasma_session`。`/etc/environment` 只覆盖 PAM/session，user manager
+读不到；所以还要：
+
+```
+/etc/environment.d/10-vdrm.conf
+  MESA_LOADER_DRIVER_OVERRIDE=msm
+  KWIN_DRM_DEVICES=/dev/dri/card1
+```
+
+加完 `systemctl restart user@0.service`（或重启容器）。否则 KWin unit 可能
+拿不到 msm/DRM 设备变量。
+
+### 4. 另一条独立根因：`/run/udev/tags`
+
+容器重启后曾出现 `CanGraphical=no`，seat0 只有 backlight。`/run/udev/data/c226:1`
+里明明有 `Q:master-of-seat`，`udevadm info` 也能看到 tag；但 logind 启动时的
+`sd_device_enumerator_add_match_tag("master-of-seat")` 走的是
+`/run/udev/tags/master-of-seat/<devid>` 空文件。只写 data 不建 tag，枚举为空，
+SDDM 就报 `No graphical seats found`。
+
+`tools/vdrm-container-setup.sh` 现在同时写 data 和 tags；`vdrm-input` 通过
+`Before=systemd-logind.service` 赶在 logind 前跑。input 的父 `inputN` 也要
+`Q:seat`/tag，否则 logind 的 `TakeDevice(13:event_minor)` 仍然 ENODEV。
+
+### 5. 实测（Fedora 43 / KWin 6.7.5 / SDDM 0.21）
+
+```
+session c4
+  Service=sddm-autologin  Leader=sddm-helper
+  VTNr=1  Seat=seat0  TTY=tty1  Active=yes
+
+ps: sddm-helper -> startplasma-wayland
+    ksmserver / plasmashell / kwin_wayland 的父进程 = systemd --user
+systemctl --user list-units:
+  plasma-kwin_wayland.service      active
+  plasma-ksmserver.service         active
+  plasma-plasmashell.service       active
+  plasma-kded6.service             active
+  plasma-polkit-agent.service      active
+  plasma-powerdevil.service        active
+```
+
+`plasma_session` 不再报 legacy；KWin 日志没有 `Could not determine the active
+graphical session`，也没有 `Failed to open /dev/input/eventN`；`frames_pushed` 涨。
+剩下 `upower`/`rtkit`/`bluetooth`/`auditd` 等失败是容器/硬件服务，不是 VDRM。
+
+## 本版本第五十五项：虚拟 VT —— 让 KDE 走回 logind，而不是 NoopSession
+
+### 1. 先排除一个错误方向：`SEATD_VTBOUND=0` 救不了 KWin
+
+KWin 6.7.5 只链 `libdrm`/`libudev`/`libgbm`，**不链 libseat**；它的 session 后端
+只有 `LogindSession` / `ConsoleKitSession` / `NoopSession`。所以 seatd 的非 VT
+seat 对 niri/Hyprland 有用，对 KDE 完全没用。KWin 日志里的
+
+```
+Could not determine the active graphical session
+```
+
+是 `LogindSession::create()` 没拿到 session 后落到 `NoopSession`（直接 open
+`/dev/dri/card1`）。KDE 看起来能出图，但 logind 那边没有 seat、没有 VTNr。
+
+### 2. 根因：GKI 没有 VT，logind 就不给 KWin 一个带 VTNr 的 session
+
+GKI android14-6.1 的 `.config` 是 `# CONFIG_VT is not set`；`/dev/tty0` 和
+`/sys/class/tty/tty0/active` 都不存在。`systemd-logind` 的 `seat_has_vts()` 因此
+为假；`session_prepare_vt()` 也不会去开 `/dev/ttyN`。KWin 的 LogindSession 初始化
+要 `VTNr`，没有 VT 就只能 Noop。
+
+### 3. 修法：在模块里实现 VT 的 uAPI，而不是把 `drivers/tty/vt` 抄进来
+
+`driver/vdrm_vt.c` 注册 major 4 的 tty 驱动，提供：
+
+- `/dev/tty0..6`（`tty_register_device`）
+- `/sys/class/tty/tty0/active`（logind 用 `lseek/read` 读 `ttyN`）
+- `VT_OPENQRY`/`VT_GETSTATE`/`VT_ACTIVATE`/`VT_WAITACTIVE`
+- `VT_GETMODE`/`VT_SETMODE`/`VT_RELDISP`/`VT_ACKACQ`
+- `KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`
+
+不实现 console/fbcon 渲染：图形会话是 `KD_GRAPHICS`，`write` 直接丢弃。内核自带
+VT（`CONFIG_VT=y`）时 major 4 已被占，`tty_register_driver` 返回 `-EBUSY`，模块
+自动跳过（`/sys/module/vdrm/parameters/vt=0` 也能强制关）。
+
+### 4. 容器侧还差两件事：tty 节点、input 的 seat tag
+
+- `/dev/tty0..6`：droidspaces 默认把容器的 `tty1..6` 指向 `/dev/null` 或 tmpfs；
+  `tools/vdrm-container-setup.sh` 现在把它们换成真正的 `4:N` 节点。
+- input：libinput 自己能枚举 eventN，但 logind 的 `TakeDevice(13:minor)` 对 evdev
+  是按 **eventN 的父 inputN** 查 seat 成员的（`session_device_verify()`）。
+  只给 eventN 写 `G:seat` 不够；父 `inputN` 也要 `Q:seat`（current tag）。
+  脚本现在同时写 `c13:<minor>` 和 `+input:inputN`；有 udev 的容器可以用
+  `docs/container/99-vdrm-seat.rules`。
+
+### 5. 实测（Fedora 43 / KWin 6.7.5）
+
+虚拟 VT 加载后，`PAMName=login` + `XDG_SEAT=seat0` + `XDG_VTNR=1` 起 KDE：
+
+```
+loginctl list-sessions
+  c5  0 root seat0 ... user-early
+loginctl show-session c5 -p Seat -p VTNr -p Active
+  VTNr=1
+  Seat=seat0
+  Active=yes
+```
+
+KWin 日志不再有 `Could not determine the active graphical session`，也不再有
+`Failed to open /dev/input/event7 device (No such device)`；`frames_pushed` 正常涨。
+`LIBSEAT_BACKEND=noop` 对 KDE 不是必需品（KWin 不读它）。
+
+### 6. 代价
+
+- tty 打开时模块被 pin 住：`rmmod vdrm` 要先停 KDE/容器里的 logind；
+  这和现有 `/dev/vdrm`、DRM fd 的 pin 行为一致。
+- 虚拟 VT 没有文本 console/fbcon；要文本终端请用合成器里的终端，不是 VT。
+
 ## 本版本第五十四项：`vdrm_gbm.so` 进 CI 构建 + 失败要说人话
 
 `vdrm_gbm.so` 是容器里的 **GBM 后端**（不是普通链接库）：libgbm 按 card1 的驱动名

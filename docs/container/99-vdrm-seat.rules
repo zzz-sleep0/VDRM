@@ -1,0 +1,21 @@
+# 装进容器：/etc/udev/rules.d/99-vdrm-seat.rules
+#
+# 让 vdrm 的虚拟输入设备成为 seat0 的成员。
+#
+# 为什么需要：libinput 自己能枚举 /dev/input/eventN，但 KWin 的 LogindSession
+# 走 logind 的 TakeDevice(13:minor)，logind 的 session_device_verify() 对 evdev
+# 是按 eventN 的【父 inputN】去 seat 设备表里查的。只给 eventN 打 seat 标签不够，
+# 父 inputN 也必须是 seat 成员；否则 KWin 日志是：
+#     Failed to open /dev/input/eventN device (No such device)
+# （画面正常、键鼠触控全丢，很容易误判成 libinput 问题。）
+#
+# 没有 udev / /sys 只读的容器不用装这个：tools/vdrm-container-setup.sh 会直接
+# 写 /run/udev/data（eventN 的 c13:* 和父设备的 +input:inputN），效果一样。
+
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="vdrm-kbd",   TAG+="seat"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="vdrm-ptr",   TAG+="seat"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="vdrm-touch", TAG+="seat"
+
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="input*", ATTRS{name}=="vdrm-kbd",   TAG+="seat"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="input*", ATTRS{name}=="vdrm-ptr",   TAG+="seat"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="input*", ATTRS{name}=="vdrm-touch", TAG+="seat"

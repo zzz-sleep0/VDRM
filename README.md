@@ -19,8 +19,14 @@ Hyprland / sway）直接画在上面，App 负责显示、虚拟键鼠和声音�
 
 ```sh
 su -c 'lsmod | grep ^vdrm'
-ls -l /dev/vdrm        # crw-rw-rw-
+ls -l /dev/vdrm                    # crw-rw-rw-
+ls -l /sys/class/tty/tty0/active   # VT-less 内核上由模块提供
+grep vdrm-vt /proc/tty/drivers     # vdrm-vt /dev/tty 4 0-6 console
 ```
+
+模块在 `CONFIG_VT=n` 的内核上注册 major 4 的虚拟 VT（`/dev/tty0..6`）；
+内核自带 VT 时 major 4 已被占，模块自动跳过，用原生的。`/sys/module/vdrm/parameters/vt`
+可以关掉它（0）。
 
 ## 2. 建容器
 
@@ -41,13 +47,16 @@ MESA_LOADER_DRIVER_OVERRIDE=msm
 LIBSEAT_BACKEND=noop
 ```
 
+`LIBSEAT_BACKEND=noop` 只对 niri / Hyprland 有意义；KWin 6.7 不链 libseat，
+它走 logind（见第 5 节），不需要这一行。
+
 `enable_hw_access` 保持 0：开了之后容器里 `/sys` 可写，装驱动可能把整机软重启。
 代价是容器里没有 udev，所以下一步用 systemd oneshot 顶替。
 
 ## 3. 容器里装节点服务
 
 用 systemd 顶替 udev：把下面这个脚本装成 oneshot，开机建 `/dev/input`、
-`/dev/snd` 和 `/run/udev/data` 属性。
+`/dev/snd`、`/dev/tty0..6` 和 `/run/udev/data` 属性。
 
 ```sh
 # 脚本（也在仓库 tools/ 里）
@@ -58,7 +67,9 @@ cat > /etc/systemd/system/vdrm-input.service <<'EOF'
 [Unit]
 Description=vdrm: only expose the virtual input devices
 After=local-fs.target
-Before=display-manager.service
+# 必须在 logind 之前写好 card 的 master-of-seat 和输入设备的 seat 属性；
+# 否则 SDDM 会报 "No graphical seats found"，KWin 也拿不到 card/input。
+Before=systemd-logind.service display-manager.service
 
 [Service]
 Type=oneshot
@@ -71,20 +82,25 @@ EOF
 systemctl enable --now vdrm-input
 ```
 
-它依次做三件事：`mount --make-rprivate /dev` 后用 tmpfs 顶掉 `/dev/input`、
+它依次做四件事：`mount --make-rprivate /dev` 后用 tmpfs 顶掉 `/dev/input`、
 `/dev/snd`；mknod 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）；
-写 `/run/udev/data/c13:<minor>` 的 `ID_INPUT*`（缺了 libinput 会直接跳过设备）。
+把 droidspaces 预置的 `/dev/tty1..6`（`/dev/null` 或 tmpfs）换成真正的 `4:N`；
+写 `/run/udev/data/c13:<minor>` 的 `ID_INPUT*` + `G/Q:seat`，以及父
+`inputN` 的 `+input:inputN`（只给 eventN 不够：logind 的 `TakeDevice` 是按父
+`inputN` 查 seat 的）。
 
 ```sh
 systemctl is-active vdrm-input      # active
 ls /dev/input/                      # event7/8/9 + vdrm-kbd/ptr/touch
+ls -l /dev/tty0 /dev/tty1           # 4,0 / 4,1
 ```
 
 ⚠️ 别在容器里 `rm`/`chmod` `/dev/input`、`/dev/snd`：那是宿主机目录的 bind mount，
 同一批 inode，删掉宿主机上就真没了（会让 Android 失去触摸）。脚本会先挂 tmpfs 并
 用自己的 fsname 确认挂上才动手。
 
-模块重载后 `eventN` 编号会变：`systemctl restart vdrm-input`。
+模块重载后 `eventN` 编号会变：`systemctl restart vdrm-input`；KDE 也要重启
+（`systemctl restart vdrm-kde`，必要时先 `loginctl kill-session`）。
 
 ## 4. 装 Mesa / GBM / 合成器
 
@@ -109,10 +125,18 @@ cat > /etc/systemd/system/vdrm-kde.service <<'EOF'
 [Unit]
 Description=VDRM: KDE session on the virtual display
 After=systemd-user-sessions.service vdrm-input.service
+Wants=vdrm-input.service
 
 [Service]
 Type=simple
+# 走标准 logind 会话：内核模块在 CONFIG_VT=n 的内核上提供虚拟 VT
+# （/dev/tty0..6 + /sys/class/tty/tty0/active），KWin 才会用 LogindSession，
+# 而不是 NoopSession（直接 open card1）。
+PAMName=login
 Environment=XDG_RUNTIME_DIR=/tmp/xdg
+Environment=XDG_SEAT=seat0
+Environment=XDG_VTNR=1
+Environment=XDG_SESSION_TYPE=wayland
 Environment=KWIN_DRM_DEVICES=/dev/dri/card1
 Environment=MESA_LOADER_DRIVER_OVERRIDE=msm
 ExecStartPre=/bin/sh -c "install -d -m 700 /tmp/xdg"
@@ -128,16 +152,67 @@ systemctl enable --now vdrm-kde
 ```
 
 日常操作就是 `systemctl start vdrm-kde` / `stop` / `status`，开机（容器启动）自动起。
+带 `PAMName` 后 `stop` 只杀 unit cgroup；KWin 在 logind 的 session scope 里，可能
+还活着 —— 停之前先 `loginctl list-sessions` 找到它，`loginctl kill-session <id>`
+（或直接 `pkill -9 -x kwin_wayland`）。
 
-确认出图：
+确认出图、并确认走的是 logind：
 
 ```sh
 pgrep -c -x kwin_wayland                        # 1
 cat /sys/module/vdrm/parameters/frames_pushed   # 动鼠标要涨
 cat /sys/module/vdrm/parameters/active
+
+loginctl list-sessions                          # 应有一条 SEAT=seat0
+journalctl -b | grep "Could not determine the active graphical session"
+                                                # 不该出现；出现就是退回 NoopSession 了
 ```
 
+模块有原生的 `/sys/class/tty/tty0/active`（没有 VT 的内核由 `vdrm_vt.c` 提供）时，
+第 3 节脚本会给容器建 `/dev/tty0..6` 并写 seat 属性；`CanTTY=yes` 之后
+`PAMName=login` + `XDG_VTNR=1` 才会成功。
+
 换合成器就把 `ExecStart` 换成 `niri` / `Hyprland` / `sway`。
+
+### 5.1 用 SDDM 在启动阶段拉起（Fedora 43 / SDDM 0.21 实测）
+
+也可以让 SDDM 自动登录，直接进 KDE；KWin 同样走 `LogindSession`。仓库
+`docs/container/sddm/` 里有现成文件，安装步骤见
+[`docs/container/sddm/README.md`](docs/container/sddm/README.md)。核心是三件事：
+
+- `vdrm-input.service` 里加 `Before=systemd-logind.service`，并确保是**新脚本**
+  （会写 `/run/udev/data`、`/run/udev/tags`、父 `inputN`）；
+- 用 `tools/vdrm-sddm-start.sh` 包装会话：`trap '' HUP`、清 `LIBSEAT_BACKEND`，
+  **保留** SDDM/PAM 给的 `DBUS_SESSION_BUS_ADDRESS=/run/user/0/bus`，然后
+  `plasma-dbus-run-session-if-needed startplasma-wayland`。不 `trap` 的话，
+  dbus/KDE 的 fork 会让内核给旧 session leader 发 SIGHUP，会话包装被杀，
+  SDDM 就当成“会话结束”把 KWin 一起收掉；
+- `/etc/environment`、`/etc/environment.d/10-vdrm.conf` 和
+  `sddm.service.d/override.conf` 里都要有
+  `KWIN_DRM_DEVICES=/dev/dri/card1`、`MESA_LOADER_DRIVER_OVERRIDE=msm`。
+  `environment.d` 是给 `systemd --user` 的，否则
+  `plasma-kwin_wayland.service` 拿不到这两个变量。
+
+```sh
+# 按 docs/container/sddm/README.md 装完文件后：
+usermod -aG droidspaces-gpu sddm
+systemctl daemon-reload
+systemctl enable sddm
+systemctl disable --now vdrm-kde
+systemctl restart user@0.service   # 让 systemd --user 读 environment.d
+# 重启容器
+```
+
+`vdrm-kde.service` 和 `sddm` 不要同时 enable：两者都会抢 card1。
+
+验证 KDE 的 user unit 是原生的：
+
+```sh
+XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+  systemctl --user list-units | grep -E 'plasma-(kwin|ksmserver|plasmashell|kded)'
+# 期望 plasma-kwin_wayland.service / plasma-ksmserver.service /
+#      plasma-plasmashell.service 都是 active；KWin 的父进程是 systemd --user
+```
 
 ## 6. 装 App
 

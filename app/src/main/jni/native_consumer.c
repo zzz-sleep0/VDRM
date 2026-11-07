@@ -309,40 +309,10 @@ static size_t submission_count(void);
 static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh);
 static void vdrm_return(int id);
 
-/* 后台静默：App 不在前台时 SF 不再消费，present 间隔会拉大。这个状态下一帧
- * 都不 latch（拿到就把槽还给内核，连拷贝都不做），于是后台什么都不攒，
- * 回到前台时槽状态和离开时一样。判定不用改 Java：present 间隔 > 300ms 就算
- * 后台，nativeSetReady（回前台）会清掉。*/
-static atomic_bool g_quiet;
-
-static bool quiet_now(void)
-{
-    /* 【暂时禁用】靠 present 间隔判后台是不可靠的：桌面静止时 present 也会停，
-     * 于是被误判成后台 -> 拖拽的头几帧被丢，等探针才更新（实测拖拽卡 0.5s）。
-     * 真正的后台信号要接 Java 的 onPause/onResume（nativeSetPaused），在那之前
-     * 一律当"前台"：不丢帧，回前台的恢复靠 nativeSetReady 里的强制归还。*/
-    return false;
-}
-
-/* 静默期间每 ~1 秒仍然 latch 一帧当探针：有 present 回来就说明已回前台
- * （present 会把 g_quiet 清掉），否则继续静默。没有这个探针就会永远卡在
- * 静默里 —— 不 latch 就没有 present，没有 present 就退不出来。*/
-static bool probe_due(void)
-{
-    static unsigned long n;
-    return (++n % 60) == 0;
-}
+/* Java onPause/onResume 的显式后台信号。*/
+static atomic_bool g_paused;
 
 static void on_present(void *context, ASurfaceTransactionStats *stats);
-static void quiet_tick(void)
-{
-    static uint64_t last_ms;
-    uint64_t now = now_ms();
-
-    if (last_ms && now - last_ms > 300)
-        atomic_store(&g_quiet, true);
-    last_ms = now;
-}
 
 static void vdrm_presented(int id);
 
@@ -465,7 +435,10 @@ static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh)
  * 内核 flip-done 不等 present 了，合成器随时可能重画池槽，所以每一帧都
  * 把内容 blit 到我们自己的目标环再交给 SF；池槽在 blit 完成的那一刻就
  * RETURN 给内核（内容已经消费掉，合成器怎么重画都不会撕）。*/
-static bool g_copy_mode = true;   /* debug.vdrm.nocopy=1 可临时关掉做 A/B */
+/* 默认零拷贝：池槽直接交给 SF，少一次 GPU blit、少一个目标环。
+ * GPU 拷贝只在排查撕裂/兼容性时用 debug.vdrm.copy=1 打开。
+ * （旧的反向开关 debug.vdrm.nocopy=1 仍兼容，但默认已经是关拷贝。）*/
+static bool g_copy_mode;          /* 默认 false = zero-copy */
 static bool g_copy_mode_init;
 
 static bool copy_wanted(void)
@@ -474,6 +447,10 @@ static bool copy_wanted(void)
         char v[PROP_VALUE_MAX];
 
         g_copy_mode_init = true;
+        g_copy_mode = false;
+        v[0] = 0;
+        if (__system_property_get("debug.vdrm.copy", v) > 0 && v[0] == '1')
+            g_copy_mode = true;
         v[0] = 0;
         if (__system_property_get("debug.vdrm.nocopy", v) > 0 && v[0] == '1')
             g_copy_mode = false;
@@ -796,11 +773,17 @@ struct consumer {
     int event_fd;        /* eventfd, KPM → us */
     uint32_t last_seq;
 
-    /* Audio: /dev/vdrm-audio ring -> AAudio */
+    /* Audio: /dev/vdrm-audio ring -> AAudio
+     * 默认只打开 ring + monitor；容器真开 PCM 时才启 AAudio。
+     * 老模块没有 GET_STATE/eventfd 时 audio_legacy=1，退回常开。*/
     pthread_t play_thr;
     pthread_t cap_thr;
+    pthread_t audio_mon_thr;
     volatile bool audio_running;
+    volatile bool audio_mon_running;
+    bool audio_legacy;
     int audio_fd;
+    int audio_ev_fd;
     void *audio_map;
     size_t audio_map_len;
     AAudioStream *play_stream;
@@ -911,7 +894,6 @@ struct vdrm_present_req { uint32_t id; uint32_t flags; };
 
 static void vdrm_presented(int id)
 {
-    atomic_store(&g_quiet, false);   /* 有帧真的上屏了 => 已经在前台 */
     struct vdrm_present_req req;
 
     memset(&req, 0, sizeof(req));
@@ -1281,7 +1263,10 @@ static void *release_worker(void *arg)
 
         if (wait_n == 0 && pres_n == 0) {
             struct pollfd w = { .fd = g_release_worker_fd, .events = POLLIN };
-            r = poll(&w, 1, 100);   /* 100ms 醒一次，给 stuck 扫描用 */
+            /* 没有在飞的 submission 时 1s 才醒一次；有 submission
+             * （可能还没进 wait/pres 的 stuck 项）才用 100ms 扫描。*/
+            int tmo = submission_count() ? 100 : 1000;
+            r = poll(&w, 1, tmo);
             if (r > 0)
                 drain_eventfd(g_release_worker_fd);
             continue;
@@ -1673,7 +1658,6 @@ static AChoreographer  *g_choreo;
 static ALooper         *g_tick_looper;
 static pthread_t        g_tick_tid;
 static int              g_tick_started;
-static unsigned long long g_tick_defer;
 
 static void tick_cb(int64_t frame_time_ns, void *data)
 {
@@ -1732,6 +1716,8 @@ static void tick_start(void)
 
 static void tick_stop(void)
 {
+    if (!g_tick_started)
+        return;
     g_tick_on = 0;
     if (g_tick_looper)
         ALooper_wake(g_tick_looper);
@@ -1740,6 +1726,12 @@ static void tick_stop(void)
         ssize_t r = write(g_tick_fd, &one, sizeof(one));
         (void)r;
     }
+    pthread_join(g_tick_tid, NULL);
+    if (g_tick_fd >= 0) {
+        close(g_tick_fd);
+        g_tick_fd = -1;
+    }
+    g_tick_started = 0;
 }
 
 static void *render_loop(void *arg)
@@ -1748,10 +1740,13 @@ static void *render_loop(void *arg)
     LOGI("render loop started");
     tick_start();
     int loop_count = 0;
+    uint64_t last_event_ms = now_ms();
     uint64_t stat_ev = 0, stat_show = 0;
     uint32_t prev_show_seq = 0;
     struct vdrm_frame_event pending = {0};
     bool have_pending = false;
+    /* 空闲/恢复后的第一帧不等下一拍，直接 latch；后续仍一 tick 一 latch。*/
+    bool force_latch = false;
     uint64_t stat_deferred = 0;
     time_t stat_t0 = time(NULL);
     uint64_t last_mode_check_ms = 0;
@@ -1831,12 +1826,16 @@ static void *render_loop(void *arg)
          * 逐条 FIFO 消费时，一旦有小突发就会去显示已过期的旧帧 → 视觉上"倒带重播"。*/
         struct vdrm_frame_event ev, latest;
         int got = 0;
+        uint64_t ev_gap_ms = 0;
+        bool first_ev = false;
         {
             uint64_t n = mono_ns();
 
-            if (g_last_ev_ns) {
+            first_ev = (g_last_ev_ns == 0);
+            if (!first_ev) {
                 unsigned long long ms = (n - g_last_ev_ns) / 1000000ull;
 
+                ev_gap_ms = ms;
                 if (ms > g_ev_gap_max_ms)
                     g_ev_gap_max_ms = ms;
                 if (ms > 40)
@@ -1869,17 +1868,32 @@ static void *render_loop(void *arg)
             for (int i = 0; i < drained_count; i++)
                 if (drained_ids[i] != pending.id) return_unsubmitted(drained_ids[i]);
             stat_ev++;
+            last_event_ms = now_ms();
+            if (!g_tick_started)
+                tick_start();
+            /* 首帧，或距离上一帧 >=50ms（空闲后第一次输入/恢复）：不等 tick。*/
+            force_latch = first_ev || ev_gap_ms >= 50;
         }
-        if (!have_pending) continue;
+        if (!have_pending) {
+            /* 空闲 500ms 后停掉 Choreographer 回调线程；有帧事件再拉起。*/
+            if (g_tick_started && now_ms() - last_event_ms > 500)
+                tick_stop();
+            continue;
+        }
 
         /* anland 对齐：一 vsync 一 latch。
          * 没有新的 Choreographer 拍就把 pending 留着（poll 会被 tick_fd 叫醒），
          * 超过 100ms 没拍就放行兜底；tick 通道起不来时完全不拦。*/
-        if (g_tick_started && g_tick_on) {
+        if (force_latch) {
+            /* 空闲后的首帧直接 latch，救掉最多一整个 vsync 的延迟。
+             * 把 tick 游标对齐到当前拍，下一帧仍然是一 tick 一 latch，
+             * 不会连续两帧贴进同一拍。*/
+            g_tick_used = __atomic_load_n(&g_tick_seq, __ATOMIC_RELAXED);
+            force_latch = false;
+        } else if (g_tick_started && g_tick_on) {
             int tk = __atomic_load_n(&g_tick_seq, __ATOMIC_RELAXED);
 
             if (tk == g_tick_used && now_ms() - g_tick_ms < 100) {
-                g_tick_defer++;
                 continue;
             }
             g_tick_used = tk;
@@ -1952,6 +1966,13 @@ static void *render_loop(void *arg)
             continue;
         }
 
+        if (atomic_load(&g_paused)) {
+            /* 后台：不 latch、不拷贝，槽立刻还内核，回前台统一 READY。*/
+            have_pending = false;
+            return_unsubmitted(target_slot);
+            continue;
+        }
+
         LDBG("setbuf slot=%u ahb=%p", target_slot, (void *)ahb);
         pthread_mutex_lock(&g_geometry_lock);
         /* 尾帧护栏：内核在 pipe_update 里已经按 g_active 过滤过一道，这里
@@ -1971,14 +1992,6 @@ static void *render_loop(void *arg)
                 return_unsubmitted(target_slot);
                 continue;
             }
-        }
-
-        quiet_tick();          /* present 断太久 = 在后台 */
-        if (quiet_now() && !probe_due()) {
-            /* 后台：内容没人看，直接归还，绝不攒状态。*/
-            pthread_mutex_unlock(&g_geometry_lock);
-            return_unsubmitted(target_slot);
-            continue;
         }
 
         bool shown = sc_latch(ahb, target_slot, (uint32_t)c->mode_w,
@@ -2098,15 +2111,13 @@ static void *audio_play_thread(void *arg)
     return NULL;
 }
 
-static int audio_start(struct consumer *c)
+static int audio_ring_open(struct consumer *c)
 {
     struct vdrm_audio_info info;
     void *map;
     int fd;
-    AAudioStreamBuilder *b = NULL;
-    AAudioStream *s = NULL;
 
-    if (c->audio_running)
+    if (c->audio_fd >= 0)
         return 0;
     fd = open("/dev/vdrm-audio", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -2126,67 +2137,16 @@ static int audio_start(struct consumer *c)
         close(fd);
         return -1;
     }
-    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK)
-        goto err;
-    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
-    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setSampleRate(b, info.rate);
-    AAudioStreamBuilder_setChannelCount(b, info.channels);
-    AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_MEDIA);
-    AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
-    if (AAudioStreamBuilder_openStream(b, &s) != AAUDIO_OK)
-        goto err;
-    AAudioStreamBuilder_delete(b);
-    b = NULL;
-    if (AAudioStream_requestStart(s) != AAUDIO_OK) {
-        AAudioStream_close(s);
-        goto err_map;
-    }
-
     c->audio_fd = fd;
     c->audio_map = map;
     c->audio_map_len = info.header_size + info.size;
-    c->play_stream = s;
-    c->audio_running = true;
-    if (pthread_create(&c->play_thr, NULL, audio_play_thread, c) != 0) {
-        c->audio_running = false;
-        AAudioStream_close(s);
-        c->play_stream = NULL;
-        /* err_map 会 munmap/close；这里必须先清掉，否则 audio_stop() 会二次
-         * munmap 同一个地址、close 一个可能已被复用的 fd。 */
-        c->audio_fd = -1;
-        c->audio_map = NULL;
-        c->audio_map_len = 0;
-        goto err_map;
-    }
-    LOGI("audio: started %u Hz %u ch, ring %u", info.rate, info.channels, info.size);
+    LOGI("audio: ring opened %u Hz %u ch, ring %u (idle until PCM opens)",
+         info.rate, info.channels, info.size);
     return 0;
-err:
-    if (b)
-        AAudioStreamBuilder_delete(b);
-err_map:
-    munmap(map, info.header_size + info.size);
-    close(fd);
-    return -1;
 }
 
-static void audio_cap_stop(struct consumer *c);
-
-static void audio_stop(struct consumer *c)
+static void audio_ring_close(struct consumer *c)
 {
-    audio_cap_stop(c);
-    if (!c->audio_running && c->audio_fd < 0)
-        return;
-    if (c->audio_running) {
-        c->audio_running = false;
-        pthread_join(c->play_thr, NULL);
-    }
-    if (c->play_stream) {
-        AAudioStream_requestStop(c->play_stream);
-        AAudioStream_close(c->play_stream);
-        c->play_stream = NULL;
-    }
     if (c->audio_map) {
         munmap(c->audio_map, c->audio_map_len);
         c->audio_map = NULL;
@@ -2195,6 +2155,178 @@ static void audio_stop(struct consumer *c)
         close(c->audio_fd);
         c->audio_fd = -1;
     }
+    c->audio_map_len = 0;
+}
+
+static void audio_play_stop(struct consumer *c)
+{
+    if (c->audio_running) {
+        c->audio_running = false;
+        pthread_join(c->play_thr, NULL);
+    }
+    if (c->play_stream) {
+        AAudioStream_requestStop(c->play_stream);
+        AAudioStream_close(c->play_stream);
+        c->play_stream = NULL;
+        LOGI("audio: AAudio output stopped (PCM closed/idle)");
+    }
+}
+
+static int audio_cap_start(struct consumer *c);
+static void audio_cap_stop(struct consumer *c);
+
+static int audio_start(struct consumer *c)
+{
+    struct vdrm_audio_info info;
+    AAudioStreamBuilder *b = NULL;
+    AAudioStream *s = NULL;
+    int rc;
+
+    if (c->audio_running)
+        return 0;
+    if (audio_ring_open(c) < 0)
+        return -1;
+    if (ioctl(c->audio_fd, VDRM_AUDIO_GET_INFO, &info) < 0 ||
+        info.magic != VDRM_AUDIO_MAGIC) {
+        LOGE("audio: GET_INFO failed");
+        return -1;
+    }
+    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK)
+        return -1;
+    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setSampleRate(b, info.rate);
+    AAudioStreamBuilder_setChannelCount(b, info.channels);
+    AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_MEDIA);
+    AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
+    if (AAudioStreamBuilder_openStream(b, &s) != AAUDIO_OK) {
+        LOGE("audio: openStream failed");
+        AAudioStreamBuilder_delete(b);
+        return -1;
+    }
+    AAudioStreamBuilder_delete(b);
+    if (AAudioStream_requestStart(s) != AAUDIO_OK) {
+        AAudioStream_close(s);
+        return -1;
+    }
+
+    c->play_stream = s;
+    c->audio_running = true;
+    rc = pthread_create(&c->play_thr, NULL, audio_play_thread, c);
+    if (rc != 0) {
+        c->audio_running = false;
+        AAudioStream_close(s);
+        c->play_stream = NULL;
+        return -1;
+    }
+    LOGI("audio: AAudio output started %u Hz %u ch", info.rate, info.channels);
+    return 0;
+}
+
+static void *audio_monitor_thread(void *arg)
+{
+    struct consumer *c = arg;
+    uint64_t last_play = 0;
+
+    while (c->audio_mon_running) {
+        if (c->audio_ev_fd >= 0) {
+            struct pollfd p = { .fd = c->audio_ev_fd, .events = POLLIN };
+            uint64_t v;
+
+            if (poll(&p, 1, 1000) > 0)
+                while (read(c->audio_ev_fd, &v, sizeof(v)) > 0) { }
+        } else {
+            usleep(500000);
+        }
+
+        struct vdrm_audio_state st;
+        if (ioctl(c->audio_fd, VDRM_AUDIO_GET_STATE, &st) < 0) {
+            if (!c->audio_legacy) {
+                c->audio_legacy = true;
+                LOGW("audio: old module (no GET_STATE), fallback: playback on, capture off");
+                audio_start(c);
+                /* 旧模块没有 capture 计数，无法按需；这里绝不常开麦克风。
+                 * 容器录音要等新模块加载后再启用。 */
+            }
+            continue;
+        }
+
+        uint64_t now = now_ms();
+
+        if (st.play_users) {
+            last_play = now;
+            if (!c->audio_running)
+                audio_start(c);
+        } else if (c->audio_running && now - last_play > 2000) {
+            audio_play_stop(c);
+        }
+
+        if (st.cap_users) {
+            if (!c->cap_running)
+                audio_cap_start(c);
+        } else if (c->cap_running) {
+            audio_cap_stop(c);
+        }
+    }
+    return NULL;
+}
+
+static int audio_monitor_start(struct consumer *c)
+{
+    int ev;
+
+    if (c->audio_mon_running)
+        return 0;
+    if (audio_ring_open(c) < 0)
+        return -1;
+
+    ev = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (ev >= 0) {
+        if (ioctl(c->audio_fd, VDRM_AUDIO_SET_EVENTFD, &ev) < 0) {
+            LOGW("audio: SET_EVENTFD failed (%s), polling", strerror(errno));
+            close(ev);
+            ev = -1;
+        }
+    }
+    c->audio_ev_fd = ev;
+    c->audio_legacy = false;
+    c->audio_mon_running = true;
+    if (pthread_create(&c->audio_mon_thr, NULL, audio_monitor_thread, c) != 0) {
+        c->audio_mon_running = false;
+        if (c->audio_ev_fd >= 0) {
+            close(c->audio_ev_fd);
+            c->audio_ev_fd = -1;
+        }
+        return -1;
+    }
+    LOGI("audio: monitor started (output/input on demand)");
+    return 0;
+}
+
+static void audio_monitor_stop(struct consumer *c)
+{
+    if (!c->audio_mon_running)
+        return;
+    c->audio_mon_running = false;
+    if (c->audio_ev_fd >= 0) {
+        uint64_t one = 1;
+        ssize_t r = write(c->audio_ev_fd, &one, sizeof(one));
+        (void)r;
+    }
+    pthread_join(c->audio_mon_thr, NULL);
+    if (c->audio_ev_fd >= 0) {
+        close(c->audio_ev_fd);
+        c->audio_ev_fd = -1;
+    }
+}
+
+static void audio_stop(struct consumer *c)
+{
+    audio_monitor_stop(c);
+    audio_play_stop(c);
+    audio_cap_stop(c);
+    audio_ring_close(c);
 }
 
 /* 采集：AAudio INPUT 录到的帧 -> /dev/vdrm-audio-in 的共享环。
@@ -2339,6 +2471,7 @@ static void audio_cap_stop(struct consumer *c)
         AAudioStream_requestStop(c->cap_stream);
         AAudioStream_close(c->cap_stream);
         c->cap_stream = NULL;
+        LOGI("audio-in: capture stopped (PCM closed)");
     }
     if (c->cap_map) {
         munmap(c->cap_map, c->cap_map_len);
@@ -2998,6 +3131,8 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
             g_last_h == (uint32_t)c->mode_h)
             sc_show_last((uint32_t)c->screen_w, (uint32_t)c->screen_h);
         pthread_mutex_unlock(&g_geometry_lock);
+        /* 纯 resize 不会重建 SC，但同样需要让内核重推一次当前帧。*/
+        vdrm_ready();
         return;
     }
     /* 输入守护进程改到下面随池一起拉起（启动即建），不再等第一次按键。*/
@@ -3158,6 +3293,11 @@ Java_com_vdrm_consumer_Native_nativeStart(JNIEnv *env, jclass clazz,
 
     LOGI("started (mode %dx%d) win %dx%d %d bufs",
          c->mode_w, c->mode_h, c->screen_w, c->screen_h, c->buf_count);
+
+    /* 回前台的 onResume 往往先于 surfaceChanged：那时 nativeSetReady 只打出
+     * "no layer yet"，READY 的帧被丢掉。Surface 真正 start 完必须再补一发，
+     * 否则静态桌面没有新 damage，App 就停在最后一帧上（"卡住"）。*/
+    vdrm_ready();
 }
 
 JNIEXPORT void JNICALL
@@ -3197,11 +3337,9 @@ Java_com_vdrm_consumer_Native_nativeStartAudio(JNIEnv *env, jclass clazz, jlong 
 {
     struct consumer *c = STATE(handle);
     if (!c) return;
-    if (audio_start(c) < 0)
-        LOGE("audio: start failed");
-    /* 采集单独一条流：播放失败不该连累麦克风，反之亦然 */
-    if (audio_cap_start(c) < 0)
-        LOGW("audio-in: 采集没起来（看上面日志）");
+    /* 只开 ring + monitor；AAudio 输出/采集由 monitor 按容器 PCM open 启停。 */
+    if (audio_monitor_start(c) < 0)
+        LOGE("audio: monitor start failed");
 }
 
 JNIEXPORT void JNICALL
@@ -3211,6 +3349,30 @@ Java_com_vdrm_consumer_Native_nativeStopAudio(JNIEnv *env, jclass clazz, jlong h
     if (!c) return;
     audio_stop(c);
 }
+/* Java 侧 onPause 调的：App 进后台。
+ *
+ * 后台时 SF 不再消费我们的图层，继续 latch 只会让 submission/held/present
+ * 三张表越攒越多；每帧都 RETURN 才是干净状态。present fence 全部 flush，
+ * 等 release 的槽立即归还，拷贝目标环也放掉。回前台 nativeSetReady 会
+ * 重新 READY + 重贴最后一帧。*/
+JNIEXPORT void JNICALL
+Java_com_vdrm_consumer_Native_nativeSetPaused(JNIEnv *env, jclass clazz,
+                                              jlong handle, jboolean paused)
+{
+    (void)env; (void)clazz; (void)handle;
+
+    if (paused) {
+        atomic_store(&g_paused, true);
+        present_flush();
+        held_expire_force(true);
+        rcopy_release_all();
+        LOGI("paused: flush present/held/copy");
+    } else {
+        atomic_store(&g_paused, false);
+        LOGI("resumed: render allowed");
+    }
+}
+
 /* Java 侧 onResume 调的：App 回到前台，"就绪"。
  *
  * 后台时 SF 不再合成我们这层 → present 不来 → 内核的帧事件只能等存活超时
@@ -3229,16 +3391,17 @@ Java_com_vdrm_consumer_Native_nativeSetReady(JNIEnv *env, jclass clazz, jlong ha
     (void)env; (void)clazz;
     if (vdrm_open() != 0)
         return;
+
+    /* 回前台：先退出暂停/静默，把后台期间攒下的"等 release"槽全部还给内核，
+     * 再 READY —— 顺序反了的话，内核可能先推来一帧又被 DISPL 槽卡住。*/
+    atomic_store(&g_paused, false);
+    held_expire_force(true);
+    rcopy_release_all();
+
     /* 老模块没有这个 ioctl → ENOTTY，当没事发生（画面靠下一帧自然恢复）。*/
     if (ioctl(g_vdrm_fd, VDRM_IOCTL_READY, &one) < 0 && errno != ENOTTY &&
         errno != EINVAL)
         LOGW("READY ioctl err=%d", errno);
-
-    /* 回前台：退出静默 + 把后台期间攒下的"等 release"槽全部还给内核，
-     * 否则合成器要等 6 秒的 dumb_create。*/
-    atomic_store(&g_quiet, false);
-    held_expire_force(true);
-    rcopy_release_all();
 
     if (c && g_sc) {
         pthread_mutex_lock(&g_geometry_lock);

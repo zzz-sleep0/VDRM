@@ -20,6 +20,13 @@ struct vdrm_audio_info {
 	__u32 header_size;
 };
 
+struct vdrm_audio_state {
+	__u32 play_users;   /* container playback PCM open count */
+	__u32 cap_users;    /* container capture PCM open count */
+	__u32 flags;
+	__u32 reserved;
+};
+
 struct vdrm_audio_ring {
 	__u32 magic;
 	__u32 size;       /* data bytes */
@@ -35,5 +42,10 @@ struct vdrm_audio_ring {
 #define VDRM_AUDIO_GET_INFO _IOR('v', 0x30, struct vdrm_audio_info)
 /* App 每消费一段（更新 tail）后调用：让内核推一次 hw_ptr 并叫醒 ALSA 写者。 */
 #define VDRM_AUDIO_KICK     _IO('v', 0x31)
+/* App 的 eventfd 注册到 /dev/vdrm-audio；容器打开/关闭 PCM 时内核 signal。
+ * 失败（老模块）时 App 回退到轮询 GET_STATE。 */
+#define VDRM_AUDIO_SET_EVENTFD _IOW('v', 0x32, int)
+/* 容器侧 playback/capture PCM 当前的 open 计数。 */
+#define VDRM_AUDIO_GET_STATE _IOR('v', 0x33, struct vdrm_audio_state)
 
 #endif

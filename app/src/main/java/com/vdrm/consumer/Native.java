@@ -14,6 +14,10 @@ public class Native {
      *  老模块没有这个 ioctl，native 侧会吞掉 ENOTTY。 */
     public static native void nativeSetReady(long handle);
 
+    /** App 进后台/回前台。后台时 native 侧停止 latch，帧立即 RETURN，
+     *  present/held/拷贝环全部放掉；回前台再 nativeSetReady() 重推。 */
+    public static native void nativeSetPaused(long handle, boolean paused);
+
     /* Event senders (static, no handle needed) */
     public static native int nativeSendKey(int code, boolean down);
     public static native int nativeSendMotion(int dx, int dy);

@@ -1,5 +1,5 @@
 MODULE_NAME := vdrm
-$(MODULE_NAME)-objs := driver/vdrm_ko.o driver/vdrm_audio.o
+$(MODULE_NAME)-objs := driver/vdrm_ko.o driver/vdrm_audio.o driver/vdrm_vt.o
 obj-m := $(MODULE_NAME).o
 
 ccflags-y += -Wno-declaration-after-statement

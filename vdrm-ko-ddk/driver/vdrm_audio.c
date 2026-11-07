@@ -36,6 +36,7 @@
 #include <linux/version.h>
 #include <linux/mutex.h>
 #include <linux/hrtimer.h>
+#include <linux/eventfd.h>
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/jack.h>
@@ -57,7 +58,24 @@ static struct vdrm_audio_ring *g_ring;
 static wait_queue_head_t g_wq;
 static DEFINE_SPINLOCK(g_lock);
 static int g_users;
+/* 容器侧 PCM open 计数：App 据此按需启停 AAudio。
+ * 只读 GET_STATE；不开 PCM 时 App 不需要常驻音频流。*/
+static atomic_t g_play_users = ATOMIC_INIT(0);
+static atomic_t g_cap_pcm_users = ATOMIC_INIT(0);
+static struct eventfd_ctx *g_audio_evfd;
 static bool g_audio_up;
+
+static void vdrm_audio_notify(void)
+{
+	unsigned long flags;
+	struct eventfd_ctx *ctx;
+
+	spin_lock_irqsave(&g_lock, flags);
+	ctx = g_audio_evfd;
+	if (ctx)
+		eventfd_signal(ctx, 1);
+	spin_unlock_irqrestore(&g_lock, flags);
+}
 static bool g_audio_inited;		/* hrtimer 已初始化，exit 可以 cancel */
 /* open() 不能直接改 head（那是 push 的单写者字段，两边锁不同）。改成置位，
  * 由持有 ALSA 流锁的 ack/pointer 在下次进入时补做"head 追平 tail"。*/
@@ -262,13 +280,18 @@ static int vdrm_cap_open(struct snd_pcm_substream *sub)
 				     VDRM_AUDIO_IN_RING_SIZE,
 				     VDRM_AUDIO_IN_RING_SIZE);
 	g_cap_sub = sub;
+	atomic_inc(&g_cap_pcm_users);
+	vdrm_audio_notify();
 	return 0;
 }
 
 static int vdrm_cap_close(struct snd_pcm_substream *sub)
 {
-	if (g_cap_sub == sub)
+	if (g_cap_sub == sub) {
 		g_cap_sub = NULL;
+		atomic_dec(&g_cap_pcm_users);
+		vdrm_audio_notify();
+	}
 	return 0;
 }
 
@@ -575,10 +598,18 @@ static int vdrm_audio_release(struct inode *inode, struct file *file)
 {
 	/* 裸写会盖掉并发的 open：旧进程 fput 的 release 晚于新进程的 open
 	 * 时，驱动会永远以为"没人收"，之后一路丢帧。*/
-	spin_lock(&g_lock);
-	g_users = 0;
-	g_st_users = 0;
-	spin_unlock(&g_lock);
+	{
+		struct eventfd_ctx *ctx;
+
+		spin_lock(&g_lock);
+		ctx = g_audio_evfd;
+		g_audio_evfd = NULL;
+		g_users = 0;
+		g_st_users = 0;
+		spin_unlock(&g_lock);
+		if (ctx)
+			eventfd_ctx_put(ctx);
+	}
 	wake_up_interruptible(&g_wq);
 	/* 消费者没了：立刻推一次，让阻塞写者看到 pointer 的"直接丢"退化路径，
 	 * 不用干等 10 秒。 */
@@ -600,6 +631,35 @@ static long vdrm_audio_ioctl(struct file *file, unsigned int cmd, unsigned long 
 
 	if (cmd == VDRM_AUDIO_KICK) {
 		vdrm_audio_kick();
+		return 0;
+	}
+	if (cmd == VDRM_AUDIO_SET_EVENTFD) {
+		struct eventfd_ctx *ctx = NULL, *old;
+		int fd;
+
+		if (get_user(fd, (int __user *)arg))
+			return -EFAULT;
+		if (fd >= 0) {
+			ctx = eventfd_ctx_fdget(fd);
+			if (IS_ERR(ctx))
+				return PTR_ERR(ctx);
+		}
+		spin_lock_irq(&g_lock);
+		old = g_audio_evfd;
+		g_audio_evfd = ctx;
+		spin_unlock_irq(&g_lock);
+		if (old)
+			eventfd_ctx_put(old);
+		return 0;
+	}
+	if (cmd == VDRM_AUDIO_GET_STATE) {
+		struct vdrm_audio_state st;
+
+		memset(&st, 0, sizeof(st));
+		st.play_users = (u32)atomic_read(&g_play_users);
+		st.cap_users = (u32)atomic_read(&g_cap_pcm_users);
+		if (copy_to_user((void __user *)arg, &st, sizeof(st)))
+			return -EFAULT;
 		return 0;
 	}
 	if (cmd != VDRM_AUDIO_GET_INFO)
@@ -695,10 +755,18 @@ static const struct snd_pcm_hardware vdrm_pcm_hw = {
 static int vdrm_pcm_open(struct snd_pcm_substream *sub)
 {
 	struct snd_pcm_runtime *rt = sub->runtime;
+	int rc;
 
 	g_sub = sub;
 	rt->hw = vdrm_pcm_hw;
-	return snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
+	rc = snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (rc) {
+		g_sub = NULL;
+		return rc;
+	}
+	atomic_inc(&g_play_users);
+	vdrm_audio_notify();
+	return 0;
 }
 
 /* 停止/关闭时清空共享环：视频关掉后不要把已经排进环的 0.5 秒尾巴
@@ -729,7 +797,11 @@ static int vdrm_pcm_close(struct snd_pcm_substream *sub)
 	g_period_on = false;
 	if (g_audio_inited)
 		hrtimer_cancel(&g_period_timer);
-	g_sub = NULL;
+	if (g_sub == sub) {
+		g_sub = NULL;
+		atomic_dec(&g_play_users);
+		vdrm_audio_notify();
+	}
 	vdrm_ring_flush();
 	return 0;
 }

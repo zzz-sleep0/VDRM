@@ -56,6 +56,8 @@
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_fourcc.h>
 
+#include "vdrm_vt.h"
+
 /* 内核 memset 是 arm64 汇编实现、没有 kCFI 哈希。走内置版本生成【直接 bl】，
  * 避免间接调用被 kCFI 校验 -> brk #0x8228 -> panic。 */
 #undef memset
@@ -3753,6 +3755,12 @@ static int vdrm_init(void)
 	if (rc)
 		pr_err("vdrm: audio init rc=%d (audio disabled)\n", rc);
 
+	/* 虚拟 VT（major 4）。CONFIG_VT=y 的内核上 major 4 被占，自动跳过。
+	 * 没有它，KWin 的 LogindSession 拿不到 VTNr，只能落 NoopSession。 */
+	rc = vdrm_vt_init();
+	if (rc)
+		pr_err("vdrm: vt init rc=%d (vt disabled)\n", rc);
+
 	/* 池不在这里建，见上面"池不由内核建" */
 	pr_info("vdrm: bring-up ok (dev=%px)\n", g_dev);
 	return 0;
@@ -3768,6 +3776,7 @@ err:
 
 static void vdrm_exit(void)
 {
+	vdrm_vt_exit();
 	vdrm_audio_exit();
 	vdrm_input_teardown();
 	vdrm_do_unregister();

@@ -225,10 +225,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 再醒 —— 就是肉眼看到的卡顿。nativeSetReady() 让内核立刻把当前帧重推
      * 一次，并把最后一帧重贴回图层，恢复是瞬时的。*/
     @Override
+    protected void onPause() {
+        if (nativeHandle != 0)
+            Native.nativeSetPaused(nativeHandle, true);
+        super.onPause();
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
-        if (nativeHandle != 0)
+        if (nativeHandle != 0) {
+            Native.nativeSetPaused(nativeHandle, false);
             Native.nativeSetReady(nativeHandle);
+        }
         /* 回前台顺手把通知状态对一次（用户这时候才会看它） */
         ForegroundService.requestRefresh(this);
     }
