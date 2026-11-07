@@ -56,6 +56,7 @@
 #include <sys/syscall.h>
 
 #include "vdrm_audio.h"
+#include "render_copy.h"
 
 #include <android/hardware_buffer.h>
 #include <android/choreographer.h>
@@ -86,6 +87,11 @@ struct submission {
     int fence_fd;
     uint64_t token;        /* 给 release 回调的身份；0 = 空闲块 */
     uint64_t created_ms;   /* 建的时间，watchdog 用 */
+    /* anland 拷贝回退：这一帧贴的是我们自己的拷贝。
+     *   is_copy   完成时要把目标 AHB 还回环里（不是还池槽）；
+     *   no_return 池槽在 blit 完成时就已 RETURN，release 时不能再还一次。*/
+    uint32_t is_copy;
+    uint32_t no_return;
 };
 /* submission 对象常驻复用：每帧 calloc/free 没必要，槽位固定后直接拿。 */
 #define SUBMISSION_CACHE_MAX 32
@@ -307,6 +313,8 @@ static void on_present(void *context, ASurfaceTransactionStats *stats);
 static void vdrm_presented(int id);
 
 
+static void maybe_request_pool(void);   /* 池按需创建（定义在后面）*/
+
 /* 「等 SF release 才还槽」的表（定义在后面）*/
 static void held_add(uint64_t token, uint32_t slot);
 static bool held_take_return(uint64_t token);
@@ -418,10 +426,63 @@ static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh)
     ASurfaceTransaction_delete(t);
 }
 
+/* anland 式拷贝回退的开关与计数（见 render_copy.c）：
+ * 内核 flip-done 不等 present 了，合成器随时可能重画池槽，所以每一帧都
+ * 把内容 blit 到我们自己的目标环再交给 SF；池槽在 blit 完成的那一刻就
+ * RETURN 给内核（内容已经消费掉，合成器怎么重画都不会撕）。*/
+static bool g_copy_mode = true;   /* debug.vdrm.nocopy=1 可临时关掉做 A/B */
+static bool g_copy_mode_init;
+
+static bool copy_wanted(void)
+{
+    if (!g_copy_mode_init) {
+        char v[PROP_VALUE_MAX];
+
+        g_copy_mode_init = true;
+        v[0] = 0;
+        if (__system_property_get("debug.vdrm.nocopy", v) > 0 && v[0] == '1')
+            g_copy_mode = false;
+    }
+    return g_copy_mode;
+}
+static unsigned long g_copy_frames, g_copy_fallback;
+
 static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
                      uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh)
 {
+    AHardwareBuffer *latch_ahb = ahb;
+    uint32_t src_w = 0, src_h = 0, src_fmt = 0;
+    bool copied = false;
+
     if (!g_sc || !ahb) return false;
+
+    {
+        AHardwareBuffer_Desc d;
+
+        memset(&d, 0, sizeof(d));
+        AHardwareBuffer_describe(ahb, &d);
+        src_w = d.width; src_h = d.height; src_fmt = d.format;
+    }
+
+    if (copy_wanted() && src_w && src_h) {
+        uint32_t cw = 0, ch = 0;
+        AHardwareBuffer *dst = NULL;
+
+        if (rcopy_ensure(src_w, src_h, src_fmt))
+            dst = rcopy_acquire(&cw, &ch);
+        if (dst) {
+            if (rcopy_blit(ahb, src_w, src_h, dst, cw, ch)) {
+                latch_ahb = dst;
+                copied = true;
+            } else {
+                rcopy_give_back(dst);
+                g_copy_fallback++;
+            }
+        } else if (g_copy_fallback++ == 0) {
+            __android_log_print(ANDROID_LOG_WARN, "VDRM",
+                                "copy: 目标环没有空闲块，本帧退回零拷贝");
+        }
+    }
 
     typedef void (*set_buffer_release_fn)(ASurfaceTransaction *, ASurfaceControl *,
                                           AHardwareBuffer *, int, void *,
@@ -430,15 +491,23 @@ static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
     if (!set_buffer_release)
         set_buffer_release = (set_buffer_release_fn)dlsym(RTLD_DEFAULT,
                                       "ASurfaceTransaction_setBufferWithRelease");
-    struct submission *s = submission_create(ahb, slot);
-    if (!s) return false;
+    struct submission *s = submission_create(latch_ahb, slot);
+    if (!s) {
+        if (copied)
+            rcopy_give_back(latch_ahb);
+        return false;
+    }
+    s->is_copy = copied ? 1 : 0;
+    s->no_return = copied ? 1 : 0;
+    if (copied)
+        g_copy_frames++;
 
     {
         /* 几何按这块 buffer 的真实宽高算，和模块的 mode 解耦 */
         AHardwareBuffer_Desc d;
 
         memset(&d, 0, sizeof(d));
-        AHardwareBuffer_describe(ahb, &d);
+        AHardwareBuffer_describe(latch_ahb, &d);
         g_last_buf_w = d.width ? d.width : mw;
         g_last_buf_h = d.height ? d.height : mh;
     }
@@ -454,7 +523,7 @@ static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
             __android_log_print(ANDROID_LOG_WARN, "VDRM",
                 "setBufferWithRelease missing; fallback to setBuffer");
         }
-        ASurfaceTransaction_setBuffer(t, g_sc, ahb, -1);
+        ASurfaceTransaction_setBuffer(t, g_sc, latch_ahb, -1);
         sc_set_geometry(t, g_last_buf_w, g_last_buf_h, ww, wh);
         ASurfaceTransaction_setOnComplete(t, (void *)(uintptr_t)slot,
                                           on_present);
@@ -464,7 +533,7 @@ static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
         submission_finish(s);
         return true;
     }
-    set_buffer_release(t, g_sc, ahb, -1, (void *)(uintptr_t)s->token, on_buf_release);
+    set_buffer_release(t, g_sc, latch_ahb, -1, (void *)(uintptr_t)s->token, on_buf_release);
     sc_set_geometry(t, g_last_buf_w, g_last_buf_h, ww, wh);
     ASurfaceTransaction_setOnComplete(t, (void *)(uintptr_t)slot, on_present);
     /* setDesiredPresentTime("马上送我") 试过，没用：apply -> latch 仍是
@@ -481,9 +550,14 @@ static bool sc_latch(AHardwareBuffer *ahb, uint32_t slot,
             g_latch_max_us = dt;
     }
 
+    /* 拷贝帧：池槽的内容已经被 blit 消费掉了，立刻 RETURN 给内核。
+     * 剩下"SF 什么时候用完这块拷贝"由目标环自己的 release 回调管。*/
+    if (copied)
+        vdrm_return((int)slot);
+
     /* 记下这一帧：Surface 重建（切后台回来、息屏再亮）时新图层是空的，
      * 要马上把它贴回去，否则那块区域在新合成器推第一帧之前是黑的。*/
-    g_last_ahb  = ahb;
+    g_last_ahb  = latch_ahb;
     g_last_slot = slot;
     g_cur_slot  = slot;
     g_last_w    = g_last_buf_w;
@@ -591,6 +665,13 @@ struct vdrm_input_event {
                     ((unsigned int)(size) << 16) | \
                     ((unsigned int)(type) << 8) | (unsigned int)(nr)))
 #define VDRM_IOCTL_GET_INFO    VDRM_IOC(2, 'V', 0x00, sizeof(struct vdrm_info))
+/* 池按需创建：内核请求的目标尺寸 + 代次（ioctl，不读 sysfs）*/
+struct vdrm_want {
+    uint32_t gen;
+    uint32_t width;
+    uint32_t height;
+};
+#define VDRM_IOCTL_WANT        VDRM_IOC(2, 'V', 0x0A, sizeof(struct vdrm_want))
 /* 模块的"配置"（mode 参数）：App 用它决定自己窗口该横着还是竖着。
  * 和 GET_INFO 的 width/height（合成器已经切过去的尺寸）区分开：方向必须看配置，
  * 否则会跟着合成器慢半拍。*/
@@ -1017,7 +1098,7 @@ static void submission_release(struct submission *s, bool give_back)
     *p = s->next;
     for (struct submission *other = g_submissions; other; other = other->next)
         if (other->slot == s->slot) { still_used = true; break; }
-    if (give_back && !still_used) {
+    if (give_back && !still_used && !s->no_return) {
         struct vdrm_handle_req req = { .id = s->slot };
         int rfd = (g_return_fd >= 0) ? g_return_fd : g_vdrm_fd;
         if (ioctl(rfd, VDRM_IOCTL_RETURN, &req) < 0)
@@ -1027,6 +1108,9 @@ static void submission_release(struct submission *s, bool give_back)
 
     if (s->fence_fd >= 0)
         close(s->fence_fd);
+    if (s->is_copy)
+        rcopy_give_back(s->ahb);      /* SF 用完这块拷贝了，还回目标环 */
+    s->is_copy = 0;
     AHardwareBuffer_release(s->ahb);
     atomic_fetch_sub(&g_submissions_live, 1);
     if (g_release_wake_fd >= 0) {
@@ -1069,6 +1153,7 @@ static struct submission *submission_create(AHardwareBuffer *ahb, uint32_t slot)
     }
 
     s->ahb = ahb; s->slot = slot;
+    s->is_copy = 0; s->no_return = 0;
     s->fence_fd = -2;   /* release callback 还没到 */
     s->token = atomic_fetch_add(&g_sub_token, 1) + 1;
     s->created_ms = now_ms();
@@ -1153,8 +1238,12 @@ static void *release_worker(void *arg)
              * 跟踪 —— 槽由内核在下一帧上屏时回收。*/
             LOGW("release callback missing slot=%u; hold until late callback",
                  stuck[i]->slot);
-            held_add(stuck[i]->token, stuck[i]->slot);
-            submission_abandon(stuck[i]);
+            if (!stuck[i]->no_return) {
+                held_add(stuck[i]->token, stuck[i]->slot);
+                submission_abandon(stuck[i]);
+            } else {
+                submission_abandon(stuck[i]);
+            }
         }
 
         held_expire();   /* 等不到回调的槽：超时才强制归还 */
@@ -1199,8 +1288,12 @@ static void *release_worker(void *arg)
                  * 上屏时回收。*/
                 LOGW("release fence timeout slot=%u; hold until late callback",
                      wait[i]->slot);
-                held_add(wait[i]->token, wait[i]->slot);
-                submission_abandon(wait[i]);
+                if (!wait[i]->no_return) {
+                    held_add(wait[i]->token, wait[i]->slot);
+                    submission_abandon(wait[i]);
+                } else {
+                    submission_abandon(wait[i]);
+                }
             }
         }
 
@@ -1631,12 +1724,15 @@ static void *render_loop(void *arg)
         if (time(NULL) - stat_t0 >= 2) {
             LOGI("STATS events=%llu shown=%llu deferred=%llu outstanding=%zu over %lds"
                  " | apply2latch=%lluus(max %llu) latch2present=%lluus(max %llu)"
-                 " | evgap_max=%llums n40=%llu n80=%llu latch_max=%lluus%s",
+                 " | evgap_max=%llums n40=%llu n80=%llu latch_max=%lluus"
+                 " copy=%lu/%lu blit=%lu/%luus%s",
                  (unsigned long long)stat_ev, (unsigned long long)stat_show,
                  (unsigned long long)stat_deferred, submission_count(),
                  (long)(time(NULL) - stat_t0),
                  g_a2l_last_us, g_a2l_max_us, g_l2p_last_us, g_l2p_max_us,
                  g_ev_gap_max_ms, g_ev_gap_n40, g_ev_gap_n80, g_latch_max_us,
+                 g_copy_frames, g_copy_fallback,
+                 rcopy_blit_last_us(), rcopy_blit_max_us(),
                  g_lat_rejects ? " [lat clock mismatch!]" : "");
             stat_ev = 0; stat_show = 0; stat_deferred = 0;
             g_ev_gap_max_ms = 0; g_ev_gap_n40 = 0; g_ev_gap_n80 = 0;
@@ -1674,6 +1770,8 @@ static void *render_loop(void *arg)
             uint64_t tk;
             while (read(g_tick_fd, &tk, sizeof(tk)) > 0) {}
         }
+        /* 内核可能刚请求了"这一档还没有槽"：补池（只在 gen 变化时拉一次） */
+        maybe_request_pool();
         if (pfds[3].revents) {
             uint64_t ev;
 
@@ -2664,6 +2762,56 @@ Java_com_vdrm_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong han
  * 路径就是模块目录里的那份（模块 id 固定为 vdrm-lkm）—— 二进制内嵌在模块里，
  * 不再往 /data/wayland 拷第二份（那是守护进程时代留下的路径，已退役）。*/
 #define VDRM_MKPOOL "/data/adb/modules/vdrm-lkm/vdrm_mkpool"
+
+/* ---- 池按需创建（分辨率归合成器）----
+ *
+ * 合成器从广告列表里挑了某一档、但池里还没有该尺寸的槽时，内核会把目标尺寸
+ * 写到 want_mode、把 want_gen 加一，并 eventfd 叫醒我们。这里看到 gen 变化
+ * 就拉一次 `vdrm_mkpool --pool WxH`（只补槽，不改 mode、不 commit），
+ * 合成器那边 dumb_create 的等待循环会因 REGISTER 被唤醒、正常拿到 buffer。*/
+static unsigned int g_want_gen_seen;
+
+static bool read_sysfs_str(const char *path, char *buf, size_t n)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t r;
+
+    if (fd < 0)
+        return false;
+    r = read(fd, buf, n - 1);
+    close(fd);
+    if (r <= 0)
+        return false;
+    buf[r] = 0;
+    while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == '\r' ||
+                     buf[r - 1] == ' '))
+        buf[--r] = 0;
+    return r > 0;
+}
+
+static void maybe_request_pool(void)
+{
+    struct vdrm_want w;
+    char want_s[24], cmd[160];
+    pid_t pid;
+
+    if (g_vdrm_fd < 0)
+        return;
+    memset(&w, 0, sizeof(w));
+    if (ioctl(g_vdrm_fd, VDRM_IOCTL_WANT, &w) < 0)
+        return;
+    if (w.gen == g_want_gen_seen || !w.width || !w.height)
+        return;
+    g_want_gen_seen = w.gen;
+    snprintf(want_s, sizeof(want_s), "%ux%u", w.width, w.height);
+    LOGI("pool-on-demand: want %s (gen=%u) -> mkpool --pool", want_s, w.gen);
+    snprintf(cmd, sizeof(cmd), VDRM_MKPOOL " --pool %s", want_s);
+    pid = fork();
+    if (pid == 0) {
+        execl("/system/bin/su", "su", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
 
 static void ensure_pool_spawn(int force)
 {

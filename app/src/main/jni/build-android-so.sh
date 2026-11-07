@@ -34,7 +34,7 @@ clang --target=aarch64-linux-android"$API" \
       --sysroot="$NDK/sysroot" \
       -fuse-ld=lld -O2 -fPIC -shared -I. \
       -o "$OUT" \
-      native_consumer.c ahb_rebuild.c \
+      native_consumer.c ahb_rebuild.c render_copy.c \
       -llog -landroid -laaudio -lEGL -lGLESv2 -ldl
 
 echo "→ $OUT"

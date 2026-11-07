@@ -124,8 +124,14 @@ static struct drm_simple_display_pipe_funcs g_pipe_funcs;
 static struct drm_mode_config_funcs         g_mode_funcs;
 
 static const u32 g_formats[] = {
+	/* 只报池里**真实存在**的两种：mkpool 用 HAL_PIXEL_FORMAT_BGRA_8888
+	 * 分配，内存字节序是 [B,G,R,A] —— 对应 DRM 只有 XRGB8888 / ARGB8888
+	 * （这两个 RGB 字节位置相同，只差最高字节是 X 还是 A）。
+	 *
+	 * 以前这里还报了 XBGR8888 / ABGR8888（内存 [R,G,B,X/A]），是**虚报**：
+	 * 合成器一旦从列表里挑中那两个，读同一片显存就是 R↔B 互换 ——
+	 * 实测 glmark2 的企鹅：橙嘴橙脚变蓝、青蓝海水变橙黄。*/
 	VDRM_FMT_XRGB8888, VDRM_FMT_ARGB8888,
-	VDRM_FMT_XBGR8888, VDRM_FMT_ABGR8888,
 };
 
 /* 只支持线性布局。显式报出去（而不是不报）有两个好处：
@@ -309,6 +315,16 @@ struct vdrm_handle_req {
 #define VDRM_IOC_BASE(cmd) \
 	((unsigned int)(cmd) & ~(unsigned int)(0x3fffu << 16))
 #define VDRM_IOC_SIZE(cmd) (((unsigned int)(cmd) >> 16) & 0x3fffu)
+/* 池按需创建：内核请 App 给某个尺寸补槽（App 用 ioctl 轮询 ——
+ * untrusted_app 读 /sys/module/... 会被 SELinux 拦）。*/
+struct vdrm_want {
+	u32 gen;
+	u32 width;
+	u32 height;
+};
+#define VDRM_IOCTL_WANT \
+	VDRM_IOC(2, 'V', 0x0A, sizeof(struct vdrm_want))
+
 #define VDRM_IOCTL_GET_INFO \
 	VDRM_IOC(2, 'V', 0x00, sizeof(struct vdrm_info))
 #define VDRM_IOCTL_REGISTER \
@@ -453,11 +469,16 @@ struct vdrm_pool_entry {
 	u32 state;
 	u32 used;
 	/* 这个槽最近一次上屏提交的时刻。用于 present_lat_us 诊断，
-	 * 也是 safe_present 模式的兜底超时起点。*/
+	 * 也是兜底超时的起点。*/
 	u64 pend_since_ns;
-	/* 【只在 safe_present=1 时非空】挂在这个槽上、等 App 报 present 才完成的
-	 * flip-done。默认模式（safe_present=0）下事件直接 arm 到下一个 vblank，
-	 * 这个字段一直是 NULL —— 见 vdrm_pipe_update 里的结论。*/
+	/* 提交序号（每次 pipe_update 递增）。pace=2 的"滞后一帧"判据靠它：
+	 * 有比它更新的帧 present 了，就说明 SF 已经翻过这一帧。*/
+	u64 pend_seq;
+	/* App 有没有为这一帧报过 PRESENTED。*/
+	u32 pend_presented;
+	/* 【pace=1/2 时非空】挂在这个槽上、等 tick 才完成的 flip-done。
+	 * pace=0（anland 式 tick 无条件）时一直是 NULL，事件直接 arm 到
+	 * 下一个 vblank，由 DRM core 的 vblank_event_list 在 tick 上发。*/
 	struct drm_pending_vblank_event *pend_event;
 	/* 分配占用：从 CREATE_DUMB 成功到合成器销毁那个 dumb/GEM handle 为止。
 	 * 它保护的是“同一次分配”的别名：只要合成器还持有 handle，就绝不把
@@ -903,8 +924,9 @@ module_param_named(frames_reuse, g_frames_reuse, ullong, 0444);
  * 现在靠真正的生命周期回收：dumb_destroy/GEM_CLOSE 解除分配占用，RETURN
  * 解除显示占用。App 真丢了 release 回调时由 App 侧的 held_expire（5s）
  * 或 misc_release 兜底，不需要内核去猜“这块是不是还在屏上”。*/
-static unsigned long long g_frame_flip_present_done;   /* present 驱动完成的计数 */
-module_param_named(flip_present_done, g_frame_flip_present_done, ullong, 0444);
+static unsigned long long g_frame_flip_present_done;   /* App 报 PRESENTED 的次数（纯诊断）*/
+module_param_named(present_seen, g_frame_flip_present_done, ullong, 0444);
+MODULE_PARM_DESC(present_seen, "PRESENTED notifications received (diagnostics only; flip-done is tick-paced)");
 
 /* 诊断：从"合成器提交这一帧"到"App 报 present"的耗时。
  *
@@ -916,6 +938,15 @@ static unsigned long long g_present_lat_us, g_present_lat_max_us;
 module_param_named(present_lat_us, g_present_lat_us, ullong, 0444);
 MODULE_PARM_DESC(present_lat_us, "commit -> App reported present, last (us)");
 module_param_named(present_lat_max_us, g_present_lat_max_us, ullong, 0444);
+
+/* 诊断：合成器这一帧用的是哪个 fourcc。池里的显存是 gralloc BGRA_8888
+ * （= DRM ARGB8888 的字节序），只有 XRGB8888/ARGB8888 两种 fourcc 读它
+ * 才是对的；如果这里出现 XBGR8888(0x34324258) / ABGR8888(0x34324241)，
+ * 屏幕上就是 R↔B 互换。plane 只广告正确的那两种之后，正常值应该只有
+ * 0x34325258(XR24) 或 0x34325241(AR24)。*/
+static unsigned int g_fb_fourcc;
+module_param_named(fb_fourcc, g_fb_fourcc, uint, 0444);
+MODULE_PARM_DESC(fb_fourcc, "fourcc of the last committed fb (0x34325258=XR24, 0x34325241=AR24)");
 MODULE_PARM_DESC(present_lat_max_us, "commit -> App reported present, max (us)");
 
 
@@ -1037,8 +1068,13 @@ static void vdrm_pool_drop_stale(void)
 
 		if (!e->used)
 			continue;
-		if (e->width == g_mode_w && e->height == g_mode_h)
-			continue;                  /* 当前档：还要用 */
+		/* 当前档、以及"对外广告过的任何一档"都要留着：
+		 * 现在分辨率由合成器自己挑，池是按需建出来的；如果这里只认
+		 * g_mode（App 不再改它了），刚建好的别的尺寸会在下一次
+		 * dumb_create 开头被当成 stale 全部回收，合成器切档必然失败。*/
+		if ((e->width == g_mode_w && e->height == g_mode_h) ||
+		    vdrm_res_advertised(e->width, e->height))
+			continue;
 		if (e->state == VDRM_ST_DISPL)
 			continue;                  /* 可能还在屏上 */
 		if (!e->handle_gone &&
@@ -1065,6 +1101,31 @@ static void vdrm_pool_drop_stale(void)
 		pr_debug("vdrm: dropped %d stale slot(s) (keep %ux%u)\n",
 			n, g_mode_w, g_mode_h);
 }
+
+/* ---- 池按需创建（分辨率交给合成器）----
+ *
+ * 合成器从"广告过的模式列表"里挑了某一档、但那档还没有池槽时，dumb_create
+ * 会走到这里：把目标尺寸挂到 want_mode + want_gen，再用 eventfd 叫醒 App，
+ * App 看到变化就跑一次 `vdrm_mkpool --pool WxH`（只补槽、不改 mode、不 commit），
+ * REGISTER 之后等待循环被唤醒，合成器拿到 buffer，modeset 正常完成。
+ */
+static char            g_want_mode[24];
+static unsigned int    g_want_gen;
+static u32             g_want_w, g_want_h;
+
+static int vdrm_want_mode_get(char *buf, const struct kernel_param *kp)
+{
+	(void)kp;
+	return scnprintf(buf, PAGE_SIZE, "%s\n", g_want_mode);
+}
+static const struct kernel_param_ops vdrm_want_mode_ops = {
+	.get = vdrm_want_mode_get,
+};
+module_param_cb(want_mode, &vdrm_want_mode_ops, NULL, 0444);
+MODULE_PARM_DESC(want_mode,
+		 "Pool creation request from the kernel: '<w>x<h>' (read-only; the app builds slots for it)");
+module_param_named(want_gen, g_want_gen, uint, 0444);
+MODULE_PARM_DESC(want_gen, "Increments on every new pool-creation request");
 
 static int vdrm_dumb_create(struct drm_file *file, struct drm_device *dev,
 			    struct drm_mode_create_dumb *args)
@@ -1143,8 +1204,33 @@ static int vdrm_dumb_create(struct drm_file *file, struct drm_device *dev,
 		 * 永远建不出来的尺寸白等 6 秒。*/
 		if (!vdrm_res_advertised(args->width, args->height))
 			return -ENOSPC;
-		if (waited >= 6000)
+
+		/* 广告过的档位就值得等：先请 App 把这一档的槽建出来
+		 * （want_mode + eventfd），再继续等 REGISTER 唤醒。同一个尺寸
+		 * 只请求一次，避免每 100ms 刷一次参数。*/
+		{
+			char want[24];
+
+			scnprintf(want, sizeof(want), "%ux%u",
+				  args->width, args->height);
+			if (strncmp(g_want_mode, want, sizeof(g_want_mode)) != 0) {
+				memcpy(g_want_mode, want, sizeof(g_want_mode));
+				g_want_w = args->width;
+				g_want_h = args->height;
+				g_want_gen++;
+				vdrm_app_signal();
+				pr_info("vdrm: want pool %s (gen=%u)\n",
+					want, g_want_gen);
+			}
+		}
+		if (waited >= 6000) {
+			/* 超时说明这一档没建出来（App 没跑 / mkpool 失败）。
+			 * 把请求清掉，下一次 dumb_create 才能重新发起一次
+			 * （不然同一个尺寸永远只请求过一次，App 后来起来了
+			 * 也补不上槽，只能切一次档再切回来）。*/
+			g_want_mode[0] = '\0';
 			return -ENOSPC;
+		}
 		if (wait_event_interruptible_timeout(g_pool_wq, false,
 						     msecs_to_jiffies(100)) < 0)
 			return -ERESTARTSYS;
@@ -1380,29 +1466,66 @@ static __poll_t vdrm_misc_poll(struct file *file,
  * 正在工作的 App。 */
 static void vdrm_input_reset_state(void);   /* 定义见文件后部 */
 
-/* ---- safe_present：保守模式（给陌生设备留的退路）----
+/* ---- flip-done 的节拍（pace）----
  *
- * 0（默认）= flip-done 在下一个 vblank 完成，不等 SF 的 present。快：实测
- *            鼠标连续移动 88fps。代价是合成器可能在 SF 还没放手时就重提交
- *            同一块显存（`frames_reuse` 会涨），理论上会撕。
- * 1         = 老行为：事件挂到池槽上，等 App 报 present 才完成，500ms 兜底。
- *            慢（~30fps）但绝不覆写正在显示的显存。
+ * 目标是 anland 的架构：**每个 vsync tick 无条件把 flip-done 发出去**，
+ * 合成器不该等 SF 的任何信号（等它 = 把合成器串行化到 SF 的 OnComplete，
+ * anland 实测 60Hz 只剩 29fps，也就是用户看到的"过一阵卡一下"）。
  *
- * 换机器/换 GPU 之后如果看到"局部色块"，先把这个设成 1 验证是不是这条路径。*/
-static bool g_safe_present;
-module_param_named(safe_present, g_safe_present, bool, 0644);
-MODULE_PARM_DESC(safe_present,
-		 "1 = wait for App present before completing flip-done (30fps, never overwrites shown memory)");
+ * 代价是：合成器拿到 flip-done 后可能重画一块 SF 还在扫描的显存。这条路
+ * 由 App 侧承担 —— App 在 latch 之前按需把池槽内容 blit 到自己的
+ * swapchain（EGL 拷贝），SF 拿到的就是拷贝，池槽随合成器怎么重画都不会撕。
+ * 内核这边只管打拍子。
+ *
+ * 三个档位留着做 A/B（同一份 .ko 里切，不用重编重载）：
+ *   pace=0 (默认) tick 无条件：anland 式，事件 arm 到下一个 vblank；
+ *   pace=1        等本帧 present：不撕但会被 SF 串行化（旧默认）；
+ *   pace=2        滞后一帧 present：上一帧 present 了就交还这一帧。
+ *
+ * 兜底 VDRM_PRESENT_FALLBACK_MS：pace=1/2 下 present 一直不来（App 在后台/
+ * 被限流/挂了）时不能永远等，超时照样完成。
+ */
+#define VDRM_PRESENT_FALLBACK_MS 500
+#define VDRM_PACE_TICK     0
+#define VDRM_PACE_PRESENT  1
+#define VDRM_PACE_LAG1     2
 
-/* 保守模式下最长等多久（毫秒）。present 不来（App 在后台/挂了）时兜底，
- * 不能让合成器永远等下去。*/
-#define VDRM_SAFE_FALLBACK_MS 500
+static uint g_pace = VDRM_PACE_TICK;
+module_param_named(pace, g_pace, uint, 0644);
+MODULE_PARM_DESC(pace, "flip-done pacing: 0=tick unconditionally (anland), 1=wait this frame's present, 2=lag one present");
 
-static unsigned long long g_flip_safe_present_done, g_flip_safe_fallback;
-module_param_named(flip_safe_present_done, g_flip_safe_present_done, ullong, 0444);
-module_param_named(flip_safe_fallback, g_flip_safe_fallback, ullong, 0444);
+/* 每次提交递增；present 到来时把"已 present 的最大序号"顶上去，
+ * pace=2 靠这两个数判断"SF 已经翻过这一帧了"。*/
+static u64 g_flip_seq, g_present_seq;
+
+static unsigned long long g_flip_armed;     /* pace=0：arm 到 vblank 的次数 */
+static unsigned long long g_flip_tick_done, g_flip_fallback;
+module_param_named(flip_armed, g_flip_armed, ullong, 0444);
+MODULE_PARM_DESC(flip_armed, "flip-done armed to the next fake vblank (pace=0, tick-paced)");
+module_param_named(flip_tick_done, g_flip_tick_done, ullong, 0444);
+MODULE_PARM_DESC(flip_tick_done, "flip-done released on a tick after its gate opened (pace=1/2)");
+module_param_named(flip_fallback, g_flip_fallback, ullong, 0444);
+MODULE_PARM_DESC(flip_fallback, "flip-done completed by the fallback timeout (present never came)");
 
 /* 完成一个挂在槽上的 flip-done。调用者不要持 g_pool_state_lock。*/
+/* 池里还有没有挂着等 RETURN 的 flip-done？网格要不要继续打拍就看它。*/
+static bool vdrm_pool_has_pending(void)
+{
+	unsigned long fl;
+	bool any = false;
+	int k;
+
+	spin_lock_irqsave(&g_pool_state_lock, fl);
+	for (k = 0; k < VDRM_POOL_MAX; k++) {
+		if (g_pool[k].pend_event) {
+			any = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_pool_state_lock, fl);
+	return any;
+}
+
 static void vdrm_flip_complete(struct drm_pending_vblank_event *ev)
 {
 	struct drm_crtc *crtc;
@@ -1572,6 +1695,16 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
 	switch (cmd) {
+	case VDRM_IOCTL_WANT: {
+		struct vdrm_want w;
+
+		w.gen    = g_want_gen;
+		w.width  = g_want_w;
+		w.height = g_want_h;
+		if (copy_to_user((void __user *)arg, &w, sizeof(w)))
+			return -EFAULT;
+		return 0;
+	}
 	case VDRM_IOCTL_GET_INFO: {
 		volatile struct vdrm_info info;
 		unsigned int i;
@@ -1919,12 +2052,12 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			vdrm_push_current_frame();
 		return 0;
 	}
-	/* 现在只是**诊断**：记下 commit→present 的耗时，不再参与 flip-done
-	 * （见 vdrm_pipe_update 里的结论）。present fence 仍然有价值 —— 它告诉
-	 * 我们"这一帧什么时候真的上了屏"，只是不该拿它当节拍。*/
+	/* 只是**诊断**：记下 commit→present 的耗时。present **不再参与**
+	 * flip-done —— 节拍在假 vblank 的 tick 上（见 vdrm_pipe_update 里的
+	 * A/B/C 说明）。present fence 仍然有价值：它告诉我们"这一帧什么时候
+	 * 真的上了屏"，只是不该拿它当合成的节拍（那会把合成器串行化）。*/
 	case VDRM_IOCTL_PRESENTED: {
 		struct vdrm_present_req req;
-		struct drm_pending_vblank_event *pend = NULL;
 		unsigned long flags;
 		int i, rc = -ENOENT;
 
@@ -1942,20 +2075,20 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 					if (dt > g_present_lat_max_us)
 						g_present_lat_max_us = dt;
 				}
-				/* safe_present：这一刻才让合成器往下走 */
-				pend = g_pool[i].pend_event;
-				g_pool[i].pend_event = NULL;
-				if (pend) {
-					g_flip_safe_present_done++;
-					g_frame_flip_present_done++;
+				g_pool[i].pend_presented = 1;
+				/* 让 pace=2 知道"SF 已经翻过这一帧"*/
+				{
+					u64 s = g_pool[i].pend_seq;
+
+					if (s > READ_ONCE(g_present_seq))
+						WRITE_ONCE(g_present_seq, s);
 				}
+				g_frame_flip_present_done++;
 				rc = 0;
 				break;
 			}
 		}
 		spin_unlock_irqrestore(&g_pool_state_lock, flags);
-		if (pend)
-			vdrm_flip_complete(pend);
 		return rc;
 	}
 	/* App 回到前台："我回来了，把当前这一帧立刻重推给我。"
@@ -2381,32 +2514,51 @@ static enum hrtimer_restart vdrm_vblank_timer_fn(struct hrtimer *t)
 	if (g_vblank_kick_ticks)
 		g_vblank_kick_ticks--;
 
-	/* 完成挂起的 flip-done。两条路取先到者：
-	 *   1. App 报了 present —— 但那条走 ioctl 就地完成，不在这个 tick 里；
-	 *   2. 兜底超时（present 不来、或 App 挂掉时仍能跑）。
+	/* 完成挂起的 flip-done（只有 pace=1/2 才会挂；pace=0 的事件在 DRM core
+	 * 的 vblank_event_list 里，上面那句 drm_crtc_handle_vblank() 已经把
+	 * 它们发完了）。
 	 *
-	 * 现在这个 tick 只做一件事：没有需要 vblank 的人了就把网格停掉。
-	 * flip-done 由 DRM core 的 vblank_event_list 在 handle_vblank 里发完，
-	 * 它自己会 put 掉引用（g_vblank_on 归 0），所以这里只看那两个条件。*/
-	{
-		/* 保守模式的兜底：present 一直不来就自己完成（否则合成器永远等）*/
+	 * pace=1：本帧 present 了才交还（不撕，但被 SF 串行化）。
+	 * pace=2：有更新的帧 present 了（SF 已经翻过这一帧）就交还 —— 合成器
+	 *         最多领先一帧，既不会停一整拍，也不会重画正在显示的显存。
+	 * 两种情况下"槽已经离开 DISPL（App RETURN 了）"都算安全，顺手交还。
+	 *
+	 * 兜底：present 一直不来（App 在后台/被限流/挂了）时超时照样完成。*/
+	if (g_pace != VDRM_PACE_TICK) {
 		struct drm_pending_vblank_event *exp[VDRM_POOL_MAX];
-		u64 lim = (u64)VDRM_SAFE_FALLBACK_MS * 1000000ULL;
+		u64 lim = (u64)VDRM_PRESENT_FALLBACK_MS * 1000000ULL;
 		unsigned long fl;
 		int k, n = 0;
 
-		if (g_safe_present) {
+		{
 			u64 now = ktime_get_ns();
+			u64 pseq = READ_ONCE(g_present_seq);
 
 			spin_lock_irqsave(&g_pool_state_lock, fl);
 			for (k = 0; k < VDRM_POOL_MAX; k++) {
+				bool gate = false;
+
 				if (!g_pool[k].pend_event)
 					continue;
+				if (g_pool[k].state != VDRM_ST_DISPL)
+					gate = true;              /* App 已 RETURN */
+				else if (g_pace == VDRM_PACE_PRESENT)
+					gate = g_pool[k].pend_presented != 0;
+				else /* LAG1 */
+					gate = g_pool[k].pend_presented &&
+					       pseq > g_pool[k].pend_seq;
+
+				if (gate) {
+					exp[n++] = g_pool[k].pend_event;
+					g_pool[k].pend_event = NULL;
+					g_flip_tick_done++;
+					continue;
+				}
 				if (now - g_pool[k].pend_since_ns <= lim)
 					continue;
 				exp[n++] = g_pool[k].pend_event;
 				g_pool[k].pend_event = NULL;
-				g_flip_safe_fallback++;
+				g_flip_fallback++;
 			}
 			spin_unlock_irqrestore(&g_pool_state_lock, fl);
 			for (k = 0; k < n; k++)
@@ -2414,7 +2566,7 @@ static enum hrtimer_restart vdrm_vblank_timer_fn(struct hrtimer *t)
 		}
 	}
 
-	if (!g_vblank_on && !g_vblank_kick_ticks)
+	if (!g_vblank_on && !g_vblank_kick_ticks && !vdrm_pool_has_pending())
 		vdrm_vblank_grid_stop();
 
 	/* 用绝对时间推进，停机再开能接回原相位 */
@@ -2564,11 +2716,10 @@ static void vdrm_pipe_disable(struct drm_simple_display_pipe *pipe)
 
 	pr_info("vdrm: pipe disable\n");
 
-	/* 默认模式下 flip-done 是"arm 到下一个 vblank"，由 DRM core 自己的
-	 * vblank_event_list 管着，drm_crtc_vblank_off() 会收尾。但 safe_present
-	 * 模式下事件是私挂在槽上的，DRM 看不到 —— 停网格之前必须自己补发，
-	 * 否则合成器会一直等上一帧，热插拔后再也不提交。*/
-	if (g_safe_present) {
+	/* flip-done 现在都私挂在池槽上等 App 的 present，DRM core 的
+	 * vblank_event_list 看不到它们 —— 停网格之前必须自己补发，否则
+	 * 合成器会一直等上一帧，热插拔后再也不提交。*/
+	{
 		struct drm_pending_vblank_event *pev[VDRM_POOL_MAX];
 		unsigned long fl;
 		int k, n = 0;
@@ -2689,6 +2840,11 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 	     pipe->plane.state->fb->height != crtc_state->mode.vdisplay))
 		tail_frame = true;
 
+	/* 诊断：记下合成器实际用的 fourcc（颜色对不对的第一手证据）。*/
+	if (pipe->plane.state && pipe->plane.state->fb &&
+	    pipe->plane.state->fb->format)
+		WRITE_ONCE(g_fb_fourcc, pipe->plane.state->fb->format->format);
+
 	/* M5: 池 buffer 上屏 -> 标 DISPLAYING + 通知 App。
 	 * 注意：池对象是 import 来的，PRIME_HANDLE_TO_FD 会返回 App 原始 dma-buf，
 	 * 合成器再 FD_TO_HANDLE 会得到“第二个 GEM”，所以不能比指针，要比
@@ -2769,45 +2925,43 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 	/* 先摘下来，否则 commit_hw_done() 里的 WARN_ON(event) 会响 */
 	crtc_state->event = NULL;
 
-	/* 这一帧的 flip-done 要不要等 SF 放手？
+	/* 这一帧的 flip-done 交给谁？见文件上部 "flip-done 的节拍（pace）"：
 	 *
-	 * 合成器的 buffer 循环是"flip done 即空闲"：一到 flip-done 它就敢
-	 * 再往同一片显存里画下一帧。可我们的链路里还夹着一层 SurfaceFlinger
-	 * + HWC：它把这块 buffer 锁进 overlay 平面之后要等下一次合成才
-	 * release（三缓冲下再多占 1–2 个 vsync）。flip-done 若按传输完成就
-	 * 发，合成器会立刻覆盖屏幕上正在扫描的显存 —— 实测就是"局部蓝块"，
-	 * 且录屏抓不到（录屏走另一条合成路径，读的是覆盖之后的像素）。
+	 *   pace=0（默认，anland 式）：不挂，直接往下面走 —— arm 到下一个假
+	 *          vblank，tick 一到就发。合成器永远不等 SF。显存被重画的风险
+	 *          由 App 侧的拷贝回退吸收。
+	 *   pace=1/2：事件私挂在池槽上（pend_event / pend_seq / pend_presented），
+	 *          由 tick 按各自的闸门发（见 vdrm_vblank_timer_fn）。
 	 *
-	 * 【结论】flip-done 只 arm 到下一个 vblank，**不等 App 的 present**。
-	 * 参考 anland 6.2 的实测（awl_sc.cpp 头部注释）：把"帧完成"从 SF 的
-	 * OnComplete 发出去，一个按 frame-callback 跑的合成器只有 29fps；改成
-	 * 在 vsync 那一拍发就正常了。我们量到的 30fps / 偶发 107ms 是同一个坑
-	 * —— present fence 是这条链里最慢的一环，不该让它决定帧率。
+	 * 挂起的路径【不取 vblank 引用】：事件不进 DRM 的 vblank_event_list，
+	 * 也就不该有引用 —— 以前 `drm_crtc_vblank_get()` 拿的引用没人 put
+	 * （send_vblank_event 不负责还），usage 只涨不跌，假 vblank 定时器
+	 * 永远停不下来。网格由下面的 vdrm_vblank_grid_start() 显式拉起。
 	 *
-	 * 那"SF 还在显示这块显存"怎么办？靠池的回收链：槽在 App RETURN（SF 的
-	 * release 信号）之前一直是 DISPL，dumb_create 不会把它发给别人。
-	 * 唯一残余风险是合成器重提交同一块 fb —— 用 frames_reuse 盯着。*/
-	if (slot_idx >= 0) {
+	 * 唯一例外：App 没接上（没有 eventfd）时也不挂 —— 池和 dumb buffer 也被
+	 * modetest / gbm demo 这类工具用，它们不报 present，挂上去等于给它们
+	 * 定了个 2fps 的上限。*/
+	if (slot_idx >= 0 && READ_ONCE(g_app_ctx) && g_pace != VDRM_PACE_TICK) {
 		unsigned long fl;
 		struct drm_pending_vblank_event *old = NULL;
 
 		spin_lock_irqsave(&g_pool_state_lock, fl);
 		g_pool[slot_idx].pend_since_ns = now_ns;
-		if (g_safe_present && drm_crtc_vblank_get(crtc) == 0) {
-			/* 保守模式：挂起来等 App present（同一槽被重提交时先补发旧的）*/
-			old = g_pool[slot_idx].pend_event;
-			g_pool[slot_idx].pend_event = event;
-			event = NULL;
-		}
+		g_pool[slot_idx].pend_seq       = ++g_flip_seq;
+		g_pool[slot_idx].pend_presented = 0;
+		/* 同一槽被重提交时先补发旧的（否则那个事件永远挂着）*/
+		old = g_pool[slot_idx].pend_event;
+		g_pool[slot_idx].pend_event = event;
+		event = NULL;
 		spin_unlock_irqrestore(&g_pool_state_lock, fl);
 		if (old)
 			vdrm_flip_complete(old);
-		if (!event) {
-			vdrm_vblank_grid_start();
-			pr_debug("vdrm: flip held slot %d (safe_present)\n", slot_idx);
-			return;
-		}
+		vdrm_vblank_grid_start();
+		pr_debug("vdrm: flip held slot %d (pace=%u)\n", slot_idx, g_pace);
+		return;
 	}
+	if (slot_idx >= 0)
+		g_flip_armed++;
 
 	_raw_spin_lock_irq(&crtc->dev->event_lock.rlock);
 	/* 没有池槽可挂（HEAP 回退的那批 buffer，或者 vblank 引用拿不到）：

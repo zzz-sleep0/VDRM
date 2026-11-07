@@ -14,9 +14,13 @@
 #     在【同名路径】下编，否则 md5 必然不同。这条对 App 的 .so 同样成立。
 #
 # 自校验（在某个目录下 `cd` 进去再编，源码叫 mkpool.c）：
-#   md5sum vdrm_mkpool  →  c7b653f96e1e950ae3a3d76862fb34c3   (15528 B)
+#   md5sum vdrm_mkpool  →  fbfbf29caf86ff76abb7e1ecb62298fe   (16040 B)
 #
-# 这个值随源码变。上一版是 f99801ad…（13896 B）—— `--mode WxH` 一条命令走完
+# 这一版加了 `--pool WxH`：只补这个尺寸的槽，不写 mode、不 commit。
+# 内核在合成器挑了一档、那档还没槽时把尺寸挂到 want_mode，App 看到就跑它
+# （`want pool 2780x1264` → mkpool --pool → REGISTER → dumb_create 醒来）。
+# 上一版是 c7b653f9…（15528 B）—— 只有 `--mode WxH`。
+# 再上一版是 f99801ad…（13896 B）—— `--mode WxH` 一条命令走完
 # prepare（写 mode）→ 建槽 → commit（EDID + hotplug）。
 # 再上一版是 5c62aecd…（13280 B）—— 建池前自己用 `wm size`
 # 查面板尺寸并 SET_SCREEN（不再依赖 App 上报窗口尺寸）。

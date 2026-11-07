@@ -234,12 +234,36 @@ int main(int argc, char **argv)
      *   3) 池齐了再写 commit = 更新 EDID + hotplug
      * 顺序固定，所以合成器收到热插拔时槽一定已经在了。*/
     const char *mode_arg = NULL;
+    const char *pool_arg = NULL;
 
-    for (i = 1; i < argc; i++)
+    for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
             mode_arg = argv[++i];
+        else if (strcmp(argv[i], "--pool") == 0 && i + 1 < argc)
+            pool_arg = argv[++i];
+    }
 
-    if (mode_arg) {
+    /* --pool WxH：只给这个尺寸补槽，**不写 mode 参数、不 commit**。
+     *
+     * 内核在合成器要一个"广告过但还没槽"的尺寸时，会通过 want_mode 参数 +
+     * eventfd 叫 App；App 就跑这一条。这样分辨率完全归合成器挑，我们只负责
+     * 把槽准备好。*/
+    if (pool_arg) {
+        uint32_t pw = 0, ph = 0;
+
+        if (sscanf(pool_arg, "%ux%u", &pw, &ph) == 2 && pw && ph) {
+            w = pw;
+            h = ph;
+            P("只补槽：%ux%u（不改 mode、不 commit）\n", w, h);
+        } else {
+            P("--pool 参数格式不对（要 WxH）：%s\n", pool_arg);
+        }
+    }
+
+    if (pool_arg) {
+        /* 尺寸已在上面按 --pool 设好；不能再走 "取 mode 参数" 的兜底，
+         * 否则会被当前生效尺寸覆盖掉。*/
+    } else if (mode_arg) {
         uint32_t mw = 0, mh = 0;
 
         if (sscanf(mode_arg, "%ux%u", &mw, &mh) == 2 && mw && mh) {
@@ -291,12 +315,17 @@ int main(int argc, char **argv)
     }
     if (have < 0)
         have = 0;
+    /* --pool：目标尺寸不是"当前生效尺寸"，mode_slots 统计的是后者 ——
+     * 不归零的话会因为"当前档已经有 6 个槽"而直接跳过，白跑一趟。*/
+    if (pool_arg)
+        have = 0;
     P("池里已有 %d 个 %ux%u 的槽（目标 %d）\n", have, w, h, NPOOL);
     if (have >= NPOOL) {
         P("done: %d/%d registered; 池已够，无需补齐\n", have, NPOOL);
 
-        /* 池本来就够，也要 commit —— 否则这次的 mode 永远不会广播出去。*/
-        if (mode_arg) {
+        /* 池本来就够，也要 commit —— 否则这次的 mode 永远不会广播出去。
+         * --pool 只补槽，不广播。*/
+        if (mode_arg && !pool_arg) {
             if (write_param("commit", "1") == 0)
                 P("commit: EDID + hotplug 已发出\n");
             else
@@ -361,8 +390,9 @@ int main(int argc, char **argv)
     }
     P("done: %d/%d registered; 退出后池由 KPM 持住\n", have + ok, NPOOL);
 
-    /* 槽齐了才广播新尺寸：合成器换档时一定有 buffer 可用。*/
-    if (mode_arg) {
+    /* 槽齐了才广播新尺寸：合成器换档时一定有 buffer 可用。
+     * --pool 只补槽，不广播。*/
+    if (mode_arg && !pool_arg) {
         if (write_param("commit", "1") == 0)
             P("commit: EDID + hotplug 已发出\n");
         else
