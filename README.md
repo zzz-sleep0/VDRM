@@ -102,18 +102,42 @@ dnf install -y plasma-workspace kwin kscreen
 
 ## 5. 起桌面
 
+做成 systemd 服务，从任何入口（容器控制台 / 管理器 shell）都能起，也不怕关掉终端：
+
 ```sh
-install -d -m 700 /tmp/xdg
-export XDG_RUNTIME_DIR=/tmp/xdg
-dbus-run-session -- startplasma-wayland
+cat > /etc/systemd/system/vdrm-kde.service <<'EOF'
+[Unit]
+Description=VDRM: KDE session on the virtual display
+After=systemd-user-sessions.service vdrm-input.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/tmp/xdg
+Environment=KWIN_DRM_DEVICES=/dev/dri/card1
+Environment=MESA_LOADER_DRIVER_OVERRIDE=msm
+ExecStartPre=/bin/sh -c "install -d -m 700 /tmp/xdg"
+ExecStart=/usr/bin/dbus-run-session -- /usr/sbin/startplasma-wayland
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now vdrm-kde
 ```
 
-换合成器就换最后一行：`niri` / `Hyprland` / `sway`。
+日常操作就是 `systemctl start vdrm-kde` / `stop` / `status`，开机（容器启动）自动起。
+
+确认出图：
 
 ```sh
-cat /sys/module/vdrm/parameters/frames_pushed   # 动鼠标，要涨
+pgrep -c -x kwin_wayland                        # 1
+cat /sys/module/vdrm/parameters/frames_pushed   # 动鼠标要涨
 cat /sys/module/vdrm/parameters/active
 ```
+
+换合成器就把 `ExecStart` 换成 `niri` / `Hyprland` / `sway`。
 
 ## 6. 装 App
 
