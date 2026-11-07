@@ -14,7 +14,7 @@ Hyprland / sway）直接画在上面，App 负责显示、虚拟键鼠和声音�
 
 ## 1. 装模块
 
-模块管理器刷 `vdrm-lkm-*.zip`，重启手机。检查：
+刷 `vdrm-lkm-*.zip`，重启手机。
 
 ```sh
 su -c 'lsmod | grep ^vdrm'
@@ -23,8 +23,7 @@ ls -l /dev/vdrm        # crw-rw-rw-
 
 ## 2. 建容器
 
-**不要开「完整硬件访问」（`enable_hw_access`）**，把需要的设备逐个挂进来就够。实测的
-Fedora 43 配置（改 `container.config`）：
+改 `container.config`（实测的 Fedora 43 配置）：
 
 ```ini
 enable_hw_access=0
@@ -34,24 +33,32 @@ privileged=nomask
 bind_mounts=/dev/dri/card1:/dev/dri/card1,/dev/input:/dev/input,/dev/snd:/dev/snd
 ```
 
-**为什么不开 `enable_hw_access`**：开了之后 `/sys` 在容器里是**可写**的，容器里装或
-升级驱动（Mesa 之类）会往 `/sys` 写，可能把整机软重启一次。不开的话 `/sys` 只读。
+改 `.env`：
 
-代价是容器里没有 udev 可用：`/sys` 只读，`udevadm trigger` 直接失败，于是设备节点和
-`ID_INPUT*` 属性都不会有人建。解决办法是**用 systemd 的 oneshot 顶替 udev**：容器里
-systemd 一定是 PID 1，让它开机跑一次脚本就行。脚本在仓库 `tools/vdrm-container-setup.sh`：
+```ini
+MESA_LOADER_DRIVER_OVERRIDE=msm
+LIBSEAT_BACKEND=noop
+```
+
+`enable_hw_access` 保持 0：开了之后容器里 `/sys` 可写，装驱动可能把整机软重启。
+代价是容器里没有 udev，所以下一步用 systemd oneshot 顶替。
+
+## 3. 容器里装节点服务
+
+用 systemd 顶替 udev：把 `tools/vdrm-container-setup.sh` 装成 oneshot，开机建
+`/dev/input`、`/dev/snd` 和 `/run/udev/data` 属性。
 
 ```sh
 install -m 755 vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
 cat > /etc/systemd/system/vdrm-input.service <<'EOF'
 [Unit]
 Description=vdrm: only expose the virtual input devices
-After=local-fs.target            # 要写 /dev、/run/udev/data，等挂载就绪
-Before=display-manager.service   # 合成器起来前必须做完，libinput 只在启动时枚举
+After=local-fs.target
+Before=display-manager.service
 
 [Service]
-Type=oneshot                     # 一次性任务，跑完就退出
-RemainAfterExit=yes              # 但让 systemd 记住"已完成"（状态 active）
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/local/sbin/vdrm-container-setup
 
 [Install]
@@ -60,42 +67,22 @@ EOF
 systemctl enable --now vdrm-input
 ```
 
-**它开机干三件事（顺序不能换）**
-
-1. `mount --make-rprivate /dev`，再用 tmpfs **顶掉** `/dev/input`、`/dev/snd`；
-2. 在 tmpfs 里 `mknod` 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）
-   并建 `vdrm-kbd` / `vdrm-ptr` / `vdrm-touch` 软链 —— 手机真实的触摸/电源键/指纹
-   **根本不会出现在容器里**，root 跑合成器也不用再做设备排除；
-3. 往 `/run/udev/data/c13:<minor>` 写属性：`ID_INPUT` + `MOUSE` / `TOUCHSCREEN` /
-   `KEYBOARD`。**这一步不能省** —— libinput 走 libudev 枚举，没有这些属性会直接
-   跳过设备，表现是"合成器起来了、画面正常、但完全没输入"。
-
-> ⚠️ **不要手动在容器里 `rm` / `chmod` `/dev/input`、`/dev/snd`**：这两个目录是宿主机
-> 目录的 bind mount，里面是**同一批 inode** —— 在容器里删一个节点，宿主机上就真的没了。
-> （踩过一次：删掉 `/dev/input/event*` 之后 Android 直接没有触摸和按键，只能强制重启。）
-> 脚本里所以先挂 tmpfs、**用我们自己的 fsname 确认挂上了**才动，任何一步不对就 `exit 1`。
-
-**怎么确认它对**
+它依次做三件事：`mount --make-rprivate /dev` 后用 tmpfs 顶掉 `/dev/input`、
+`/dev/snd`；mknod 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）；
+写 `/run/udev/data/c13:<minor>` 的 `ID_INPUT*`（缺了 libinput 会直接跳过设备）。
 
 ```sh
-systemctl is-active vdrm-input          # active
-ls /dev/input/                          # 只有 event7/8/9 + vdrm-kbd/ptr/touch
-libinput list-devices | grep -E '^Device'
-#   Device: vdrm-kbd      Capabilities: keyboard
-#   Device: vdrm-ptr      Capabilities: pointer
-#   Device: vdrm-touch    Capabilities: touch
+systemctl is-active vdrm-input      # active
+ls /dev/input/                      # event7/8/9 + vdrm-kbd/ptr/touch
 ```
 
-> 模块重新加载后 `eventN` 编号会变，记得 `systemctl restart vdrm-input`。
+⚠️ 别在容器里 `rm`/`chmod` `/dev/input`、`/dev/snd`：那是宿主机目录的 bind mount，
+同一批 inode，删掉宿主机上就真没了（会让 Android 失去触摸）。脚本会先挂 tmpfs 并
+用自己的 fsname 确认挂上才动手。
 
-容器 `.env`：
+模块重载后 `eventN` 编号会变：`systemctl restart vdrm-input`。
 
-```ini
-MESA_LOADER_DRIVER_OVERRIDE=msm
-LIBSEAT_BACKEND=noop
-```
-
-## 3. 容器里装三样
+## 4. 装 Mesa / GBM / 合成器
 
 ```sh
 # Mesa（Fedora 43；Arch 换对应包）
@@ -109,7 +96,7 @@ cp vdrm_gbm.so /usr/lib64/gbm/
 dnf install -y plasma-workspace kwin kscreen
 ```
 
-## 4. 起桌面
+## 5. 起桌面
 
 ```sh
 install -d -m 700 /tmp/xdg
@@ -117,25 +104,23 @@ export XDG_RUNTIME_DIR=/tmp/xdg
 dbus-run-session -- startplasma-wayland
 ```
 
-换了合成器就换最后一行（`niri` / `Hyprland` / `sway`）。确认出图：
+换合成器就换最后一行：`niri` / `Hyprland` / `sway`。
 
 ```sh
-cat /sys/module/vdrm/parameters/frames_pushed   # 动鼠标，这个数要涨
+cat /sys/module/vdrm/parameters/frames_pushed   # 动鼠标，要涨
 cat /sys/module/vdrm/parameters/active
 ```
 
-## 5. 装 App
+## 6. 装 App
 
-装 `vdrm-debug.apk`，打开，给通知权限和 root 授权，**保持运行**。通知里两个按钮：
+装 `vdrm-debug.apk`，打开，给通知权限和 root 授权，保持运行。
 
-| | |
+| 通知 | 作用 |
 |---|---|
 | `刷新` | 重读内核参数 |
-| `命令` | `input 0` 触摸当鼠标 / `input 1` 触摸当触控屏 / `commit` 广播参数 |
+| `命令` | `input 0` 鼠标 / `input 1` 触控屏 / `commit` 广播参数 |
 
-## 6. 切分辨率 / 缩放
-
-在合成器里切：
+## 7. 切分辨率 / 缩放
 
 ```sh
 kscreen-doctor output.1.mode.2                 # KWin（-o 先看列表）
@@ -143,10 +128,10 @@ niri msg output Virtual-3 mode 1264x2780       # niri
 swaymsg output Virtual-3 mode 1264x2780        # sway
 ```
 
-缩放写在合成器自己的配置里（niri `output "Virtual-3" { scale 1.5 }`，
+缩放写在合成器配置里（niri `output "Virtual-3" { scale 1.5 }`，
 Hyprland `monitor=Virtual-3,preferred,auto,1.5`，KWin 用系统设置）。
 
-开机默认档写在模块目录的 `mode.conf`：
+开机默认档在模块目录 `mode.conf`：
 
 ```
 mode=1920x1080
@@ -154,9 +139,7 @@ mode=1920x1080
 #dpi=256
 ```
 
-## 7. 声音
-
-容器里当普通输出设备用：
+## 8. 声音
 
 ```sh
 aplay -l | grep vdrm
@@ -168,8 +151,8 @@ aplay -l | grep vdrm
 - **先单独 `insmod` 验一遍。** 不要跳过模块自己的兼容性检验：
   用自己 KMI 的那个 `.ko` 单独 `insmod`，不重启再继续往下装。
 - **设备排除。**
-- 内核模块模块加载后自己把虚拟键鼠的 `/dev/input/event*`（相比于你加载内核模块之前多出来的那几个）换成 0600 root 节点，系统 InputReader 打不开就看不见。
-- 容器侧不用再单独排除：按「配容器」装好那个 systemd 服务后，容器里只有 vdrm 三个虚拟设备，
+- 内核模块加载后自己把虚拟键鼠的 `/dev/input/event*`（相比于你加载内核模块之前多出来的那几个）换成 0600 root 节点，系统 InputReader 打不开就看不见。
+- 容器侧不用再单独排除：装好第 3 步那个 systemd 服务后，容器里只有 vdrm 三个虚拟设备，
   手机真实的触摸/电源键/指纹看不见（root 跑合成器也一样）。
 
 ## 鸣谢
