@@ -309,7 +309,37 @@ static size_t submission_count(void);
 static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh);
 static void vdrm_return(int id);
 
+/* 后台静默：App 不在前台时 SF 不再消费，present 间隔会拉大。这个状态下一帧
+ * 都不 latch（拿到就把槽还给内核，连拷贝都不做），于是后台什么都不攒，
+ * 回到前台时槽状态和离开时一样。判定不用改 Java：present 间隔 > 300ms 就算
+ * 后台，nativeSetReady（回前台）会清掉。*/
+static atomic_bool g_quiet;
+
+static bool quiet_now(void)
+{
+    return atomic_load(&g_quiet);
+}
+
+/* 静默期间每 ~1 秒仍然 latch 一帧当探针：有 present 回来就说明已回前台
+ * （present 会把 g_quiet 清掉），否则继续静默。没有这个探针就会永远卡在
+ * 静默里 —— 不 latch 就没有 present，没有 present 就退不出来。*/
+static bool probe_due(void)
+{
+    static unsigned long n;
+    return (++n % 60) == 0;
+}
+
 static void on_present(void *context, ASurfaceTransactionStats *stats);
+static void quiet_tick(void)
+{
+    static uint64_t last_ms;
+    uint64_t now = now_ms();
+
+    if (last_ms && now - last_ms > 300)
+        atomic_store(&g_quiet, true);
+    last_ms = now;
+}
+
 static void vdrm_presented(int id);
 
 
@@ -877,6 +907,7 @@ struct vdrm_present_req { uint32_t id; uint32_t flags; };
 
 static void vdrm_presented(int id)
 {
+    atomic_store(&g_quiet, false);   /* 有帧真的上屏了 => 已经在前台 */
     struct vdrm_present_req req;
 
     memset(&req, 0, sizeof(req));
@@ -1936,6 +1967,14 @@ static void *render_loop(void *arg)
                 return_unsubmitted(target_slot);
                 continue;
             }
+        }
+
+        quiet_tick();          /* present 断太久 = 在后台 */
+        if (quiet_now() && !probe_due()) {
+            /* 后台：内容没人看，直接归还，绝不攒状态。*/
+            pthread_mutex_unlock(&g_geometry_lock);
+            return_unsubmitted(target_slot);
+            continue;
         }
 
         bool shown = sc_latch(ahb, target_slot, (uint32_t)c->mode_w,
@@ -3191,8 +3230,9 @@ Java_com_vdrm_consumer_Native_nativeSetReady(JNIEnv *env, jclass clazz, jlong ha
         errno != EINVAL)
         LOGW("READY ioctl err=%d", errno);
 
-    /* 回前台第一件事：把后台期间攒下的"等 release"槽全部还给内核，
+    /* 回前台：退出静默 + 把后台期间攒下的"等 release"槽全部还给内核，
      * 否则合成器要等 6 秒的 dumb_create。*/
+    atomic_store(&g_quiet, false);
     held_expire_force(true);
     rcopy_release_all();
 
