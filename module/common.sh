@@ -146,6 +146,8 @@ vdrm_fix_nodes() {
 
 vdrm_hide_input_once() {
     VDRM_HIDDEN=0
+    # 宿主 /dev/input 下绝不能留 vdrm-* symlink；它们是旧容器脚本直接 ln 的残留。
+    rm -f /dev/input/vdrm-kbd /dev/input/vdrm-ptr /dev/input/vdrm-touch
     for p in /sys/class/input/event*/device/name; do
         [ -e "$p" ] || continue
         case "$(cat "$p" 2>/dev/null)" in
