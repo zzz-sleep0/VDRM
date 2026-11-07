@@ -11,9 +11,9 @@
 - session 是 `VTNr=1 / Seat=seat0 / Active=yes`，输入通过 logind
   `TakeDevice` 进来。
 
-前提：内核模块提供虚拟 VT（`/sys/class/tty/tty0/active` 存在），并且
-`vdrm-input.service` 已按 `tools/vdrm-container-setup.sh` 建好
-`/dev/tty0..6`、输入 udev data（含父 `inputN`）和 **`/run/udev/tags`**。
+前提：内核模块提供虚拟 VT；容器运行时已 bind `/dev/tty0..6`、`/dev/dri/card1`、
+`/dev/input/eventN`、`/dev/snd/*`。`vdrm-udev.service` 只写 `/run/udev/data`/tags，
+不 mknod、不 mount、不 mask。
 
 ## 1. 装文件
 
@@ -29,10 +29,6 @@ install -m 644 docs/container/sddm/10-vdrm.conf \
 install -d /etc/systemd/system/sddm.service.d
 install -m 644 docs/container/sddm/override.conf \
   /etc/systemd/system/sddm.service.d/override.conf
-
-install -d /etc/systemd/system/vdrm-input.service.d
-install -m 644 docs/container/sddm/order.conf \
-  /etc/systemd/system/vdrm-input.service.d/order.conf
 
 # SDDM 进程（greeter）和 user session 都要有 MESA/KWIN
 cp docs/container/sddm/environment /etc/environment
@@ -65,9 +61,8 @@ systemctl disable --now vdrm-kde
 
 `vdrm-kde.service` 还是可以留着当 fallback；两个都 enable 会抢 card1。
 
-`vdrm-input.service` 必须是新脚本，并且 `Before=systemd-logind.service`：
-它现在要赶在 logind 之前写 `/run/udev/data` 和 `/run/udev/tags`。
-`order.conf` 就是干这个的。
+设备节点由运行时 bind；`vdrm-udev.service` 在 logind 之前只写
+`/run/udev/data` 和 `/run/udev/tags`，不碰 `/dev`。
 
 ## 3. 重启容器验证
 
@@ -103,12 +98,9 @@ XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
    PAM session。`tools/vdrm-sddm-start.sh` 里的 `trap '' HUP` 是必须的；忽略
    信号会跨 exec 保留。
 
-2. **`/run/udev/tags` 不是 `/run/udev/data`**。logind 启动时按
-   `master-of-seat` 枚举设备，用的是 `/run/udev/tags/master-of-seat/<devid>`
-   空文件；只写 `c226:1` 的 `Q:master-of-seat`，`udevadm info` 会显示 tag，
-   但 logind 枚举不到，seat0 就没有图形设备（SDDM 报
-   `No graphical seats found`）。`vdrm-container-setup.sh` 现在会建这些 tag；
-   `vdrm-input` 必须在 logind 之前跑。
+2. **`/run/udev/tags` 不是 `/run/udev/data`**。`vdrm-udev.service` 会同时写
+   data 和 tags；只写 data 时 logind 的 `master-of-seat` 枚举不到。它必须在
+   logind 之前跑，但只写 `/run/udev`，不 mknod/mount/mask。
 
 ## 关于 DBus：别再用私有 `dbus-run-session`
 

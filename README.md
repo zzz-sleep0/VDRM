@@ -53,54 +53,33 @@ LIBSEAT_BACKEND=noop
 `enable_hw_access` 保持 0：开了之后容器里 `/sys` 可写，装驱动可能把整机软重启。
 代价是容器里没有 udev，所以下一步用 systemd oneshot 顶替。
 
-## 3. 容器里装节点服务
+## 3. 容器里写 udev 数据
 
-用 systemd 顶替 udev：把下面这个脚本装成 oneshot，开机建 `/dev/input`、
-`/dev/snd`、`/dev/tty0..6` 和 `/run/udev/data` 属性。
+设备节点由容器运行时逐个 bind 进容器：
 
-```sh
-# 脚本（也在仓库 tools/ 里）
-curl -L -o /tmp/vdrm-container-setup.sh \
-  https://raw.githubusercontent.com/zzz-sleep0/VDRM/main/tools/vdrm-container-setup.sh
-install -m 755 /tmp/vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
-cat > /etc/systemd/system/vdrm-input.service <<'EOF'
-[Unit]
-Description=vdrm: only expose the virtual input devices
-After=local-fs.target
-# 必须在 logind 之前写好 card 的 master-of-seat 和输入设备的 seat 属性；
-# 否则 SDDM 会报 "No graphical seats found"，KWin 也拿不到 card/input。
-Before=systemd-logind.service display-manager.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/vdrm-container-setup
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable --now vdrm-input
+```text
+/dev/tty0..6       ← 宿主 vdrm VT
+/dev/dri/card1     ← 宿主虚拟 DRM
+/dev/input/eventN  ← 宿主 vdrm-kbd/ptr/touch
+/dev/snd/*         ← 宿主 vdrm 声卡
 ```
 
-它依次做四件事：`mount --make-rprivate /dev` 后用 tmpfs 顶掉 `/dev/input`、
-`/dev/snd`；mknod 出 vdrm 三台虚拟设备（输入 `0666`，声卡 `root:audio 0660`）；
-把 droidspaces 预置的 `/dev/tty1..6`（`/dev/null` 或 tmpfs）换成真正的 `4:N`；
-写 `/run/udev/data/c13:<minor>` 的 `ID_INPUT*` + `G/Q:seat`，以及父
-`inputN` 的 `+input:inputN`（只给 eventN 不够：logind 的 `TakeDevice` 是按父
-`inputN` 查 seat 的）。
+systemd 只负责 udev 的职责：运行 `vdrm-container-setup`，把
+`/run/udev/data`、`/run/udev/tags` 写好，让 logind/合成器能激活这些设备。
+它**不 mknod、不 mount、不 mask、不碰 `/dev`**。
 
 ```sh
-systemctl is-active vdrm-input      # active
-ls /dev/input/                      # event7/8/9 + vdrm-kbd/ptr/touch
-ls -l /dev/tty0 /dev/tty1           # 4,0 / 4,1
+install -m 755 tools/vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
+install -m 644 docs/container/systemd/vdrm-udev.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now vdrm-udev
 ```
 
-⚠️ 别在容器里 `rm`/`chmod` `/dev/input`、`/dev/snd`：那是宿主机目录的 bind mount，
-同一批 inode，删掉宿主机上就真没了（会让 Android 失去触摸）。脚本会先挂 tmpfs 并
-用自己的 fsname 确认挂上才动手。
-
-模块重载后 `eventN` 编号会变：`systemctl restart vdrm-input`；KDE 也要重启
-（`systemctl restart vdrm-kde`，必要时先 `loginctl kill-session`）。
+```sh
+systemctl is-active vdrm-udev
+cat /run/udev/data/c226:1              # DRM seat/master-of-seat
+cat /run/udev/data/c13:71              # vdrm-kbd 的 ID_INPUT*/Q:seat
+```
 
 ## 4. 装 Mesa / GBM / 合成器
 
@@ -179,8 +158,8 @@ journalctl -b | grep "Could not determine the active graphical session"
 `docs/container/sddm/` 里有现成文件，安装步骤见
 [`docs/container/sddm/README.md`](docs/container/sddm/README.md)。核心是三件事：
 
-- 设备节点由容器运行时 bind，udev/logind 自己生成 seat 属性；
-  不要再让 systemd 去 mknod/mask；
+- 设备节点由容器运行时 bind；`vdrm-udev` 只写 `/run/udev` 数据，
+  不 mknod、不 mount、不 mask；
 - 用 `tools/vdrm-sddm-start.sh` 包装会话：`trap '' HUP`、清 `LIBSEAT_BACKEND`，
   **保留** SDDM/PAM 给的 `DBUS_SESSION_BUS_ADDRESS=/run/user/0/bus`，然后
   `plasma-dbus-run-session-if-needed startplasma-wayland`。不 `trap` 的话，

@@ -3,6 +3,39 @@
 > 这里记的是**为什么这么改**：每一项的根因、证据、修法。
 > 只想把模块跑起来的话看 `README.md` 就够了，不必读这份。
 
+## 本版本第六十四项：systemd 只写 udev 数据；重载先停合成器/App，无需软重启
+
+### 1. systemd 不碰 /dev
+
+systemd 不负责 mknod/mount/mask。`vdrm-udev.service` 只运行
+`vdrm-container-setup`，写：
+
+- `/run/udev/data/c226:1`：DRM seat/master-of-seat；
+- `/run/udev/data/c13:<minor>` 和父 `+input:inputN`：input seat；
+- `/run/udev/data/c116:*`：vdrm 声卡 seat；
+- 对应 `/run/udev/tags`。
+
+设备节点 `/dev/tty0..6`、`/dev/dri/card1`、`/dev/input/eventN`、`/dev/snd/*`
+由容器运行时逐个 bind，service 完全不碰。
+
+### 2. 重载流程：先停合成器/App
+
+`tools/vdrm_reload.sh` 现在：
+
+1. `am force-stop com.vdrm.consumer`；
+2. 停 Fedora 的 `sddm`/KWin；
+3. `rmmod` / `insmod`；
+4. 立即 `vdrm_fix_nodes` + `vdrm_hide_input`（此时没人持有 `/dev/input`）；
+5. 重启 SDDM/App。
+
+因此模块重载不需要软重启；Android 的 InputReader 也不会打开新节点。
+之前软重启是因为先加载模块、InputReader 已经开了 fd 之后才 hide。
+
+### 3. `/dev/ttynull`
+
+`/dev/ttynull` 是 Android `CONFIG_NULL_TTY`（235:0），`/dev/tty0` 是 vdrm VT（4:0），
+不同 driver；容器没有 ttynull，不要删宿主 ttynull，只 bind tty0。
+
 ## 本版本第六十三项：恢复通用节点服务；输入排除用软重启
 
 之前把 `vdrm-container-setup.sh` 删掉、改成只跑 `udevadm trigger`，在 `/sys` 只读的

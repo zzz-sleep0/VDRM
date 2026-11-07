@@ -1,5 +1,5 @@
 [Unit]
-Description=vdrm: only expose the virtual input devices
+Description=VDRM: write udev data for already-mounted virtual devices
 After=local-fs.target
 Before=systemd-logind.service display-manager.service
 
