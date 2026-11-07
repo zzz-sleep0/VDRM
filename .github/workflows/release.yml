@@ -44,12 +44,14 @@ jobs:
       # 以前这里直接 cp，等于依赖"本地编好、恰好没被清掉"的文件 —— 干净
       # checkout 上这一步会 cp 失败。所以在装配前现编一次：
       # 只依赖 libc + 容器/构建机自带的 gbm.h，几十毫秒的事。
-      - name: Build vdrm_gbm.so
+      - name: Build vdrm_gbm.so (aarch64)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential
-          make -C vdrm-gbm
-          file vdrm-gbm/vdrm_gbm.so
+          # 产物要跑在手机上的 aarch64 容器里，必须是交叉编译 —— 直接用
+          # 构建机自带的 gcc 会编出 x86-64 的 .so（以前发出去的就是）。
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          make -C vdrm-gbm CC=aarch64-linux-gnu-gcc
+          file vdrm-gbm/vdrm_gbm.so | tee /dev/stderr | grep -q aarch64
 
       - name: Collect assets
         run: |
