@@ -316,8 +316,8 @@ su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
 bind，不再有 systemd mknod/service。
 
 注意：如果 InputReader 已经打开过这些 event fd，改权限不会把它从 Android
-设备表里立刻移除；**模块重载后需要重启一次**，让 post-fs-data 在 zygote 之前
-完成隐藏。开机后 `dumpsys input | grep vdrm` 应该为空。
+设备表里立刻移除；**模块重载后需要重启手机，或 `stop; start` 重启 Android
+framework**，让 InputReader 释放旧 fd；开机时 post-fs-data 会在 zygote 之前完成隐藏。开机后 `dumpsys input | grep vdrm` 应该为空。
 
 ## 鸣谢
 
