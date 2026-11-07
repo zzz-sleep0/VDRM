@@ -1526,6 +1526,21 @@ static bool vdrm_pool_has_pending(void)
 	return any;
 }
 
+/* DRM core 里还有没有 arm 出去、等 vblank 的 flip 事件？*/
+static bool vdrm_core_has_armed(void)
+{
+	struct drm_device *dev = g_pipe ? g_pipe->crtc.dev : NULL;
+	unsigned long fl;
+	bool any;
+
+	if (!dev)
+		return false;
+	spin_lock_irqsave(&dev->event_lock, fl);
+	any = !list_empty(&dev->vblank_event_list);
+	spin_unlock_irqrestore(&dev->event_lock, fl);
+	return any;
+}
+
 static void vdrm_flip_complete(struct drm_pending_vblank_event *ev)
 {
 	struct drm_crtc *crtc;
@@ -2566,7 +2581,11 @@ static enum hrtimer_restart vdrm_vblank_timer_fn(struct hrtimer *t)
 		}
 	}
 
-	if (!g_vblank_on && !g_vblank_kick_ticks && !vdrm_pool_has_pending())
+	/* 只要还有 arm 出去的事件（DRM core 的 vblank_event_list 非空），网格就
+	 * 不能停：pace=0 下那些事件全靠 tick 发出去，一停就是"合成器永远等
+	 * 第一帧 → 不做 modeset → pipe 关着 → 黑屏"的死循环（实测踩过）。*/
+	if (!g_vblank_on && !g_vblank_kick_ticks && !vdrm_pool_has_pending() &&
+	    !vdrm_core_has_armed())
 		vdrm_vblank_grid_stop();
 
 	/* 用绝对时间推进，停机再开能接回原相位 */
@@ -2665,6 +2684,12 @@ static void vdrm_pipe_enable(struct drm_simple_display_pipe *pipe,
 			g_vblank_period_ns = p;
 	}
 #endif
+	/* 每次 modeset 之后都强制预热几拍：合成器的第一帧 flip-done 也靠 tick
+	 * 发出去，不能等它自己来驱动网格（pipe 刚 enable 时没人持有 vblank
+	 * 引用，网格不会自己跑起来）。*/
+	g_vblank_kick_ticks = 3;
+	vdrm_vblank_grid_start();
+
 	/* 合成器真正编程进去的尺寸 = 池/GET_INFO 要跟随的尺寸。*/
 	if (m->hdisplay && m->vdisplay &&
 	    (g_active_w != m->hdisplay || g_active_h != m->vdisplay)) {
@@ -2973,6 +2998,7 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 		drm_crtc_arm_vblank_event(crtc, event);
 	_raw_spin_unlock_irq(&crtc->dev->event_lock.rlock);
 
+	vdrm_vblank_grid_start();
 	pr_debug("vdrm: pipe update -> event armed\n");
 }
 
