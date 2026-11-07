@@ -223,7 +223,14 @@ su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
 
 `rmmod vdrm`，在模块管理器刷 `vdrm-lkm-*.zip`，重启。之后按第 2 步往后正常部署。
 
-### 容器侧不用再排除设备
+### 设备排除（模块没自动藏住时手动补一刀）
+
+```sh
+chown root:root /dev/input/event*     # 只对 vdrm 那三个节点做
+chmod 0600 /dev/input/event*
+```
+
+### 容器侧不用再排除
 
 模块加载后自己把虚拟键鼠的 `/dev/input/event*`（比加载前多出来的那几个）换成 0600
 root 节点，Android 的 InputReader 打不开就看不见；容器侧装好第 3 步那个 service 后，
