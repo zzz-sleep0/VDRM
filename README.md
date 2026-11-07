@@ -14,7 +14,8 @@ Hyprland / sway）直接画在上面，App 负责显示、虚拟键鼠和声音�
 
 ## 1. 装模块
 
-刷 `vdrm-lkm-*.zip`，重启手机。
+刷 `vdrm-lkm-*.zip`，重启手机。（内核不符合 GKI 标准的话，先做文末「兼容性自测」，
+别直接刷 zip。）
 
 ```sh
 su -c 'lsmod | grep ^vdrm'
@@ -124,16 +125,13 @@ cat /sys/module/vdrm/parameters/active
 | `触控` | 手机触摸当触控屏（按哪点哪） |
 | `刷新` | 重读内核参数 |
 
-## 7. 切分辨率 / 缩放
+## 7. 切分辨率
 
 ```sh
 kscreen-doctor output.1.mode.2                 # KWin（-o 先看列表）
 niri msg output Virtual-3 mode 1264x2780       # niri
 swaymsg output Virtual-3 mode 1264x2780        # sway
 ```
-
-缩放写在合成器配置里（niri `output "Virtual-3" { scale 1.5 }`，
-Hyprland `monitor=Virtual-3,preferred,auto,1.5`，KWin 用系统设置）。
 
 开机默认档在模块目录 `mode.conf`：
 
@@ -149,15 +147,86 @@ mode=1920x1080
 aplay -l | grep vdrm
 ```
 
-## 注意（如果你的内核在支持的KMI中，但是疑似较大程度上不符合GKI标准，请重点阅读这里）
+## 注意：兼容性自测（不符合 GKI 标准的内核，先做这一步）
 
-- **先记一下你的/dev/input/event*下都有什么设备**，后面要用
-- **先单独 `insmod` 验一遍。** 不要跳过模块自己的兼容性检验：
-  用自己 KMI 的那个 `.ko` 单独 `insmod`，不重启再继续往下装。
-- **设备排除。**
-- 内核模块加载后自己把虚拟键鼠的 `/dev/input/event*`（相比于你加载内核模块之前多出来的那几个）换成 0600 root 节点，系统 InputReader 打不开就看不见。
-- 容器侧不用再单独排除：装好第 3 步那个 systemd 服务后，容器里只有 vdrm 三个虚拟设备，
-  手机真实的触摸/电源键/指纹看不见（root 跑合成器也一样）。
+**别先刷 zip。** 按下面的顺序单独验一遍，任何一步不对就 `rmmod` 收手，刷了 zip 只会
+更难恢复。刷之前先准备好抢救手段（音量键进 recovery / 强制重启）。
+
+### 1. 记下现状
+
+```sh
+uname -r                                  # 决定的 KMI，比如 6.1.x-android14-...
+for p in /sys/class/input/event*/device/name; do echo "$p: $(cat $p)"; done
+```
+
+把 `eventN` 列表抄下来——模块加载后会多出 `vdrm-kbd` / `vdrm-ptr` / `vdrm-touch` 三个。
+
+### 2. 只解出 .ko，单独 insmod
+
+```sh
+mkdir -p /data/local/tmp/vdrm && cd /data/local/tmp/vdrm
+unzip /sdcard/vdrm-lkm-v3.*.zip 'vdrm-*.ko'      # 只取 .ko，别的先别装
+su -c 'insmod /data/local/tmp/vdrm/vdrm-android14-6.1.ko'
+```
+
+### 3. 看 dmesg 走到哪一步
+
+```sh
+su -c 'dmesg | grep vdrm' | tail -30
+```
+
+正常应该依次出现（缺哪个，就是卡在哪一步）：
+
+```
+vdrm: registered
+vdrm: /dev/vdrm registered (minor=..)
+vdrm: stage=register-ok
+input: vdrm-kbd as /devices/virtual/input/inputNN
+input: vdrm-ptr ...
+input: vdrm-touch ...
+vdrm: stage=input-ok
+vdrm: audio ready (/dev/vdrm-audio out 48000 Hz 2 ch ring 524288, ...)
+vdrm: bring-up ok (dev=...)
+```
+
+`insmod` 直接 panic / 手机重启 = 这个内核不兼容，**到此为止**。
+
+### 4. 检查节点
+
+```sh
+ls -l /dev/vdrm /dev/vdrm-audio /dev/vdrm-audio-in     # 三个都在
+ls -l /dev/dri/card1                                   # 226,1
+cat /proc/asound/cards | grep vdrm                     # 有一张 vdrm 声卡
+```
+
+节点权限在手工 `insmod` 时是默认值，验证阶段先给开：
+
+```sh
+su -c 'chmod 666 /dev/vdrm /dev/vdrm-audio /dev/vdrm-audio-in'
+su -c 'chcon u:object_r:gpu_device:s0 /dev/vdrm'
+```
+
+### 5. 用 App 打通一条帧
+
+装 APK、打开、授权，然后：
+
+```sh
+su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
+```
+
+应该看到 `app eventfd registered` 和 **6 条** `REGISTER id=1..6 1920x1080`。屏幕出现
+画面（哪怕是纯色/黑边）就算通了；`cat /sys/module/vdrm/parameters/frames_pushed` 动一下
+鼠标要涨。
+
+### 6. 通过之后再刷 zip
+
+`rmmod vdrm`，在模块管理器刷 `vdrm-lkm-*.zip`，重启。之后按第 2 步往后正常部署。
+
+### 容器侧不用再排除设备
+
+模块加载后自己把虚拟键鼠的 `/dev/input/event*`（比加载前多出来的那几个）换成 0600
+root 节点，Android 的 InputReader 打不开就看不见；容器侧装好第 3 步那个 service 后，
+容器里只有 vdrm 三个虚拟设备，手机真实的触摸/电源键/指纹看不见（root 跑合成器也一样）。
 
 ## 鸣谢
 
