@@ -469,6 +469,15 @@ bool rcopy_blit(AHardwareBuffer *src, uint32_t sw, uint32_t sh,
 	return true;
 }
 
+/* 全部目标标记为空闲（回前台用：SF 在后台不会回调 release，环会一直满）*/
+void rcopy_release_all(void)
+{
+	pthread_mutex_lock(&g_lock);
+	for (int i = 0; i < RCOPY_TARGETS; i++)
+		g_tgt[i].busy = false;
+	pthread_mutex_unlock(&g_lock);
+}
+
 void rcopy_counters(unsigned long *frames, unsigned long *fails,
 		    unsigned long *givebacks, int *free_targets)
 {

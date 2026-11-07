@@ -319,6 +319,7 @@ static void maybe_request_pool(void);   /* 池按需创建（定义在后面）*
 static void held_add(uint64_t token, uint32_t slot);
 static bool held_take_return(uint64_t token);
 static void held_expire(void);
+static void held_expire_force(bool force);
 
 /* 把一块 AHB 贴到 SC 上（可反复调用，用于重贴最后一帧）*/
 static void sc_set_geometry(ASurfaceTransaction *t, uint32_t mw, uint32_t mh,
@@ -1434,7 +1435,11 @@ static bool held_take_return(uint64_t token)
 }
 
 /* 兜底：真等不到回调/ fence 时强制归还（并吼一声）*/
-static void held_expire(void)
+/* force=1：不等超时，把表里所有"等 release"的槽立刻还给内核。
+ * 从后台回到前台、或者 SurfaceControl 重建时要这么干 —— 否则 SF 在后台
+ * 不会给 release 回调，池槽一直挂在 DISPL，内核 dumb_create 会傻等 6 秒，
+ * 表现就是"切回前台冻住七八秒"（实测 evgap_max=7241ms）。*/
+static void held_expire_force(bool force)
 {
     uint32_t slots[HELD_MAX];
     int n = 0, i;
@@ -1442,17 +1447,23 @@ static void held_expire(void)
 
     pthread_mutex_lock(&g_display_lock);
     for (i = 0; i < HELD_MAX; i++) {
-        if (g_held[i].token && now - g_held[i].since_ms > HELD_TIMEOUT_MS) {
+        if (g_held[i].token && (force ||
+            now - g_held[i].since_ms > HELD_TIMEOUT_MS)) {
             slots[n++] = g_held[i].slot;
             g_held[i].token = 0;
         }
     }
     pthread_mutex_unlock(&g_display_lock);
     for (i = 0; i < n; i++) {
-        LOGW("held slot %u expired after %dms -> force return",
-             slots[i], HELD_TIMEOUT_MS);
+        LOGW("held slot %u %s -> return", slots[i],
+             force ? "(resume: forced)" : "(expired)");
         vdrm_return((int)slots[i]);
     }
+}
+
+static void held_expire(void)
+{
+    held_expire_force(false);
 }
 
 static void on_buf_release(void *context, int release_fd)
@@ -3179,6 +3190,11 @@ Java_com_vdrm_consumer_Native_nativeSetReady(JNIEnv *env, jclass clazz, jlong ha
     if (ioctl(g_vdrm_fd, VDRM_IOCTL_READY, &one) < 0 && errno != ENOTTY &&
         errno != EINVAL)
         LOGW("READY ioctl err=%d", errno);
+
+    /* 回前台第一件事：把后台期间攒下的"等 release"槽全部还给内核，
+     * 否则合成器要等 6 秒的 dumb_create。*/
+    held_expire_force(true);
+    rcopy_release_all();
 
     if (c && g_sc) {
         pthread_mutex_lock(&g_geometry_lock);

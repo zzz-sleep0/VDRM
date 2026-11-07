@@ -20,6 +20,9 @@ void rcopy_give_back(AHardwareBuffer *dst);
 bool rcopy_blit(AHardwareBuffer *src, uint32_t sw, uint32_t sh,
 		AHardwareBuffer *dst, uint32_t dw, uint32_t dh);
 
+/* 把所有目标标记为空闲（回前台/重建 SurfaceControl 时用）。*/
+void rcopy_release_all(void);
+
 /* 诊断计数。*/
 void rcopy_counters(unsigned long *frames, unsigned long *fails,
 		    unsigned long *givebacks, int *free_targets);
