@@ -160,7 +160,7 @@ uname -r                                  # 决定的 KMI，比如 6.1.x-android
 for p in /sys/class/input/event*/device/name; do echo "$p: $(cat $p)"; done
 ```
 
-把 `eventN` 列表抄下来——模块加载后会多出 `vdrm-kbd` / `vdrm-ptr` / `vdrm-touch` 三个。
+把 `eventN` 列表抄下来——模块加载后会多出 `vdrm-kbd` / `vdrm-ptr` / `vdrm-touch` 三个，随后的/dev/input/event*的设备号也会多处三个，跟着下面**排除设备**处理。
 
 ### 2. 只解出 .ko，单独 insmod
 
@@ -206,6 +206,13 @@ cat /proc/asound/cards | grep vdrm                     # 有一张 vdrm 声卡
 su -c 'chmod 666 /dev/vdrm /dev/vdrm-audio /dev/vdrm-audio-in'
 su -c 'chcon u:object_r:gpu_device:s0 /dev/vdrm'
 ```
+**设备排除**
+
+```sh
+# 只对 vdrm 那三个节点做
+chown root:root /dev/input/event*     
+chmod 0600 /dev/input/event*
+```
 
 ### 5. 用 App 打通一条帧
 
@@ -215,20 +222,15 @@ su -c 'chcon u:object_r:gpu_device:s0 /dev/vdrm'
 su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
 ```
 
-应该看到 `app eventfd registered` 和 **6 条** `REGISTER id=1..6 1920x1080`。屏幕出现
-画面（哪怕是纯色/黑边）就算通了；`cat /sys/module/vdrm/parameters/frames_pushed` 动一下
-鼠标要涨。
+应该看到 `app eventfd registered` 和 **6 条** `REGISTER id=1..6 1920x1080`。
+
+如果没有问题，而且急于想要看到效果，可以按照上面说的打开一个合成器看看有没有画面。
 
 ### 6. 通过之后再刷 zip
 
-`rmmod vdrm`，在模块管理器刷 `vdrm-lkm-*.zip`，重启。之后按第 2 步往后正常部署。
+在模块管理器刷 `vdrm-lkm-*.zip`，重启。之后按第 2 步往后正常部署。
 
-### 设备排除（模块没自动藏住时手动补一刀）
 
-```sh
-chown root:root /dev/input/event*     # 只对 vdrm 那三个节点做
-chmod 0600 /dev/input/event*
-```
 
 ### 容器侧不用再排除
 
