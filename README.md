@@ -45,11 +45,14 @@ LIBSEAT_BACKEND=noop
 
 ## 3. 容器里装节点服务
 
-用 systemd 顶替 udev：把 `tools/vdrm-container-setup.sh` 装成 oneshot，开机建
-`/dev/input`、`/dev/snd` 和 `/run/udev/data` 属性。
+用 systemd 顶替 udev：把下面这个脚本装成 oneshot，开机建 `/dev/input`、
+`/dev/snd` 和 `/run/udev/data` 属性。
 
 ```sh
-install -m 755 vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
+# 脚本（也在仓库 tools/ 里）
+curl -L -o /tmp/vdrm-container-setup.sh \
+  https://raw.githubusercontent.com/zzz-sleep0/VDRM/main/tools/vdrm-container-setup.sh
+install -m 755 /tmp/vdrm-container-setup.sh /usr/local/sbin/vdrm-container-setup
 cat > /etc/systemd/system/vdrm-input.service <<'EOF'
 [Unit]
 Description=vdrm: only expose the virtual input devices
@@ -115,10 +118,11 @@ cat /sys/module/vdrm/parameters/active
 
 装 `vdrm-debug.apk`，打开，给通知权限和 root 授权，保持运行。
 
-| 通知 | 作用 |
+| 通知按钮 | 作用 |
 |---|---|
+| `鼠标` | 手机触摸当鼠标（相对位移） |
+| `触控` | 手机触摸当触控屏（按哪点哪） |
 | `刷新` | 重读内核参数 |
-| `命令` | `input 0` 鼠标 / `input 1` 触控屏 / `commit` 广播参数 |
 
 ## 7. 切分辨率 / 缩放
 
