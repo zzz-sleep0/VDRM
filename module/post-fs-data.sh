@@ -12,5 +12,4 @@ MODDIR=${0%/*}
 . "$MODDIR/common.sh"
 
 vdrm_load || exit 0
-vdrm_fix_nodes
-vdrm_hide_input
+vdrm_sync_nodes

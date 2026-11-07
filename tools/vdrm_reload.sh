@@ -27,8 +27,7 @@ if grep -q '^vdrm ' /proc/modules; then
     exit 1
 fi
 vdrm_load || exit 1
-vdrm_fix_nodes
-vdrm_hide_input
+vdrm_sync_nodes
 
 # 4) 建池（没有池 App 会 0 bufs）
 "$MODDIR/vdrm_mkpool" --reset >/dev/null 2>&1 || say "mkpool 失败"

@@ -19,8 +19,7 @@ MODDIR=${0%/*}
 # post-fs-data.sh 没跑到（老管理器、手工装模块）时这里兜一次：设备还是能起来，
 # 只是这次启动 Android 会看见虚拟键鼠 —— 重启一次就干净了。
 vdrm_load || exit 1
-vdrm_fix_nodes
-vdrm_hide_input
+vdrm_sync_nodes
 
 # 2) 建池。mkpool 就在模块目录里，直接跑它 —— 不再往别处拷一份。
 #    （以前拷到 /data/wayland/vdrm_mkpool，那是守护进程时代留下的路径，已退役。

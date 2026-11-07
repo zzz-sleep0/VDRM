@@ -57,10 +57,9 @@ MODDIR=$MOD          # common.sh 用 MODDIR 找 mode.conf / vdrm-$KMI.ko
 vdrm_load || { say "模块加载失败（见 dmesg / logcat -s vdrm）"; exit 1; }
 say "模块就绪 $KO"
 
-# ---- 2. 节点：/dev/vdrm* 0666 + gpu_device；虚拟键鼠 0600 藏起来 ----
-vdrm_fix_nodes
-vdrm_hide_input
-say "/dev/vdrm 权限已修正，虚拟输入节点已从 Android 手里拿掉"
+# ---- 2. 节点：以 sysfs 为准校正主次号/权限/标签 ----
+vdrm_sync_nodes
+say "设备节点已按 sysfs 校正"
 
 # ---- 3. App 先起来（上报屏幕尺寸，modes 列表才完整）----
 am start -n com.vdrm.consumer/.MainActivity >/dev/null 2>&1

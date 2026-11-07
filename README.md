@@ -28,6 +28,38 @@ grep vdrm-vt /proc/tty/drivers     # vdrm-vt /dev/tty 4 0-6 console
 内核自带 VT 时 major 4 已被占，模块自动跳过，用原生的。`/sys/module/vdrm/parameters/vt`
 可以关掉它（0）。
 
+### 1.1 设备节点是谁建的（为什么模块里有一小段用户态）
+
+先把边界说清楚：**图形栈本身零 patch** —— KMS/DRM、GBM、EGL/Vulkan、Wayland、
+KWin、libinput、logind 全是原生实现，内核侧没有一行图形相关改动，合成器那边也没有。
+
+真正需要用户态插手的只有设备节点，原因是内核事实，不是我们的选择：
+
+- GKI 上 `CONFIG_DEVTMPFS` 是 **n**，内核根本不会建节点；`/dev` 是 init 挂的
+  tmpfs，节点由 Android 的 **ueventd** 在收到 `KOBJ_ADD` 时 `mknod` 出来。
+  所以节点的名字和主次号本身是原生的，来自内核 uevent。
+- 但 ueventd 只在 ADD 时动作，`KOBJ_REMOVE` **不删节点**：`rmmod` 之后旧节点
+  照旧留在 `/dev` 里，重新 `insmod` 拿到的主次号一变，它们就是指向死设备的空壳。
+- 权限和 SELinux 标签：`/vendor/etc/ueventd.rc` 里没有 vdrm 的条目，而它在 init
+  第二阶段就读完了，早于模块挂载 —— 模块改不动它。
+
+于是 `module/common.sh` 里有一段 `vdrm_sync_nodes`，只做 ueventd 做不到的三件事，
+全部以 sysfs 的 `dev` 为准：
+
+| 设备 | 节点 | 模式 / owner | 标签 |
+|---|---|---|---|
+| 控制面 | `/dev/vdrm`、`/dev/vdrm-audio`、`/dev/vdrm-audio-in` | `0666 root:root` | `gpu_device`（App 能 open） |
+| DRM | `/dev/dri/cardN`（realpath 含 `/platform/vdrm`） | `0666 root:graphics` | `graphics_device` |
+| VT | `/dev/tty0..6` | `0620 root:tty`（原生 VT 惯例） | `tty_device` |
+| 虚拟输入 | `/dev/input/eventN`（name 匹配 `vdrm-*`） | `0600 root:root` | `input_device` |
+| 虚拟声卡 | `/dev/snd/*`（realpath 含 `/platform/vdrm`） | `0660 system:audio` | `audio_device` |
+
+主次号对不上就删了重建；虚拟输入必须"删了重建"才会触发 EventHub 的
+`IN_DELETE`/`IN_CREATE`，只 `chmod` 收不回已经打开的 fd。只认上面这几类 vdrm
+设备，不对 `event*` 之类做任何通配。
+
+这段脚本的作用等价于原生驱动的 `ueventd.rc` + udev 规则，不是什么内核或合成器补丁。
+
 ## 2. 建容器
 
 改 `container.config`（实测的 Fedora 43 配置）：
@@ -37,8 +69,22 @@ enable_hw_access=0
 enable_gpu_mode=1
 allow_sandboxing=1
 privileged=nomask
-bind_mounts=/dev/dri/card1:/dev/dri/card1,/dev/input:/dev/input,/dev/snd:/dev/snd
+bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/eventN:/dev/input/eventN,/dev/snd/controlC0:/dev/snd/controlC0
 ```
+
+`/dev/input`、`/dev/snd` 也可以整目录 bind，但逐个节点更干净：Android 自己的
+12 个 event 节点和另一张声卡就不会跟着进容器。
+
+**`/dev/tty0..6` 是硬前提，少一个都不行**：logind 判断"这台机器有没有 VT"
+的唯一依据就是 `/dev/tty0` 存不存在（`access("/dev/tty0")`），`CanTTY` 直接由它
+决定；SDDM 的 sddm-helper 则要打开 `/dev/tty1` 做 `TIOCSCTTY`。缺了就是
+`Inappropriate ioctl for device`，session 开完 40ms 就关。
+
+运行时会把 `tty1..6` 预置成 `/dev/null` 或空节点的，必须确认它们被换成了真的
+`4:N`。droidspaces 7.1.0 用指向 `/dev/null` 的软链占位，而且拒绝在软链上 bind
+（`Security Violation: Bind target is a symlink`）；7.2.0 改成 `1:3` 字符节点占位，
+bind 就能覆盖上去。
+
 
 改 `.env`：
 
@@ -58,7 +104,7 @@ LIBSEAT_BACKEND=noop
 设备节点由容器运行时逐个 bind 进容器：
 
 ```text
-/dev/tty0..6       ← 宿主 vdrm VT
+/dev/tty0..6       ← 宿主 vdrm VT（logind 的 CanTTY / sddm-helper 的 TIOCSCTTY）
 /dev/dri/card1     ← 宿主虚拟 DRM
 /dev/input/eventN  ← 宿主 vdrm-kbd/ptr/touch
 /dev/snd/*         ← 宿主 vdrm 声卡
@@ -147,8 +193,8 @@ journalctl -b | grep "Could not determine the active graphical session"
 ```
 
 模块有原生的 `/sys/class/tty/tty0/active`（没有 VT 的内核由 `vdrm_vt.c` 提供）时，
-第 3 节脚本会给容器建 `/dev/tty0..6` 并写 seat 属性；`CanTTY=yes` 之后
-`PAMName=login` + `XDG_VTNR=1` 才会成功。
+容器只需要 **bind 进 `/dev/tty0..6`**（第 2 节），`vdrm-udev` 不碰这些节点；
+`CanTTY=yes` 之后 `PAMName=login` + `XDG_VTNR=1` 才会成功。
 
 换合成器就把 `ExecStart` 换成 `niri` / `Hyprland` / `sway`。
 
@@ -316,9 +362,9 @@ su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
 
 ### 容器侧不用再排除
 
-模块加载后 `vdrm_hide_input` 只按 `vdrm-*` 名字把对应 event 节点换成
-`0600 root:root`；**不要对 `/dev/input/event*` 通配**。容器侧设备节点由运行时
-bind，不再有 systemd mknod/service。
+模块加载后 `vdrm_sync_nodes` 只按 `vdrm-*` 名字把对应 event 节点换成
+`0600 root:root`（并顺手校正主次号/标签）；**不要对 `/dev/input/event*` 通配**。
+容器侧设备节点由运行时 bind，不再有 systemd mknod/service。
 
 注意：如果 InputReader 已经打开过这些 event fd，改权限不会把它从 Android
 设备表里立刻移除；**模块重载后需要重启手机，或 `stop; start` 重启 Android

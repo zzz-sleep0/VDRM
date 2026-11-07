@@ -99,95 +99,131 @@ vdrm_load() {
     return 0
 }
 
-# 2) /dev/vdrm、/dev/vdrm-audio：gpu_device 标签 + 0666。
+# 2) 设备节点正确性 —— GKI 没有 devtmpfs，节点只能由 ueventd 建。
 #
-# 不做 chown：0666 让第一次安装/重装换 UID 都能直接 open，不需要查 UID、不需要
-# 重启。SELinux 边界是 gpu_device —— 有该权限的域能打开，没有的域打不开；
-# 不要求“只有 VDRM App 能开”。mkpool 以 root 运行，不受影响。
-# ueventd 可能在 insmod 返回之后才把节点建出来，直接 chmod 会落空
-# （实测 /dev/vdrm-audio 会停在 0600）。先等两个节点都出现。
-vdrm_fix_nodes() {
-    i=0
-    while [ "$i" -lt 5 ]; do
-        [ -e /dev/vdrm ] && [ -e /dev/vdrm-audio ] &&
-            [ -e /dev/vdrm-audio-in ] && break
-        sleep 1
-        i=$((i + 1))
-    done
-    for n in /dev/vdrm /dev/vdrm-audio /dev/vdrm-audio-in; do
-        [ -e "$n" ] || { vdrm_log "vdrm perms: $n missing"; continue; }
-        chmod 666 "$n"
-        chcon u:object_r:gpu_device:s0 "$n"
-        vdrm_log "vdrm perms: $n 0666 gpu_device"
-    done
+# 先把事实摆清楚，免得把"节点是原生的"和"节点是对的"混成一件事：
+#
+#   - `CONFIG_DEVTMPFS` 在 GKI 上是 n，`/dev` 是 init 挂的 tmpfs。节点由 Android
+#     的 ueventd 在收到 KOBJ_ADD 时 mknod 出来 —— 名字和主次号都来自内核，
+#     这一段是原生的，我们不插手的部分。
+#   - 但 ueventd 只在 ADD 时动作，KOBJ_REMOVE 不删节点。rmmod 之后旧节点照旧
+#     躺在 /dev 里，重新 insmod 拿到的主次号一变，它们就是指向死设备的空壳。
+#   - 权限和 SELinux 标签：`/vendor/etc/ueventd.rc` 里没有我们的条目，而它
+#     在 init 第二阶段就读完了，早于模块挂载 —— 模块改不动它。
+#
+# 所以这里只补 ueventd 做不到的三件事，全部以 sysfs 的 `dev` 为准：
+#
+#   1. 主次号对不上（或节点缺失）就删了重建 —— 这是正确性，不是补丁；
+#   2. 权限 / owner / 标签按设备类型给（App 走 gpu_device、VT 按原生
+#      `0620 root:tty`、虚拟输入 0600 root:root 挡 Android、声卡 system:audio）；
+#   3. 虚拟输入节点必须"删了重建"才会触发 EventHub 的 IN_DELETE / IN_CREATE，
+#      只 chmod 收不回已经打开的 fd。
+#
+# 只认 /sys 里属于 vdrm 的设备：drm / snd 的 realpath 里含 `/platform/vdrm`，
+# tty 看 `/sys/class/tty/tty0/active` 在不在（内核自带 VT 时模块根本不会注册，
+# 这个文件也就没有）。任何一步都不对 event* 之类做通配。
+
+vdrm_node_ok() {   # $1=节点 $2=期望的 hex 主次号
+    [ -c "$1" ] || return 1
+    [ "$(stat -c '%t:%T' "$1" 2>/dev/null)" = "$2" ]
 }
 
-# 3) 把虚拟键鼠的 evdev 节点从 Android 手里拿掉。
-#
-# 只 chmod 是不够的：
-#   - 已经 open 的 fd 收不回来（chmod 只影响之后的 open）；
-#   - ueventd 建节点是异步的，开机时可能晚于脚本 —— 追着改权限永远有窗口，
-#     谁先跑到只能靠运气（第一次开机实测就输在这：脚本 5 秒窗口过了节点才出来，
-#     Android 先开走了）。
-#
-# 所以换成"删掉、再由我们重建"：
-#   1. rm /dev/input/eventN
-#      → EventHub 收到 inotify IN_DELETE，把设备 close 掉，InputReader 里立刻
-#        没有这台设备（实测 dumpsys input 的 vdrm 行数掉到 0）；
-#   2. mknod 同样的主次设备号，chmod 0600 root:root
-#      → EventHub 收到 IN_CREATE 去 open，EACCES，跳过。
-#
-# 于是不管节点什么时候建出来、Android 有没有抢在前面，最终都停在"Android 看不见、
-# 容器照样能用"（容器用自己的 /dev 里的节点，libinput 以 root 打开，够权限）。
-# 这个"删了重建"由 post-fs-data.sh / service.sh 在模块加载后跑一次（带重试）；
-# 手动 reload 的脚本（tools/vdrm_up.sh --reload）也会补一刀。不再有常驻 watcher。
-#
-# 不动 SELinux 标签：input_device 这个类型 root 照样能开，换它没必要。
+vdrm_sync_node() { # $1=节点 $2=sysfs 目录 $3=模式 $4=owner $5=标签 $6=kick
+    n=$1; s=$2; mode=$3; own=$4; ctx=$5; kick=$6
+    dev=$(cat "$s/dev" 2>/dev/null) || return 1
+    maj=${dev%%:*}; min=${dev##*:}
+    want=$(printf '%x:%x' "$maj" "$min")
 
-vdrm_hide_input_once() {
-    VDRM_HIDDEN=0
-    # 宿主 /dev/input 下绝不能留 vdrm-* symlink；它们是旧容器脚本直接 ln 的残留。
-    rm -f /dev/input/vdrm-kbd /dev/input/vdrm-ptr /dev/input/vdrm-touch
-    for p in /sys/class/input/event*/device/name; do
-        [ -e "$p" ] || continue
-        case "$(cat "$p" 2>/dev/null)" in
-            vdrm-*) ;;
-            *) continue ;;
-        esac
-        ev=$(basename "${p%/device/name}")
-        node="/dev/input/$ev"
+    # 设备号和权限都对：只补标签（ueventd 重建后标签会退回默认类型）
+    if vdrm_node_ok "$n" "$want" && [ "$(stat -c %a "$n" 2>/dev/null)" = "$mode" ]; then
+        chcon "$ctx" "$n" 2>/dev/null
+        return 0
+    fi
 
-        # 已经是我们的节点（0600）就别再删一次了：每删一次 InputReader 都要重扫
-        if [ -c "$node" ] && [ "$(stat -c %a "$node" 2>/dev/null)" = "600" ]; then
-            VDRM_HIDDEN=$((VDRM_HIDDEN + 1))
-            continue
-        fi
+    # 设备号对、只是权限不对：kick=1 的（虚拟输入）也要删了重建，
+    # 否则 InputReader 手里那个 fd 还开着，chmod 对它无效。
+    if vdrm_node_ok "$n" "$want" && [ "$kick" != 1 ]; then
+        chmod "$mode" "$n" 2>/dev/null
+        chown "$own" "$n" 2>/dev/null
+        chcon "$ctx" "$n" 2>/dev/null
+        return 0
+    fi
 
-        d=$(cat "/sys/class/input/$ev/dev" 2>/dev/null)     # 形如 13:71
-        [ -n "$d" ] || continue
-
-        rm -f "$node"
-        mknod "$node" c "${d%%:*}" "${d##*:}" 2>/dev/null
-        chown root:root "$node" 2>/dev/null
-        chmod 600 "$node" 2>/dev/null
-        if [ -c "$node" ] && [ "$(stat -c %a "$node" 2>/dev/null)" = "600" ]; then
-            VDRM_HIDDEN=$((VDRM_HIDDEN + 1))
-            vdrm_log "input hide: $node ($d) 删掉重建为 0600"
-        fi
-    done
-}
-
-# 单次处理，带重试：给 post-fs-data 用（那时节点可能还没被 ueventd 建出来）。
-# 15 秒足够覆盖 ueventd 的异步建节点；跑完就退，不再常驻。
-vdrm_hide_input() {
-    i=0
-    while [ "$i" -lt 30 ]; do
-        vdrm_hide_input_once
-        [ "$VDRM_HIDDEN" -ge 3 ] && return 0
-        sleep 0.5
-        i=$((i + 1))
-    done
-    vdrm_log "input hide: 只处理到 $VDRM_HIDDEN 个 vdrm 节点"
+    rm -f "$n"
+    mknod "$n" c "$maj" "$min" 2>/dev/null || return 1
+    chmod "$mode" "$n" 2>/dev/null
+    chown "$own" "$n" 2>/dev/null
+    chcon "$ctx" "$n" 2>/dev/null
+    vdrm_log "node: $n 重建（$dev $mode $own）"
     return 0
 }
 
+vdrm_sync_once() {
+    VDRM_PENDING=0
+
+    # 控制节点：App 要 0666 直接 open，不 chown（换 UID 重装也不用重启）
+    for n in vdrm vdrm-audio vdrm-audio-in; do
+        if [ -e "/sys/class/misc/$n" ]; then
+            vdrm_sync_node "/dev/$n" "/sys/class/misc/$n" 666 0:0 \
+                u:object_r:gpu_device:s0 0 || VDRM_PENDING=$((VDRM_PENDING + 1))
+        else
+            VDRM_PENDING=$((VDRM_PENDING + 1))
+        fi
+    done
+
+    # 虚拟 DRM：ueventd 已按 drm 规则给 0666 root:graphics + graphics_device
+    for c in /sys/class/drm/card[0-9]*; do
+        case "$(basename "$c")" in *-*) continue ;; esac   # card1-Virtual-3 是连接器，不是设备
+        case $(readlink -f "$c" 2>/dev/null) in
+            */platform/vdrm/*)
+                vdrm_sync_node "/dev/dri/$(basename "$c")" "$c" 666 0:1003 \
+                    u:object_r:graphics_device:s0 0 || VDRM_PENDING=$((VDRM_PENDING + 1))
+                ;;
+        esac
+    done
+
+    # 虚拟 VT：原生 VT 的惯例是 0620 root:tty，session 用户不必是 root 也能拿
+    if [ -e /sys/class/tty/tty0/active ]; then
+        for t in 0 1 2 3 4 5 6; do
+            vdrm_sync_node "/dev/tty$t" "/sys/class/tty/tty$t" 620 0:5 \
+                u:object_r:tty_device:s0 0 || VDRM_PENDING=$((VDRM_PENDING + 1))
+        done
+    fi
+
+    # 虚拟键鼠/触摸：0600 root:root，Android 的 InputReader 打不开
+    for e in /sys/class/input/event*; do
+        case "$(cat "$e/device/name" 2>/dev/null)" in
+            vdrm-*)
+                vdrm_sync_node "/dev/input/$(basename "$e")" "$e" 600 0:0 \
+                    u:object_r:input_device:s0 1 || VDRM_PENDING=$((VDRM_PENDING + 1))
+                ;;
+        esac
+    done
+
+    # 虚拟声卡：system:audio 0660，和原生声卡一致
+    for c in /sys/class/sound/controlC[0-9]* /sys/class/sound/pcmC*; do
+        case $(readlink -f "$c" 2>/dev/null) in
+            */platform/vdrm/*)
+                vdrm_sync_node "/dev/snd/$(basename "$c")" "$c" 660 1000:1005 \
+                    u:object_r:audio_device:s0 0 || VDRM_PENDING=$((VDRM_PENDING + 1))
+                ;;
+        esac
+    done
+}
+
+# ueventd 建节点是异步的，开机那一下可能还没出来：15 秒内轮询，全就位就退。
+vdrm_sync_nodes() {
+    i=0
+    while [ "$i" -lt 30 ]; do
+        vdrm_sync_once
+        [ "$VDRM_PENDING" -eq 0 ] && return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    vdrm_log "node: 还有 $VDRM_PENDING 个没就位"
+    return 0
+}
+
+# 兼容旧调用点（tools/、文档里还写着这两个名字）：收敛到同一条路径。
+vdrm_fix_nodes() { vdrm_sync_nodes; }
+vdrm_hide_input() { vdrm_sync_nodes; }
