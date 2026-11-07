@@ -317,7 +317,11 @@ static atomic_bool g_quiet;
 
 static bool quiet_now(void)
 {
-    return atomic_load(&g_quiet);
+    /* 【暂时禁用】靠 present 间隔判后台是不可靠的：桌面静止时 present 也会停，
+     * 于是被误判成后台 -> 拖拽的头几帧被丢，等探针才更新（实测拖拽卡 0.5s）。
+     * 真正的后台信号要接 Java 的 onPause/onResume（nativeSetPaused），在那之前
+     * 一律当"前台"：不丢帧，回前台的恢复靠 nativeSetReady 里的强制归还。*/
+    return false;
 }
 
 /* 静默期间每 ~1 秒仍然 latch 一帧当探针：有 present 回来就说明已回前台
