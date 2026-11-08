@@ -279,6 +279,22 @@ mode=1920x1080
 aplay -l | grep vdrm
 ```
 
+声音是**按需**的：容器里有人开 `/dev/snd/pcmC0D0p`，内核就把
+`play_users` 置 1 并 eventfd 叫醒 App，App 这时才起 AAudio；容器把 PCM 关掉
+之后 App 再停。所以容器里必须有一个声卡服务真的会开、也会关这个 PCM。
+
+Fedora 的 PipeWire 在这套容器里有两个坑（`ConditionUser=!root` 直接 skip、
+WirePlumber 枚举不到 ALSA 卡），配置和验证步骤都在
+[`docs/container/audio/`](docs/container/audio/README.md)。裸 ALSA 也能直接测：
+
+```sh
+aplay -D hw:0,0 -f S16_LE -r 48000 -c 2 /dev/zero
+cat /sys/module/vdrm/parameters/play_users     # 播放期间应为 1
+```
+
+`play_users` 一直是 0 = 容器根本没开 PCM（或旧内核模块的那个约束返回值 bug），
+这时 App 不会起 AAudio，dmesg 里也不会有 `vdrm_audio` 相关日志。
+
 ## 注意：KMI 对得上，也可能不兼容
 
 `uname -r` 在支持的 KMI 里、模块里也有对应的 `.ko`，不代表一定能加载：厂商魔改过的
