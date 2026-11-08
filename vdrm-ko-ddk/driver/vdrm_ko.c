@@ -223,6 +223,42 @@ static volatile u64   g_vblank_period_ns = 16666666ULL; /* 60Hz 兜底（pipe en
  * 能接回原来的节拍，而不是"从现在再等一个周期"。*/
 static ktime_t        g_vblank_next;
 
+/* 假 vblank 相对面板 vsync 的相位偏移（ns，可正可负）。
+ *
+ * vdrm 的 tick 是 hrtimer，面板 vsync 是硬件，两者同频但相位独立 —
+ * 相位差决定合成器的 commit 落在 SF 本帧 deadline 的前面还是后面。
+ * 落在后面就白等一整帧（实测 apply2latch 稳定在 ~9.6ms，正是 120Hz
+ * 一帧的长度）。写这个参数会立刻把下一次 wakeup 挪过去，周期不变。*/
+static s64 g_tick_phase_ns;
+
+static int vdrm_tick_phase_set(const char *val, const struct kernel_param *kp)
+{
+	s64 old = g_tick_phase_ns;
+	s64 delta;
+	int ret = kstrtos64(val, 0, &g_tick_phase_ns);
+
+	if (ret)
+		return ret;
+	delta = g_tick_phase_ns - old;
+	if (delta && g_vblank_timer_running)
+		g_vblank_next = ktime_add_ns(g_vblank_next, delta);
+	pr_info("vdrm: tick phase %lld ns\n", (long long)g_tick_phase_ns);
+	return 0;
+}
+static int vdrm_tick_phase_get(char *buf, const struct kernel_param *kp)
+{
+	(void)kp;
+	return scnprintf(buf, PAGE_SIZE, "%lld\n", (long long)g_tick_phase_ns);
+}
+static const struct kernel_param_ops vdrm_tick_phase_ops = {
+	.set = vdrm_tick_phase_set,
+	.get = vdrm_tick_phase_get,
+};
+module_param_cb(tick_phase_ns, &vdrm_tick_phase_ops, NULL, 0644);
+MODULE_PARM_DESC(tick_phase_ns,
+		 "shift the fake vblank grid against the panel vsync (ns, signed)");
+
+
 /* 诊断：网格在不在跑 / 累计 tick。空闲时应该是 running=0、ticks 不再增长。
  * 以前网格是常开的，没人看 vblank 也每秒醒 120 次；这两个值用来验收"按需"确实生效。*/
 static unsigned int   g_vblank_running_view;
@@ -2736,8 +2772,10 @@ static void vdrm_pipe_enable(struct drm_simple_display_pipe *pipe,
 		 * 回收改到 dumb_create 开头（进程上下文的普通路径）就够了：每次换档
 		 * 合成器必然先来要新尺寸的 buffer。*/
 	}
-	/* 相位起点：从"现在 + 一个周期"开始，和旧行为一致（首帧不会立刻完成）*/
-	g_vblank_next = ktime_add_ns(ktime_get(), (u64)g_vblank_period_ns);
+	/* 相位起点：从"现在 + 一个周期"开始，和旧行为一致（首帧不会立刻完成）。
+	 * tick_phase_ns 是给"假 vblank 和面板 vsync 对相位"用的偏移量。*/
+	g_vblank_next = ktime_add_ns(ktime_get(),
+				     (u64)((s64)g_vblank_period_ns + g_tick_phase_ns));
 
 	pr_info("vdrm: pipe enable %ux%u period=%llu ns\n",
 		m->hdisplay, m->vdisplay,

@@ -99,6 +99,15 @@ static atomic_size_t g_submissions_live;
  * 按 token 在活动表里找；找不到就说明是过期回调，只把 fd 关掉。*/
 static atomic_uint_fast64_t g_sub_token;
 
+/* ---- 延迟预算：把"内核推帧 → App 读到 → apply → latch → present → RETURN"
+ * 六段都量出来。以前只有中间两段（apply2latch / latch2present），前面
+ * "commit→读到" 和后面的 "present→RETURN" 是黑的，没法判断该优化哪一段。*/
+static unsigned long long g_p2r_last_us, g_p2r_max_us;   /* push(内核) → read */
+static unsigned long long g_r2a_last_us, g_r2a_max_us;   /* read → apply */
+static unsigned long long g_p2t_last_us, g_p2t_max_us;   /* present → RETURN */
+static uint64_t g_ev_read_ns;                             /* 最近一次读到帧事件的时刻 */
+static uint64_t g_present_ns_arr[64];                     /* 按 slot 记 present 时刻 */
+
 static uint64_t now_ms(void)
 {
     struct timespec ts;
@@ -981,10 +990,19 @@ static void on_present(void *context, ASurfaceTransactionStats *stats)
             } else {
                 g_lat_rejects++;
             }
+            /* 预算第二段：读到帧事件 → apply 落进 SF。*/
+            if (g_ev_read_ns && g_apply_ns[idx] > g_ev_read_ns) {
+                unsigned long long us = (g_apply_ns[idx] - g_ev_read_ns) / 1000ull;
+
+                g_r2a_last_us = us;
+                if (us > g_r2a_max_us)
+                    g_r2a_max_us = us;
+            }
         }
     }
     if (n++ < 3)
         LOGI("present cb slot=%u fence=%d", slot, fd);
+    g_present_ns_arr[slot & 63] = mono_ns();
     present_wait_add(slot, fd);
 }
 
@@ -1040,6 +1058,20 @@ static void submission_release(struct submission *s, bool give_back)
         if (other->slot == s->slot) { still_used = true; break; }
     if (give_back && !still_used) {
         struct vdrm_handle_req req = { .id = s->slot };
+        uint64_t pn = g_present_ns_arr[s->slot & 63];
+
+        if (pn) {
+            uint64_t rn = mono_ns();
+
+            if (rn > pn) {
+                unsigned long long us = (rn - pn) / 1000ull;
+
+                g_p2t_last_us = us;
+                if (us > g_p2t_max_us)
+                    g_p2t_max_us = us;
+            }
+            g_present_ns_arr[s->slot & 63] = 0;
+        }
         int rfd = (g_return_fd >= 0) ? g_return_fd : g_vdrm_fd;
         if (ioctl(rfd, VDRM_IOCTL_RETURN, &req) < 0)
             LOGW("RETURN slot=%u err=%d", s->slot, errno);
@@ -1568,7 +1600,7 @@ static int              g_tick_fd = -1;
 static volatile int     g_tick_on;
 static volatile int     g_tick_seq;
 static volatile uint64_t g_tick_ms;
-static int              g_tick_used;
+static int              g_tick_used = -1;   /* -1：这一拍还没贴过 */
 static AChoreographer  *g_choreo;
 static ALooper         *g_tick_looper;
 static pthread_t        g_tick_tid;
@@ -1675,11 +1707,15 @@ static void *render_loop(void *arg)
         if (time(NULL) - stat_t0 >= 2) {
             LOGI("STATS events=%llu shown=%llu deferred=%llu outstanding=%zu over %lds"
                  " | apply2latch=%lluus(max %llu) latch2present=%lluus(max %llu)"
+                 " | push2read=%lluus(max %llu) read2apply=%lluus(max %llu)"
+                 " present2ret=%lluus(max %llu)"
                  " | evgap_max=%llums n40=%llu n80=%llu latch_max=%lluus%s",
                  (unsigned long long)stat_ev, (unsigned long long)stat_show,
                  (unsigned long long)stat_deferred, submission_count(),
                  (long)(time(NULL) - stat_t0),
                  g_a2l_last_us, g_a2l_max_us, g_l2p_last_us, g_l2p_max_us,
+                 g_p2r_last_us, g_p2r_max_us, g_r2a_last_us, g_r2a_max_us,
+                 g_p2t_last_us, g_p2t_max_us,
                  g_ev_gap_max_ms, g_ev_gap_n40, g_ev_gap_n80, g_latch_max_us,
                  g_lat_rejects ? " [lat clock mismatch!]" : "");
             stat_ev = 0; stat_show = 0; stat_deferred = 0;
@@ -1771,6 +1807,20 @@ static void *render_loop(void *arg)
             }
             latest = ev;
             got = 1;
+            /* 预算第一段：内核 pipe_update 推帧 → 我们读到。事件的
+             * timestamp_ns 由 vdrm_frame_push() 用 ktime_get() 打。*/
+            {
+                uint64_t rn = mono_ns();
+
+                g_ev_read_ns = rn;
+                if (ev.timestamp_ns && rn > ev.timestamp_ns) {
+                    unsigned long long us = (rn - ev.timestamp_ns) / 1000ull;
+
+                    g_p2r_last_us = us;
+                    if (us > g_p2r_max_us)
+                        g_p2r_max_us = us;
+                }
+            }
         }
         if (got) {
             if (have_pending && pending.id != latest.id)
@@ -1805,9 +1855,15 @@ static void *render_loop(void *arg)
         } else if (g_tick_started && g_tick_on) {
             int tk = __atomic_load_n(&g_tick_seq, __ATOMIC_RELAXED);
 
-            if (tk == g_tick_used && now_ms() - g_tick_ms < 100) {
+            /* 旧写法是"没等到新的一拍就先憋着"，等于每帧都延后到下一拍
+             * 才 apply —— 而 AChoreographer 的回调本来就在 vsync 边界上，
+             * SF 的 deadline 在它之前，于是每帧都错过本帧、白等一个 vsync
+             * （实测 apply2latch 7–11ms、latch2present 13ms）。
+             *
+             * 反过来：这一拍还没贴过就立刻贴，贴过才等下一拍。节拍仍然是
+             * 一 vsync 一帧，但落点从"下一拍的边界"提前到"帧事件到达时"。*/
+            if (tk == g_tick_used)
                 continue;
-            }
             g_tick_used = tk;
         }
 
