@@ -85,7 +85,6 @@ struct submission {
     uint32_t slot;
     int fence_fd;
     uint64_t token;        /* 给 release 回调的身份；0 = 空闲块 */
-    int presented;         /* SF 的 present 回调已经来过 */
     uint64_t created_ms;   /* 建的时间，watchdog 用 */
 };
 /* submission 对象常驻复用：每帧 calloc/free 没必要，槽位固定后直接拿。 */
@@ -188,25 +187,6 @@ static void notify_mode_changed(void)
 static volatile int g_inflight_override = -1;
 /* App 侧节拍模式：0=立即贴；1=等上一帧 present；2=允许一帧在飞。
  * 由调试页的 nativeSetPace 或 debug.vdrm.pace 设置；内核 pace 始终 0。*/
-static volatile int g_app_pace_mode;
-static int app_pace_prop(void)
-{
-    static int cached = -1;
-
-    if (cached < 0) {
-        char v[PROP_VALUE_MAX];
-        int n = 0;
-
-        if (__system_property_get("debug.vdrm.pace", v) > 0) {
-            int t = atoi(v);
-
-            if (t >= 0 && t <= 2)
-                n = t;
-        }
-        cached = n;
-    }
-    return cached;
-}
 
 static int max_inflight(void)
 {
@@ -335,25 +315,8 @@ static struct submission *submission_create(AHardwareBuffer *ahb, uint32_t slot)
 static void submission_finish(struct submission *s);
 static void submission_abandon(struct submission *s);
 static void submission_release(struct submission *s, bool give_back);
-static size_t submission_pending_present(void)
-{
-    size_t n = 0;
-
-    pthread_mutex_lock(&g_display_lock);
-    for (struct submission *s = g_submissions; s; s = s->next)
-        if (!s->presented)
-            n++;
-    pthread_mutex_unlock(&g_display_lock);
-    return n;
-}
-
 static size_t submission_count(void);
 
-/* 还没拿到 present 回调的帧数 —— App 侧的节拍门控用它，不用内核的
- * flip-done（那条会拖住合成器，实测 pace=1/2 都会把池子卡死）。
- *   模式 1：必须等上一帧 present 了才贴下一帧（≈ pace=1，不撕）
- *   模式 2：允许一帧在飞（≈ pace=2，滞后一帧）*/
-static size_t submission_pending_present(void);
 static void sc_geometry(uint32_t mw, uint32_t mh, uint32_t ww, uint32_t wh);
 static void vdrm_return(int id);
 
@@ -695,7 +658,6 @@ struct vdrm_tick_info {
 };
 #define VDRM_IOCTL_TICK_INFO   VDRM_IOC(2, 'V', 0x0c, sizeof(struct vdrm_tick_info))
 #define VDRM_IOCTL_TICK_PHASE  VDRM_IOC(1, 'V', 0x0d, sizeof(int64_t))
-#define VDRM_IOCTL_SET_PACE    VDRM_IOC(1, 'V', 0x0e, sizeof(uint32_t))
 
 /* 锁相环：把内核的假 vblank 锁到面板 vsync 上。
  *
@@ -1096,11 +1058,6 @@ static void on_present(void *context, ASurfaceTransactionStats *stats)
     if (n++ < 3)
         LOGI("present cb slot=%u fence=%d", slot, fd);
     g_present_ns_arr[slot & 63] = mono_ns();
-    /* 标记这一帧已经上屏：App 侧的节拍门控（模式 1/2）靠它。*/
-    pthread_mutex_lock(&g_display_lock);
-    for (struct submission *s2 = g_submissions; s2; s2 = s2->next)
-        if (s2->slot == slot) { s2->presented = 1; break; }
-    pthread_mutex_unlock(&g_display_lock);
     present_wait_add(slot, fd);
 }
 
@@ -1115,7 +1072,11 @@ static void vdrm_return(int id)
 }/* SF 用完这块 buffer 时回调 → 归还给 KPM（契中台）。可任意线程。 */
 
 #define SUBMISSION_WAIT_MAX 8
-#define RELEASE_FENCE_TIMEOUT_MS 2000
+/* 等 SF release 的上界。原来是 2000ms —— 那意味着 SF 一旦迟到，这块槽
+ * 两秒不回来；池子只有 6 个槽，几帧就能把合成器饿死（实测内核 pace=1/2
+ * 配合 2s 超时就是"卡死"）。压到 150ms：最坏情况是我们提前还槽（可能撕
+ * 一下），而不是整条管线停住。*/
+#define RELEASE_FENCE_TIMEOUT_MS 150
 
 /* 从提交表里摘掉并完成归还。worker 和 worker 起不来时的 fallback 共用。*/
 static void submission_finish(struct submission *s)
@@ -1220,7 +1181,6 @@ static struct submission *submission_create(AHardwareBuffer *ahb, uint32_t slot)
     }
 
     s->ahb = ahb; s->slot = slot;
-    s->presented = 0;   /* 还没上屏（App 侧节拍门控用） */
     s->fence_fd = -2;   /* release callback 还没到 */
     s->token = atomic_fetch_add(&g_sub_token, 1) + 1;
     s->created_ms = now_ms();
@@ -2016,38 +1976,6 @@ static void *render_loop(void *arg)
         /* in-flight 上限。之前写死 3：宿主 120Hz、合成器推 118 帧时，App 会
          * 被这个上限卡在 ~80 帧，贴帧间隔不均匀（慢速动画上就是"一顿一顿"）。
          * 池里有 6 个槽，放宽到 4 更平滑；可用 debug.vdrm.inflight 调着试。*/
-        /* App 侧节拍（调试页 pace=1/2）：
-         *   1 → 上一帧没 present 就憋着；2 → 允许一帧在飞。
-         * 注意这是"我们少贴一帧"，不是让合成器等 —— 所以不会冻。*/
-        {
-            static uint64_t wait_since_ms;
-            static int warned;
-            int mode = g_app_pace_mode ? g_app_pace_mode : app_pace_prop();
-            size_t pend = 0;
-
-            if (mode >= 1) {
-                pend = submission_pending_present();
-                if (pend > (size_t)(mode - 1)) {
-                    uint64_t now = now_ms();
-
-                    if (!wait_since_ms)
-                        wait_since_ms = now;
-                    /* 兜底：present 迟迟不来（SF 卡了/我们在后台）时
-                     * 最多憋 200ms 就放行，绝不让"少贴一帧"变成"再也不贴"
-                     * —— 那会把槽扣死、把池子饿死（内核 pace=1 就是这么冻的）。*/
-                    if (now - wait_since_ms <= 200) {
-                        stat_deferred++;
-                        continue;
-                    }
-                    if (!warned) {
-                        warned = 1;
-                        LOGW("app pacing: present 等待超时，放行一帧");
-                    }
-                }
-            }
-            wait_since_ms = 0;
-        }
-
         if (submission_count() >= max_inflight()) {
             stat_deferred++;
             continue;
@@ -2881,15 +2809,6 @@ Java_com_vdrm_consumer_Native_nativeSendScroll(JNIEnv *env, jclass clazz, jint a
  * Java 拿它强制 Activity 的横竖（竖配置 → 竖窗口）。优先用 GET_CONF：那是
  * mode 参数（配置值），切换分辨率后立刻生效，不用等合成器真的切过去。
  * 老模块没有 GET_CONF 时退回 GET_INFO（合成器在用的尺寸），至少方向是对的。*/
-/* ---- 调试页（长按图标 → 调试选项）用的三个入口 ---- */
-JNIEXPORT void JNICALL
-Java_com_vdrm_consumer_Native_nativeSetPace(JNIEnv *env, jclass clazz, jint pace)
-{
-	/* 0/1/2 现在是 **App 侧**的 latch 深度，不再写内核的 pace。
-	 * 内核那条（等 flip-done 的 present）实测会把合成器拖死。*/
-	g_app_pace_mode = (pace < 0) ? 0 : (pace > 2 ? 2 : pace);
-}
-
 JNIEXPORT void JNICALL
 Java_com_vdrm_consumer_Native_nativeSetInflight(JNIEnv *env, jclass clazz, jint n)
 {

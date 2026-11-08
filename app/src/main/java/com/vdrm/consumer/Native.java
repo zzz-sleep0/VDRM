@@ -49,10 +49,8 @@ public class Native {
                                              float[] ps);
 
     /* ---- 调试页（长按图标 → 调试选项）----
-     * pace: 0=tick 无条件 / 1=等 present / 2=滞后一帧（见 VdrmSettingsActivity）
      * inflight: 1..6，还没上屏的帧数上限
      * pll: 假 vblank 是否锁到面板 vsync 上 */
-    public static native void nativeSetPace(int pace);
     public static native void nativeSetInflight(int n);
     public static native void nativeSetPll(boolean on);
 

@@ -7,8 +7,6 @@ import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
-import android.widget.RadioButton;
-import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
@@ -17,22 +15,13 @@ import android.widget.TextView;
 /**
  * 长按桌面图标 → 「调试选项」打开的页面。
  *
- * 这里只有三个开关，都是"出问题时的逃生口"，默认值就是保守配置：
+ * 这里只有两个开关，都是"出问题时的逃生口"，默认值就是保守配置：
  *
- *   1. pace（flip-done 节拍）
- *        0 = 每个假 vblank tick 无条件发 flip-done（默认）。合成器不等
- *            SurfaceFlinger 的 present，帧率最高；代价是合成器可能在 SF 还在
- *            扫描时就开始画下一帧（表现为偶发闪/撕）。
- *        1 = 等到 App 报了这一帧的 present 才发。不撕，但会被 SF 串行化，
- *            帧率下降；present/release 不回时还可能把池子卡住。
- *        2 = 滞后一帧：这一帧 present 了、后面又有帧 present 才放行。
- *            合成器最多领先一帧，是 0 和 1 之间的折中。
- *
- *   2. in-flight（App 同一时刻允许几帧"还没上屏"）
+ *   1. in-flight（App 同一时刻允许几帧"还没上屏"）
  *        默认 4。调小更"跟手"但更容易被 SF 的 present 速度限住（1 会明显卡）；
  *        调大更平滑，但会让合成器领先屏幕更多。
  *
- *   3. 锁相环（pll）
+ *   2. 锁相环（pll）
  *        默认关。打开后 App 每 500ms 观测一次面板 vsync，把内核假 vblank
  *        的相位（tick_phase_ns）微调到"比面板 vsync 早约 2ms"，用来消除
  *        tick 与面板两个独立时钟之间的漂移。只在面板和合成器同频时才有意义
@@ -42,15 +31,12 @@ import android.widget.TextView;
  */
 public class VdrmSettingsActivity extends Activity {
 
-    public static final String PREF_PACE = "pace";
     public static final String PREF_INFLIGHT = "inflight";
     public static final String PREF_PLL = "pll";
 
-    public static final int DEFAULT_PACE = 0;
     public static final int DEFAULT_INFLIGHT = 4;
     public static final boolean DEFAULT_PLL = false;
 
-    private RadioGroup paceGroup;
     private SeekBar inflightBar;
     private TextView inflightLabel;
     private Switch pllSwitch;
@@ -65,27 +51,6 @@ public class VdrmSettingsActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         int pad = (int) (20 * getResources().getDisplayMetrics().density);
         root.setPadding(pad, pad, pad, pad);
-
-        root.addView(section("节拍（贴帧深度）",
-            "0 = 立即贴下一帧（默认）。\n" +
-            "1 = 等上一帧上屏后再贴下一帧。\n" +
-            "2 = 允许一帧在飞，滞后一帧。\n\n" +
-            "调大：更不容易闪/撕，但帧率更低、手感更迟钝。\n" +
-            "调小：帧率更高、更跟手，但可能出现闪/撕。\n" +
-            "（等不到上屏时最多憋 200 毫秒就放行，不会卡死池子。）"));
-
-        paceGroup = new RadioGroup(this);
-        paceGroup.setOrientation(RadioGroup.VERTICAL);
-        String[] paceNames = {"0 · tick（默认）", "1 · 等 present", "2 · 滞后一帧"};
-        for (int i = 0; i < paceNames.length; i++) {
-            RadioButton rb = new RadioButton(this);
-            rb.setId(1000 + i);
-            rb.setText(paceNames[i]);
-            paceGroup.addView(rb);
-        }
-        int pace = sp.getInt(PREF_PACE, DEFAULT_PACE);
-        paceGroup.check(1000 + Math.max(0, Math.min(2, pace)));
-        root.addView(paceGroup);
 
         root.addView(section("在飞帧数（in-flight）",
             "默认 4。\n" +
@@ -123,17 +88,14 @@ public class VdrmSettingsActivity extends Activity {
         save.setText("保存并应用");
         save.setOnClickListener(new android.view.View.OnClickListener() {
             @Override public void onClick(android.view.View v) {
-                int p = paceGroup.getCheckedRadioButtonId() - 1000;
                 int n = inflightBar.getProgress() + 1;
                 boolean pll = pllSwitch.isChecked();
 
                 sp.edit()
-                  .putInt(PREF_PACE, p)
                   .putInt(PREF_INFLIGHT, n)
                   .putBoolean(PREF_PLL, pll)
                   .apply();
 
-                Native.nativeSetPace(p);
                 Native.nativeSetInflight(n);
                 Native.nativeSetPll(pll);
                 finish();
@@ -159,7 +121,6 @@ public class VdrmSettingsActivity extends Activity {
     /** MainActivity 启动时调一次，把上次保存的设置应用到 native 侧。 */
     public static void applySaved(Activity a) {
         SharedPreferences sp = a.getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
-        Native.nativeSetPace(sp.getInt(PREF_PACE, DEFAULT_PACE));
         Native.nativeSetInflight(sp.getInt(PREF_INFLIGHT, DEFAULT_INFLIGHT));
         Native.nativeSetPll(sp.getBoolean(PREF_PLL, DEFAULT_PLL));
     }
