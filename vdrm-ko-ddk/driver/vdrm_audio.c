@@ -248,6 +248,15 @@ static int vdrm_cap_users_get(char *buf, const struct kernel_param *kp)
 }
 static const struct kernel_param_ops vdrm_cap_users_ops = { .get = vdrm_cap_users_get };
 module_param_cb(cap_users, &vdrm_cap_users_ops, NULL, 0444);
+
+/* 调试用：容器侧 playback PCM 当前打开数（GET_STATE 报的就是这个） */
+static int vdrm_play_users_get(char *buf, const struct kernel_param *kp)
+{
+	(void)kp;
+	return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&g_play_users));
+}
+static const struct kernel_param_ops vdrm_play_users_ops = { .get = vdrm_play_users_get };
+module_param_cb(play_users, &vdrm_play_users_ops, NULL, 0444);
 MODULE_PARM_DESC(cap_overrun, "Capture frames dropped because the app wrote too far ahead");
 
 static const struct snd_pcm_hardware vdrm_cap_hw = {
@@ -759,8 +768,11 @@ static int vdrm_pcm_open(struct snd_pcm_substream *sub)
 
 	g_sub = sub;
 	rt->hw = vdrm_pcm_hw;
+	/* 成功时返回 1（约束被改了），0 表示没动，**只有 <0 才是失败**。
+	 * 以前写成 `if (rc)` 把成功当失败直接 return，ALSA 见返回值非负又当成功
+	 * 继续跑：PCM 正常出声，但 g_play_users 永远不涨，App 的按需音频失效。*/
 	rc = snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
-	if (rc) {
+	if (rc < 0) {
 		g_sub = NULL;
 		return rc;
 	}
