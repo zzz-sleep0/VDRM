@@ -89,6 +89,6 @@ logcat -s VDRM | grep "audio: AAudio"               # 应出现 AAudio output st
 
 ## 前提
 
-- 容器运行时已 bind `/dev/snd/controlC0`、`pcmC0D0p`、`pcmC0D1c`、`timer`；
+- 容器运行时已 bind `/dev/snd/controlC0`、`pcmC0D0p`、`pcmC0D1c`（不需要 `timer`，实测去掉照样出声）；
 - `vdrm-udev.service` 已写好 `/run/udev/data`（`audio_device` 标签、seat 属性）；
 - 内核模块的 `vdrm_audio.c` 是修过约束返回值之后的版本。

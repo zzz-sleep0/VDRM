@@ -69,8 +69,8 @@ KWin、libinput、logind 全是原生实现，内核侧没有一行图形相关�
 enable_hw_access=0
 enable_gpu_mode=1
 allow_sandboxing=1
-privileged=nomask,noseccomp
-bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/event7:/dev/input/event7,/dev/input/event8:/dev/input/event8,/dev/input/event9:/dev/input/event9,/dev/snd/controlC0:/dev/snd/controlC0,/dev/snd/pcmC0D0p:/dev/snd/pcmC0D0p,/dev/snd/pcmC0D1c:/dev/snd/pcmC0D1c,/dev/snd/timer:/dev/snd/timer
+privileged=nomask
+bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/event7:/dev/input/event7,/dev/input/event8:/dev/input/event8,/dev/input/event9:/dev/input/event9,/dev/snd/controlC0:/dev/snd/controlC0,/dev/snd/pcmC0D0p:/dev/snd/pcmC0D0p,/dev/snd/pcmC0D1c:/dev/snd/pcmC0D1c
 ```
 
 `/dev/input`、`/dev/snd` 也可以整目录 bind，但逐个节点更干净：Android 自己的
@@ -83,7 +83,7 @@ event 节点和另一张声卡就不会跟着进容器。
 KWin 根本不会用），那样容器里就一个可用输入都没有。
 
 ALSA 节点名也是大小写敏感的：`pcmC0D0p`（小写 p = playback），写成 `pcmC0D0P`
-会 bind 出一个没人认的节点。`/dev/snd/timer` 也要带上，声卡服务会用到它。
+会 bind 出一个没人认的节点。
 
 **`/dev/tty0..6` 是硬前提，少一个都不行**：logind 判断"这台机器有没有 VT"
 的唯一依据就是 `/dev/tty0` 存不存在（`access("/dev/tty0")`），`CanTTY` 直接由它
@@ -137,115 +137,43 @@ cat /run/udev/data/c226:1              # DRM seat/master-of-seat
 cat /run/udev/data/c13:71              # vdrm-kbd 的 ID_INPUT*/Q:seat
 ```
 
-## 4. 装 Mesa / GBM / 合成器
+## 4. Mesa 与 GBM
+
+- **Mesa**：用 [lfdevs/mesa-for-android-container](https://github.com/lfdevs/mesa-for-android-container)
+  出的包（按你的发行版/架构选）；
+- **GBM 后端**：把仓库里的 `vdrm_gbm.so` 放进发行版的 GBM 后端目录
+  （Fedora `/usr/lib64/gbm/`，Debian/Arch `/usr/lib/gbm/`）。
+
+其余按发行版的常规方式装合成器即可，不赘述。
+
+## 5. 起桌面：交给 SDDM
+
+有了 `/dev/tty0..6` 之后，桌面直接交给 SDDM 自动登录拉起即可 —— 不需要自己写
+service 去起合成器。现成文件在 [`docs/container/sddm/`](docs/container/sddm/README.md)，
+装完 `systemctl enable sddm` 就行。
+
+三个要点：
+
+- **SDDM 以 root 跑**（`sddm.service` 里没有 `User=`），不用额外加组；
+- **会话包装脚本必须 `trap '' HUP`**。实测把这行去掉后：SDDM 日志立刻出现
+  `session closed for user root` + `Auth: sddm-helper exited with 1`，
+  `loginctl` 里没有 session、`kwin_wayland` 起不来；
+- **环境变量要给两处**：`/etc/environment`（PAM/session）和
+  `/etc/environment.d/`（`systemd --user`），否则 `plasma-kwin_wayland.service`
+  拿不到 `KWIN_DRM_DEVICES` / `MESA_LOADER_DRIVER_OVERRIDE`。
+
+确认：
 
 ```sh
-# Mesa（Fedora 43；Arch 换对应包）
-curl -L -o /tmp/mesa.tar.gz https://github.com/lfdevs/mesa-for-android-container/releases/download/mesa-27.0.0-devel-20261025-r1/mesa-for-android-container_27.0.0-devel-20261025-r1_fedora_43_arm64.tar.gz
-tar -xzf /tmp/mesa.tar.gz -C /
-
-# GBM 后端（Fedora 是 /usr/lib64/gbm，Arch/Debian 是 /usr/lib/gbm）
-cp vdrm_gbm.so /usr/lib64/gbm/
-
-# 合成器
-dnf install -y plasma-workspace kwin kscreen
-```
-
-## 5. 起桌面
-
-做成 systemd 服务，从任何入口（容器控制台 / 管理器 shell）都能起，也不怕关掉终端：
-
-```sh
-cat > /etc/systemd/system/vdrm-kde.service <<'EOF'
-[Unit]
-Description=VDRM: KDE session on the virtual display
-After=systemd-user-sessions.service
-
-[Service]
-Type=simple
-# 走标准 logind 会话：内核模块在 CONFIG_VT=n 的内核上提供虚拟 VT
-# （/dev/tty0..6 + /sys/class/tty/tty0/active），KWin 才会用 LogindSession，
-# 而不是 NoopSession（直接 open card1）。
-PAMName=login
-Environment=XDG_RUNTIME_DIR=/tmp/xdg
-Environment=XDG_SEAT=seat0
-Environment=XDG_VTNR=1
-Environment=XDG_SESSION_TYPE=wayland
-Environment=KWIN_DRM_DEVICES=/dev/dri/card1
-Environment=MESA_LOADER_DRIVER_OVERRIDE=msm
-ExecStartPre=/bin/sh -c "install -d -m 700 /tmp/xdg"
-ExecStart=/usr/bin/dbus-run-session -- /usr/sbin/startplasma-wayland
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now vdrm-kde
-```
-
-日常操作就是 `systemctl start vdrm-kde` / `stop` / `status`，开机（容器启动）自动起。
-带 `PAMName` 后 `stop` 只杀 unit cgroup；KWin 在 logind 的 session scope 里，可能
-还活着 —— 停之前先 `loginctl list-sessions` 找到它，`loginctl kill-session <id>`
-（或直接 `pkill -9 -x kwin_wayland`）。
-
-确认出图、并确认走的是 logind：
-
-```sh
-pgrep -c -x kwin_wayland                        # 1
+loginctl list-sessions                    # 应有一条 SEAT=seat0、TTY=tty1
+pgrep -c -x kwin_wayland                  # 1
 cat /sys/module/vdrm/parameters/frames_pushed   # 动鼠标要涨
-cat /sys/module/vdrm/parameters/active
-
-loginctl list-sessions                          # 应有一条 SEAT=seat0
-journalctl -b | grep "Could not determine the active graphical session"
-                                                # 不该出现；出现就是退回 NoopSession 了
 ```
 
-模块有原生的 `/sys/class/tty/tty0/active`（没有 VT 的内核由 `vdrm_vt.c` 提供）时，
-容器只需要 **bind 进 `/dev/tty0..6`**（第 2 节），`vdrm-udev` 不碰这些节点；
-`CanTTY=yes` 之后 `PAMName=login` + `XDG_VTNR=1` 才会成功。
-
-换合成器就把 `ExecStart` 换成 `niri` / `Hyprland` / `sway`。
-
-### 5.1 用 SDDM 在启动阶段拉起（Fedora 43 / SDDM 0.21 实测）
-
-也可以让 SDDM 自动登录，直接进 KDE；KWin 同样走 `LogindSession`。仓库
-`docs/container/sddm/` 里有现成文件，安装步骤见
-[`docs/container/sddm/README.md`](docs/container/sddm/README.md)。核心是三件事：
-
-- 设备节点由容器运行时 bind；`vdrm-udev` 只写 `/run/udev` 数据，
-  不 mknod、不 mount、不 mask；
-- 用 `tools/vdrm-sddm-start.sh` 包装会话：`trap '' HUP`、清 `LIBSEAT_BACKEND`，
-  **保留** SDDM/PAM 给的 `DBUS_SESSION_BUS_ADDRESS=/run/user/0/bus`，然后
-  `plasma-dbus-run-session-if-needed startplasma-wayland`。不 `trap` 的话，
-  dbus/KDE 的 fork 会让内核给旧 session leader 发 SIGHUP，会话包装被杀，
-  SDDM 就当成“会话结束”把 KWin 一起收掉；
-- `/etc/environment`、`/etc/environment.d/10-vdrm.conf` 和
-  `sddm.service.d/override.conf` 里都要有
-  `KWIN_DRM_DEVICES=/dev/dri/card1`、`MESA_LOADER_DRIVER_OVERRIDE=msm`。
-  `environment.d` 是给 `systemd --user` 的，否则
-  `plasma-kwin_wayland.service` 拿不到这两个变量。
-
-```sh
-# 按 docs/container/sddm/README.md 装完文件后：
-systemctl daemon-reload
-systemctl enable sddm
-systemctl disable --now vdrm-kde
-systemctl restart user@0.service   # 让 systemd --user 读 environment.d
-# 重启容器
-```
-
-`vdrm-kde.service` 和 `sddm` 不要同时 enable：两者都会抢 card1。
-
-验证 KDE 的 user unit 是原生的：
-
-```sh
-XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
-  systemctl --user list-units | grep -E 'plasma-(kwin|ksmserver|plasmashell|kded)'
-# 期望 plasma-kwin_wayland.service / plasma-ksmserver.service /
-#      plasma-plasmashell.service 都是 active；KWin 的父进程是 systemd --user
-```
+**关于 VT 的边界**：这套虚拟 VT 还不成熟，只实现了 logind/SDDM 需要的那部分
+uAPI。它能做到的是"SDDM 在 tty1 上拉起一个桌面"；想同时装多个合成器、在 SDDM
+里按需切换 niri / sway / Hyprland，会遇到会话和输入的归属问题 —— **别把它当真机
+上的多会话 VT 用**。换合成器建议直接改 SDDM 会话，而不是并存多套。
 
 ## 6. 装 App
 
@@ -291,13 +219,18 @@ App 不投票。同频不闪、90 那档容易撞（见第 9 节）。
 aplay -l | grep vdrm
 ```
 
-声音是**按需**的：容器里有人开 `/dev/snd/pcmC0D0p`，内核就把
-`play_users` 置 1 并 eventfd 叫醒 App，App 这时才起 AAudio；容器把 PCM 关掉
-之后 App 再停。所以容器里必须有一个声卡服务真的会开、也会关这个 PCM。
+容器里的声卡是**真实的内核 ALSA 设备**（`/dev/snd/controlC0`、`pcmC0D0p`、
+`pcmC0D1c`），行为和真机一致 —— 按你所装发行版的常规方式配置音频即可
+（PipeWire / PulseAudio / 直接 ALSA 都行），没有任何 VDRM 专用步骤。
 
-Fedora 的 PipeWire 在这套容器里有两个坑（`ConditionUser=!root` 直接 skip、
-WirePlumber 枚举不到 ALSA 卡），配置和验证步骤都在
-[`docs/container/audio/`](docs/container/audio/README.md)。裸 ALSA 也能直接测：
+声音是**按需**的：容器里有人打开 PCM，内核把 `play_users` 置 1 并叫醒 App，
+App 这时才起 AAudio；PCM 关掉之后 App 再停。所以容器里要有一个声卡服务真的
+会开、也会关这个 PCM。
+
+> Fedora 上的两个坑（`ConditionUser=!root`、WirePlumber 枚举不到 ALSA 卡）
+> 和现成配置在 [`docs/container/audio/`](docs/container/audio/README.md)。
+
+裸 ALSA 也能直接测：
 
 ```sh
 aplay -D hw:0,0 -f S16_LE -r 48000 -c 2 /dev/zero
@@ -330,7 +263,7 @@ logcat -s VDRM | grep STATS
 13–24ms，这部分改不动。
 
 **闪屏**：面板和合成器同频（都 120 或都 60）不闪；不同频会闪，`90` 那档最容易
-和 120 的 tick 撞。遇到闪屏先把刷新率调成同频，再看要不要开锁相环。
+和 120 的 tick 撞。先把刷新率调成同频；同频还闪就把「在飞帧数」调大。
 
 **卡顿**：把「在飞帧数」调大（更平滑，延迟变大）；调小更跟手，但太小会卡。
 
