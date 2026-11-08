@@ -70,7 +70,7 @@ enable_hw_access=0
 enable_gpu_mode=1
 allow_sandboxing=1
 privileged=nomask
-bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/event7:/dev/input/event7,/dev/input/event8:/dev/input/event8,/dev/input/event9:/dev/input/event9,/dev/snd/controlC0:/dev/snd/controlC0,/dev/snd/pcmC0D0p:/dev/snd/pcmC0D0p,/dev/snd/pcmC0D1c:/dev/snd/pcmC0D1c
+bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/event7:/dev/input/event7,/dev/input/event8:/dev/input/event8,/dev/input/event9:/dev/input/event9,/dev/snd/controlC0:/dev/snd/controlC0,/dev/snd/pcmC0D0p:/dev/snd/pcmC0D0p,/dev/snd/pcmC0D1c:/dev/snd/pcmC0D1c,/dev/snd/timer:/dev/snd/timer
 ```
 
 `/dev/input`、`/dev/snd` 也可以整目录 bind，但逐个节点更干净：Android 自己的
@@ -83,7 +83,7 @@ event 节点和另一张声卡就不会跟着进容器。
 KWin 根本不会用），那样容器里就一个可用输入都没有。
 
 ALSA 节点名也是大小写敏感的：`pcmC0D0p`（小写 p = playback），写成 `pcmC0D0P`
-会 bind 出一个没人认的节点。
+会 bind 出一个没人认的节点。`/dev/snd/timer` 也要带上，声卡服务会用到它。
 
 **`/dev/tty0..6` 是硬前提，少一个都不行**：logind 判断"这台机器有没有 VT"
 的唯一依据就是 `/dev/tty0` 存不存在（`access("/dev/tty0")`），`CanTTY` 直接由它
@@ -431,9 +431,15 @@ su -c 'dmesg | grep -E "vdrm: (app eventfd|REGISTER)" | tail -8'
 `0600 root:root`（并顺手校正主次号/标签）；**不要对 `/dev/input/event*` 通配**。
 容器侧设备节点由运行时 bind，不再有 systemd mknod/service。
 
-注意：如果 InputReader 已经打开过这些 event fd，改权限不会把它从 Android
-设备表里立刻移除；**模块重载后需要重启手机，或 `stop; start` 重启 Android
-framework**，让 InputReader 释放旧 fd；开机时 post-fs-data 会在 zygote 之前完成隐藏。开机后 `dumpsys input | grep vdrm` 应该为空。
+重载模块**不需要重启手机**：用 `tools/vdrm_reload.sh`（先停容器和 App → `rmmod`
+→ `insmod` → 校正节点并隐藏输入 → 重建池 → 起容器和 App）。它的顺序保证
+InputReader 手里没有旧 fd；开机时 post-fs-data 也会在 zygote 之前完成隐藏。
+
+验证：
+
+```sh
+su -c 'dumpsys input | grep -E "vdrm-kbd|vdrm-ptr|vdrm-touch"'   # 应该为空
+```
 
 ## 鸣谢
 
