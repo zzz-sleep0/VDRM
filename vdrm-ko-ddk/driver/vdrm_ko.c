@@ -2990,6 +2990,20 @@ static void vdrm_pipe_update(struct drm_simple_display_pipe *pipe,
 	if (slot_idx >= 0)
 		g_flip_armed++;
 
+	/* pace=0 也要落时间戳：present_lat 是纯诊断，不该因为"事件没挂在槽上"
+	 * 就整条关掉（以前 pend_since_ns 只在 pace=1/2 的分支里写，所以 pace=0
+	 * 下 present_lat_us 恒为 0，等于这条延迟没有任何监控）。只写时间戳和
+	 * 序号，不碰 pend_event —— 节拍仍然是 tick 的。*/
+	if (slot_idx >= 0) {
+		unsigned long fl;
+
+		spin_lock_irqsave(&g_pool_state_lock, fl);
+		g_pool[slot_idx].pend_since_ns = now_ns;
+		g_pool[slot_idx].pend_seq       = ++g_flip_seq;
+		g_pool[slot_idx].pend_presented = 0;
+		spin_unlock_irqrestore(&g_pool_state_lock, fl);
+	}
+
 	_raw_spin_lock_irq(&crtc->dev->event_lock.rlock);
 	/* 没有池槽可挂（HEAP 回退的那批 buffer，或者 vblank 引用拿不到）：
 	 * arm 到下一个 vblank；连 vblank 都没有就立即完成。
