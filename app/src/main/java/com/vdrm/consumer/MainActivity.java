@@ -68,10 +68,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         @Override
         public void run() {
             syncOrientation();
-
-        /* 应用调试页保存的配置。pace 需要 /dev/vdrm 的 fd，这里先设一次
-         * inflight/pll（纯 native 状态）；surfaceCreated 里再补一次 pace。*/
-        VdrmSettingsActivity.applySaved(this);
             orientHandler.postDelayed(this, ORIENT_POLL_MS);
         }
     };
@@ -93,6 +89,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
          * nativeGetMode 首次调用只看 GET_INFO（active），不会被上一次
          * commit 的目标尺寸带偏。*/
         syncOrientation();
+
+        /* 应用调试页保存的配置（inflight / pll 立即生效；pace 需要
+         * /dev/vdrm 的 fd，surfaceCreated 里会再应用一次）。*/
+        VdrmSettingsActivity.applySaved(MainActivity.this);
 
         /* Fullscreen */
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
@@ -269,7 +269,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         Native.nativeStart(nativeHandle, holder.getSurface());
 
         /* fd 已经就绪：把调试页里存的 pace 真正下发一次。*/
-        VdrmSettingsActivity.applySaved(this);
+        VdrmSettingsActivity.applySaved(MainActivity.this);
         Native.nativeStartAudio(nativeHandle);
     }
 

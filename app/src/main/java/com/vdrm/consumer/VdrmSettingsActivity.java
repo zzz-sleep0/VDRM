@@ -66,10 +66,13 @@ public class VdrmSettingsActivity extends Activity {
         int pad = (int) (20 * getResources().getDisplayMetrics().density);
         root.setPadding(pad, pad, pad, pad);
 
-        root.addView(section("flip-done 节拍（pace）",
-            "0 = 每个假 vblank 无条件发 flip-done：最流畅，但合成器可能重画正在扫描的显存（偶发闪/撕）。\n" +
-            "1 = 等 App 报 present 才发：不撕，但会被 SF 串行化，帧率下降，release 不回时时可能卡住池子。\n" +
-            "2 = 滞后一帧：这一帧 present、后面又有帧 present 才放行，折中。"));
+        root.addView(section("节拍（App 侧 latch 深度）",
+            "0 = 立即贴下一帧（默认）。帧率最高，但合成器可能在 SF 还在扫描时重画（偶发闪/撕）。\n" +
+            "1 = 上一帧 present 了才贴下一帧。更接近不撕，代价是帧率被 SF 的上屏速度限住。\n" +
+            "2 = 允许一帧在飞（滞后一帧），是 0 和 1 之间的折中。\n\n" +
+            "注意：这三个值是 App 侧"少贴一帧"的深度，不是内核的 flip-done 节拍；" +
+            "内核 pace 始终为 0（那条会在合成器侧等 present，实测会把池子卡死）。" +
+            "等不到 present 时最多憋 200ms 就放行，不会把池子扣死。"));
 
         paceGroup = new RadioGroup(this);
         paceGroup.setOrientation(RadioGroup.VERTICAL);
