@@ -66,13 +66,13 @@ public class VdrmSettingsActivity extends Activity {
         int pad = (int) (20 * getResources().getDisplayMetrics().density);
         root.setPadding(pad, pad, pad, pad);
 
-        root.addView(section("节拍（App 侧 latch 深度）",
-            "0 = 立即贴下一帧（默认）。帧率最高，但合成器可能在 SF 还在扫描时重画（偶发闪/撕）。\n" +
-            "1 = 上一帧 present 了才贴下一帧。更接近不撕，代价是帧率被 SF 的上屏速度限住。\n" +
-            "2 = 允许一帧在飞（滞后一帧），是 0 和 1 之间的折中。\n\n" +
-            "注意：这三个值是 App 侧"少贴一帧"的深度，不是内核的 flip-done 节拍；" +
-            "内核 pace 始终为 0（那条会在合成器侧等 present，实测会把池子卡死）。" +
-            "等不到 present 时最多憋 200ms 就放行，不会把池子扣死。"));
+        root.addView(section("节拍（贴帧深度）",
+            "0 = 立即贴下一帧（默认）。\n" +
+            "1 = 等上一帧上屏后再贴下一帧。\n" +
+            "2 = 允许一帧在飞，滞后一帧。\n\n" +
+            "调大：更不容易闪/撕，但帧率更低、手感更迟钝。\n" +
+            "调小：帧率更高、更跟手，但可能出现闪/撕。\n" +
+            "（等不到上屏时最多憋 200 毫秒就放行，不会卡死池子。）"));
 
         paceGroup = new RadioGroup(this);
         paceGroup.setOrientation(RadioGroup.VERTICAL);
@@ -87,9 +87,10 @@ public class VdrmSettingsActivity extends Activity {
         paceGroup.check(1000 + Math.max(0, Math.min(2, pace)));
         root.addView(paceGroup);
 
-        root.addView(section("in-flight（还没上屏的帧数上限）",
-            "默认 4。调小更跟手，但更容易被 SF 的 present 速度限住（1 会明显卡顿）；" +
-            "调大更平滑，但合成器会领先屏幕更多帧。"));
+        root.addView(section("在飞帧数（in-flight）",
+            "默认 4。\n" +
+            "调大：画面更平滑，但合成器会领先屏幕更多帧，延迟变大。\n" +
+            "调小：更跟手、延迟更小，但容易被上屏速度限住，太小（1）会明显卡顿。"));
 
         inflightLabel = new TextView(this);
         inflightBar = new SeekBar(this);
@@ -108,9 +109,10 @@ public class VdrmSettingsActivity extends Activity {
         root.addView(inflightBar);
 
         root.addView(section("锁相环（pll）",
-            "默认关。打开后每 500ms 观测面板 vsync，把内核假 vblank 的相位" +
-            "调到比面板 vsync 早约 2ms，用来消除两个独立时钟的漂移。\n" +
-            "只在面板和合成器同频（如都是 120Hz）时才有意义；不同频时请保持关闭。"));
+            "默认关。\n" +
+            "打开后每 500 毫秒观测一次面板 vsync，把内核假 vblank 的相位调到比面板 vsync 早约 2 毫秒，" +
+            "用来消除两个独立时钟之间的漂移。\n" +
+            "只在面板和合成器同频（比如都是 120Hz）时有用；不同频时请保持关闭。"));
 
         pllSwitch = new Switch(this);
         pllSwitch.setText("启用锁相环");
