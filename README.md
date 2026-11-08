@@ -10,7 +10,8 @@
 # VDRM
 
 手机上的虚拟显示器：内核模块给出 `/dev/dri/card1`，容器里的合成器（niri / KWin /
-Hyprland / sway）直接画在上面，App 负责显示、虚拟键鼠和声音。默认 1920x1080@120。
+Hyprland / sway）直接画在上面，App 负责显示、虚拟键鼠和声音。默认 1920x1080，
+EDID 报 120/90/60 三档，**App 不主动投票刷新率**，由合成器/SF 自己选（见第 9 节）。
 
 ## 1. 装模块
 
@@ -257,6 +258,17 @@ XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
 | `触控` | 手机触摸当触控屏（按哪点哪） |
 | `刷新` | 重读内核参数 |
 
+**长按桌面图标 → 「调试选项」**（`VdrmSettingsActivity`）：
+
+| 项 | 默认 | 调大 | 调小 |
+|---|---|---|---|
+| 在飞帧数（in-flight，1..6） | 4 | 画面更平滑，但合成器领先屏幕更多帧、延迟变大 | 更跟手、延迟更小，但容易被上屏速度限住（1 会明显卡顿） |
+| 锁相环（pll） | 关 | —— | —— |
+
+锁相环打开后，App 每 500ms 观测一次面板 vsync，把内核假 vblank 的相位
+（`tick_phase_ns`）调到比面板 vsync 早约 2ms，用来消除两个独立时钟的漂移。
+**只在面板和合成器同频（比如都是 120Hz）时有意义**，不同频时保持关闭。
+
 ## 7. 切分辨率
 
 ```sh
@@ -272,6 +284,10 @@ mode=1920x1080
 #refresh=120
 #dpi=256
 ```
+
+`refresh` 只决定 EDID 里报的 preferred 档（120/90/60 三档都会报出去），
+合成器自己会选；**App 不投票**。经验值：面板和合成器同频（都 120 或都 60）
+不闪，`90` 那一档容易和 120 的 tick 打架（见第 9 节）。
 
 ## 8. 声音
 
@@ -294,6 +310,34 @@ cat /sys/module/vdrm/parameters/play_users     # 播放期间应为 1
 
 `play_users` 一直是 0 = 容器根本没开 PCM（或旧内核模块的那个约束返回值 bug），
 这时 App 不会起 AAudio，dmesg 里也不会有 `vdrm_audio` 相关日志。
+
+## 9. 延迟与节拍（为什么默认 pace=0、不追 120Hz）
+
+App 侧把整条链拆成六段量过（`logcat -s VDRM | grep STATS`，KDE 桌面负载下）：
+
+| 段 | 谁测 | 实测 |
+|---|---|---|
+| 内核推帧 → App 读到 | `push2read` | ~0.1ms |
+| 读到 → apply 进 SF | `read2apply` | ~0.06ms |
+| apply → SF 锁定 | `apply2latch` | 1.4–12ms（双峰） |
+| 锁定 → 上屏 | `latch2present` | 13–24ms |
+| 上屏 → App 归还槽 | `present2ret` | 9–20ms |
+| commit → 上屏 | 内核 `present_lat_us` | 16–27ms（max 更差） |
+
+结论：**我们自己那两段是 0.1ms 级，30ms+ 全在 SurfaceFlinger 里**。所以：
+
+- **`pace` 固定 0**：flip-done 在假 vblank tick 上无条件发，合成器永不等 SF；
+- **不追 120Hz**：面板和合成器同频时（都 120）配合锁相环基本不闪；一旦不同频
+  （面板 60 / 合成器 90 或 120，或反过来）就会闪，这是两块时钟打架，不是参数问题；
+- **`pace=1/2` 已删除**：它们的语义是"等 present 再发 flip-done"，等于让合成器
+  也一起等。实测会死锁 —— 合成器等 flip-done 就不再 commit，这一帧的 present
+  永远不来，vblank 网格随之停掉，连兜底超时都跑不到。代码里不再保留这条路径；
+- 槽的归还上界压到 **150ms**（原来 2s）：SF 的 release 迟到时宁可提前还槽冒一次
+  撕裂，也不能把 6 个槽扣死、把合成器饿死。
+
+已知限制：零拷贝 + SurfaceFlinger 下，合成器复用的是**同一块显存**，而"能否复用"
+只由 flip-done 决定。这与 anland 在 Wayland 层把 `wl_buffer.release` 和
+`frame_done` 分开是本质区别 —— DRM 只有一条 flip-done，做不到那种分离。
 
 ## 注意：KMI 对得上，也可能不兼容
 
