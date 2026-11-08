@@ -183,11 +183,16 @@ static void notify_mode_changed(void)
 
 
 /* in-flight 上限：debug.vdrm.inflight 可调（1..6），默认 4。*/
+/* 调试页设的 in-flight 上限；-1 = 用属性/默认值 */
+static volatile int g_inflight_override = -1;
+
 static int max_inflight(void)
 {
     static int cached = -1;
     char v[PROP_VALUE_MAX];
 
+    if (g_inflight_override >= 1 && g_inflight_override <= 6)
+        return g_inflight_override;
     if (cached < 0) {
         int n = 4;
 
@@ -361,9 +366,34 @@ static void sc_set_geometry(ASurfaceTransaction *t, uint32_t mw, uint32_t mh,
          * 面板都要重配 gamma/boost，暗画面（容器桌面就是这样）上会看到闪一下。
          * App 硬投 120 等于不停把策略往 120 拉，和其他窗口/空闲计时器打架，
          * 反而制造更多模式切换。让 SF 按内容实际的帧节奏自己选。*/
-        if (set_fr)
-            set_fr(t, g_sc, 0.0f,
-                   ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+        /* 投票策略可调：debug.vdrm.frame_rate = 0 表示不投（历史默认），
+         * >0 表示恒定投这个帧率（FIXED_SOURCE）。
+         *
+         * 以前不投是因为 LTPO 上 60/90/120 来回切会闪；现在有了锁相环，
+         * 只要面板稳定在同一个频率，tick 就能锁住它 —— 值得重新试
+         * "稳定投 120" 这一档。*/
+        {
+            static int fr_cached = -1;
+            int fr = 0;   /* 默认不投票（保守）；调试页可改成恒定帧率 */
+
+            if (fr_cached < 0) {
+                char v[PROP_VALUE_MAX];
+
+                if (__system_property_get("debug.vdrm.frame_rate", v) > 0) {
+                    int t = atoi(v);
+
+                    if (t >= 0 && t <= 240)
+                        fr = t;
+                }
+                fr_cached = fr;
+            }
+            if (set_fr && fr > 0)
+                set_fr(t, g_sc, (float)fr,
+                       ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+            else if (set_fr)
+                set_fr(t, g_sc, 0.0f,
+                       ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+        }
         g_fr_sc = g_sc;
     }
 
@@ -625,6 +655,7 @@ struct vdrm_tick_info {
 };
 #define VDRM_IOCTL_TICK_INFO   VDRM_IOC(2, 'V', 0x0c, sizeof(struct vdrm_tick_info))
 #define VDRM_IOCTL_TICK_PHASE  VDRM_IOC(1, 'V', 0x0d, sizeof(int64_t))
+#define VDRM_IOCTL_SET_PACE    VDRM_IOC(1, 'V', 0x0e, sizeof(uint32_t))
 
 /* 锁相环：把内核的假 vblank 锁到面板 vsync 上。
  *
@@ -632,6 +663,7 @@ struct vdrm_tick_info {
  * 合成器 commit → App apply 要花 ~0.1ms，SF 还有自己的处理时间；tick 落在
  * deadline 之后，apply2latch 就整帧白等（实测 9.6ms vs 2ms 两档）。
  * 增益取 0.3，避免一次调过头；周期里做 1/2 环绕。*/
+static volatile int g_pll_enabled;     /* 默认关：调试页里手动开 */
 static uint64_t g_panel_vsync_ns;      /* 最近一次 Choreographer 回调时刻 */
 static int64_t  g_pll_phase_ns;
 static int64_t  g_pll_delta_ns;        /* 最近一次算出的相位误差（诊断）*/
@@ -1672,6 +1704,8 @@ static void pll_update(void)
     struct vdrm_tick_info ti;
     int64_t period, delta, err, want;
 
+    if (!g_pll_enabled)
+        return;
     if (g_vdrm_fd < 0)
         return;
     if (ioctl(g_vdrm_fd, VDRM_IOCTL_TICK_INFO, &ti) < 0 || !ti.running)
@@ -2769,6 +2803,28 @@ Java_com_vdrm_consumer_Native_nativeSendScroll(JNIEnv *env, jclass clazz, jint a
  * Java 拿它强制 Activity 的横竖（竖配置 → 竖窗口）。优先用 GET_CONF：那是
  * mode 参数（配置值），切换分辨率后立刻生效，不用等合成器真的切过去。
  * 老模块没有 GET_CONF 时退回 GET_INFO（合成器在用的尺寸），至少方向是对的。*/
+/* ---- 调试页（长按图标 → 调试选项）用的三个入口 ---- */
+JNIEXPORT void JNICALL
+Java_com_vdrm_consumer_Native_nativeSetPace(JNIEnv *env, jclass clazz, jint pace)
+{
+	uint32_t p = (uint32_t)(pace < 0 ? 0 : (pace > 2 ? 2 : pace));
+
+	if (g_vdrm_fd >= 0)
+		ioctl(g_vdrm_fd, VDRM_IOCTL_SET_PACE, &p);
+}
+
+JNIEXPORT void JNICALL
+Java_com_vdrm_consumer_Native_nativeSetInflight(JNIEnv *env, jclass clazz, jint n)
+{
+	g_inflight_override = (n >= 1 && n <= 6) ? n : -1;
+}
+
+JNIEXPORT void JNICALL
+Java_com_vdrm_consumer_Native_nativeSetPll(JNIEnv *env, jclass clazz, jboolean on)
+{
+	g_pll_enabled = on ? 1 : 0;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_vdrm_consumer_Native_nativeGetMode(JNIEnv *env, jclass clazz)
 {

@@ -68,6 +68,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         @Override
         public void run() {
             syncOrientation();
+
+        /* 应用调试页保存的配置。pace 需要 /dev/vdrm 的 fd，这里先设一次
+         * inflight/pll（纯 native 状态）；surfaceCreated 里再补一次 pace。*/
+        VdrmSettingsActivity.applySaved(this);
             orientHandler.postDelayed(this, ORIENT_POLL_MS);
         }
     };
@@ -263,6 +267,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         /* 同上：不再对 Surface 投 120Hz。 */
         Log.i(TAG, "VDRM build window-no-fps-vote");
         Native.nativeStart(nativeHandle, holder.getSurface());
+
+        /* fd 已经就绪：把调试页里存的 pace 真正下发一次。*/
+        VdrmSettingsActivity.applySaved(this);
         Native.nativeStartAudio(nativeHandle);
     }
 

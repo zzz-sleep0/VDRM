@@ -31,7 +31,19 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- 长按图标弹出的「调试选项」入口 -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+
+        <!-- 调试页：节拍 / 帧数上限 / 锁相环，默认都是保守配置 -->
+        <activity
+            android:name=".VdrmSettingsActivity"
+            android:exported="true"
+            android:label="VDRM 调试选项"
+            android:theme="@android:style/Theme.DeviceDefault" />
 
         <service
             android:name=".ForegroundService"

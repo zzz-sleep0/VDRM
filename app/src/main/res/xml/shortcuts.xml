@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 长按桌面图标 → 「调试选项」。
+     三个开关：pace（flip-done 节拍）、in-flight（未上屏帧数上限）、
+     锁相环（假 vblank 锁到面板 vsync）。默认值都是保守配置。 -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="debug_options"
+        android:enabled="true"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:shortcutShortLabel="@string/shortcut_debug_short"
+        android:shortcutLongLabel="@string/shortcut_debug_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.vdrm.consumer"
+            android:targetClass="com.vdrm.consumer.VdrmSettingsActivity" />
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>

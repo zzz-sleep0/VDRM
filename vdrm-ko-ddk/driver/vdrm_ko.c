@@ -408,6 +408,10 @@ struct vdrm_tick_info {
 };
 #define VDRM_IOCTL_TICK_INFO  VDRM_IOC(2, 'V', 0x0c, sizeof(struct vdrm_tick_info))
 #define VDRM_IOCTL_TICK_PHASE VDRM_IOC(1, 'V', 0x0d, sizeof(s64))
+/* 调试页用：改 flip-done 的节拍（0=tick / 1=等 present / 2=滞后一帧）。
+ * 和 /sys/module/vdrm/parameters/pace 是同一个变量，App 没权限写 sysfs，
+ * 所以给它一条 ioctl。*/
+#define VDRM_IOCTL_SET_PACE   VDRM_IOC(1, 'V', 0x0e, sizeof(u32))
 
 /* ---- 直接触摸屏（ABS_MT）----
  * App 每帧把【当前所有活动触点】打包发过来；内核负责：
@@ -1936,6 +1940,17 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			vdrm_gem_put(obj);
 			return -EFAULT;
 		}
+		return 0;
+	}
+	case VDRM_IOCTL_SET_PACE: {
+		u32 p;
+
+		if (copy_from_user(&p, (const void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		if (p > 2)
+			return -EINVAL;
+		WRITE_ONCE(g_pace, p);
+		pr_info("vdrm: pace -> %u\n", p);
 		return 0;
 	}
 	case VDRM_IOCTL_TICK_INFO: {
