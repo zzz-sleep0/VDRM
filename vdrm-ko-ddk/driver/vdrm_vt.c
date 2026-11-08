@@ -103,10 +103,19 @@ static int vt_write(struct tty_struct *tty, const unsigned char *buf, int count)
 }
 #endif
 
+/* write_room() 的返回类型比 tty 那两个回调更早变：5.10 还是 int，
+ * 5.15/6.1 已经是 unsigned int（矩阵里 5.15 用 unsigned 编得过）。*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
 static unsigned int vt_write_room(struct tty_struct *tty)
 {
 	return 4096;
 }
+#else
+static int vt_write_room(struct tty_struct *tty)
+{
+	return 4096;
+}
+#endif
 
 static void vt_send_sig(int idx, int sig)
 {
