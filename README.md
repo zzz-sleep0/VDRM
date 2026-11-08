@@ -229,7 +229,6 @@ journalctl -b | grep "Could not determine the active graphical session"
 
 ```sh
 # 按 docs/container/sddm/README.md 装完文件后：
-usermod -aG droidspaces-gpu sddm
 systemctl daemon-reload
 systemctl enable sddm
 systemctl disable --now vdrm-kde

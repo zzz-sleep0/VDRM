@@ -42,14 +42,8 @@ systemctl restart user@0.service
 `/etc/environment` 给 PAM/session；`/etc/environment.d/10-vdrm.conf`
 给 `systemd --user`，后者会把变量传给 `plasma-kwin_wayland.service`。
 
-SDDM 的 Wayland greeter 以 `sddm` 用户跑 KWin，需要能读 render 节点：
-
-```sh
-usermod -aG droidspaces-gpu sddm
-```
-
-（如果容器的 render 节点组不是这个，换成 `render` / `video`，用
-`ls -l /dev/dri/renderD*` 看。）
+SDDM 以 root 跑（`sddm.service` 里没有 `User=`），不需要额外加组；
+自动登录的用户也是 root，`/dev/dri/card1`、`/dev/input/eventN` 都读得到。
 
 ## 2. 关掉自定义 vdrm-kde，开 SDDM
 
