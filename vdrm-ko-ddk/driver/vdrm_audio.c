@@ -73,7 +73,11 @@ static void vdrm_audio_notify(void)
 	spin_lock_irqsave(&g_lock, flags);
 	ctx = g_audio_evfd;
 	if (ctx)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+		eventfd_signal(ctx);		/* 6.9 起去掉了 count 参数 */
+#else
 		eventfd_signal(ctx, 1);
+#endif
 	spin_unlock_irqrestore(&g_lock, flags);
 }
 static bool g_audio_inited;		/* hrtimer 已初始化，exit 可以 cancel */

@@ -18,12 +18,15 @@
  */
 #include "vdrm_vt.h"
 
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
-#include <linux/tty_port.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
+#include <linux/tty_port.h>	/* 5.14 才从 tty.h 拆出来 */
+#endif
 #include <linux/tty_flip.h>
 #include <linux/vt.h>
 #include <linux/kd.h>
@@ -51,8 +54,15 @@ static wait_queue_head_t vt_wait;
 static int vt_pending = -1;
 static struct device *vt0_dev;
 
+/* 6.6 把 tty_port_operations 的这两个回调改成 bool：
+ *   carrier_raised() -> bool，dtr_rts(port, bool)。5.x 还是 int。*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+static bool vt_carrier_raised(struct tty_port *port) { return true; }
+static void vt_dtr_rts(struct tty_port *port, bool raise) { }
+#else
 static int vt_carrier_raised(struct tty_port *port) { return 1; }
 static void vt_dtr_rts(struct tty_port *port, int raise) { }
+#endif
 static const struct tty_port_operations vt_port_ops = {
 	.carrier_raised = vt_carrier_raised,
 	.dtr_rts = vt_dtr_rts,
@@ -80,10 +90,18 @@ static void vt_hangup(struct tty_struct *tty)
 	tty_port_hangup(&vt_port[tty->index]);
 }
 
+/* 6.6 起 tty_operations.write 用 ssize_t + size_t（原来是 int）。*/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+static ssize_t vt_write(struct tty_struct *tty, const u8 *buf, size_t count)
+{
+	return count;
+}
+#else
 static int vt_write(struct tty_struct *tty, const unsigned char *buf, int count)
 {
 	return count;
 }
+#endif
 
 static unsigned int vt_write_room(struct tty_struct *tty)
 {
