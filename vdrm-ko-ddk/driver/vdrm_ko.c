@@ -230,6 +230,7 @@ static ktime_t        g_vblank_next;
  * 落在后面就白等一整帧（实测 apply2latch 稳定在 ~9.6ms，正是 120Hz
  * 一帧的长度）。写这个参数会立刻把下一次 wakeup 挪过去，周期不变。*/
 static s64 g_tick_phase_ns;
+static s64 g_last_tick_ns;   /* 最近一次 tick 的 ktime_get_ns() */
 
 static int vdrm_tick_phase_set(const char *val, const struct kernel_param *kp)
 {
@@ -391,6 +392,22 @@ struct vdrm_input_batch {
 };
 #define VDRM_IOCTL_INPUT_BATCH \
 	VDRM_IOC(1, 'V', 0x0b, sizeof(struct vdrm_input_batch))
+
+/* ---- 假 vblank 的观测/调相（给 App 侧的锁相环用）----
+ *
+ * App 需要两样东西才能把 tick 锁到面板 vsync 上：
+ *   1) 最近一次 tick 的时刻（本 ioctl 的 last_tick_ns）；
+ *   2) 面板 vsync 的时刻（App 自己从 AChoreographer 拿）。
+ * 算出相位误差后用它去调 tick_phase_ns，避免用户态写 sysfs（App 没权限）。*/
+struct vdrm_tick_info {
+	s64 last_tick_ns;   /* 最近一次 tick 的 ktime（CLOCK_MONOTONIC）*/
+	u64 period_ns;      /* 当前 tick 周期 */
+	s64 phase_ns;       /* 当前相位偏移 */
+	u32 running;        /* 网格在不在跑 */
+	u32 reserved;
+};
+#define VDRM_IOCTL_TICK_INFO  VDRM_IOC(2, 'V', 0x0c, sizeof(struct vdrm_tick_info))
+#define VDRM_IOCTL_TICK_PHASE VDRM_IOC(1, 'V', 0x0d, sizeof(s64))
 
 /* ---- 直接触摸屏（ABS_MT）----
  * App 每帧把【当前所有活动触点】打包发过来；内核负责：
@@ -1921,6 +1938,37 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 		}
 		return 0;
 	}
+	case VDRM_IOCTL_TICK_INFO: {
+		struct vdrm_tick_info ti;
+
+		memset(&ti, 0, sizeof(ti));
+		ti.last_tick_ns = READ_ONCE(g_last_tick_ns);
+		ti.period_ns    = g_vblank_period_ns;
+		ti.phase_ns     = g_tick_phase_ns;
+		ti.running      = g_vblank_timer_running ? 1 : 0;
+		if (copy_to_user((void __user *)arg, &ti, sizeof(ti)))
+			return -EFAULT;
+		return 0;
+	}
+	case VDRM_IOCTL_TICK_PHASE: {
+		s64 ns;
+
+		if (copy_from_user(&ns, (const void __user *)arg, sizeof(ns)))
+			return -EFAULT;
+		/* 限幅 ±1 个周期：再大就等于挪整拍了 */
+		if (ns > (s64)g_vblank_period_ns)
+			ns = (s64)g_vblank_period_ns;
+		if (ns < -(s64)g_vblank_period_ns)
+			ns = -(s64)g_vblank_period_ns;
+		{
+			s64 delta = ns - g_tick_phase_ns;
+
+			g_tick_phase_ns = ns;
+			if (delta && g_vblank_timer_running)
+				g_vblank_next = ktime_add_ns(g_vblank_next, delta);
+		}
+		return 0;
+	}
 	case VDRM_IOCTL_RETURN: {
 		struct vdrm_handle_req req;
 		unsigned long flags;
@@ -2568,6 +2616,7 @@ static enum hrtimer_restart vdrm_vblank_timer_fn(struct hrtimer *t)
 	if (g_vblank_on || g_vblank_kick_ticks)
 		drm_crtc_handle_vblank(&g_pipe->crtc);
 	g_vblank_ticks++;
+	WRITE_ONCE(g_last_tick_ns, ktime_get_ns());
 
 	/* 预热只递减，不要在这里停网格。
 	 *

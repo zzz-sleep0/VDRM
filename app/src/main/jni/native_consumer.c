@@ -615,6 +615,27 @@ struct vdrm_want {
     uint32_t height;
 };
 #define VDRM_IOCTL_WANT        VDRM_IOC(2, 'V', 0x0A, sizeof(struct vdrm_want))
+/* 假 vblank 的观测/调相（内核 vdrm_ko.c 的 TICK_INFO / TICK_PHASE）*/
+struct vdrm_tick_info {
+    int64_t  last_tick_ns;
+    uint64_t period_ns;
+    int64_t  phase_ns;
+    uint32_t running;
+    uint32_t reserved;
+};
+#define VDRM_IOCTL_TICK_INFO   VDRM_IOC(2, 'V', 0x0c, sizeof(struct vdrm_tick_info))
+#define VDRM_IOCTL_TICK_PHASE  VDRM_IOC(1, 'V', 0x0d, sizeof(int64_t))
+
+/* 锁相环：把内核的假 vblank 锁到面板 vsync 上。
+ *
+ * 目标不是"和面板同相"，而是让我们的 tick 比面板 vsync **早一点** ——
+ * 合成器 commit → App apply 要花 ~0.1ms，SF 还有自己的处理时间；tick 落在
+ * deadline 之后，apply2latch 就整帧白等（实测 9.6ms vs 2ms 两档）。
+ * 增益取 0.3，避免一次调过头；周期里做 1/2 环绕。*/
+static uint64_t g_panel_vsync_ns;      /* 最近一次 Choreographer 回调时刻 */
+static int64_t  g_pll_phase_ns;
+static int64_t  g_pll_delta_ns;        /* 最近一次算出的相位误差（诊断）*/
+static uint64_t g_pll_last_ms;
 /* 模块的"配置"（mode 参数）：App 用它决定自己窗口该横着还是竖着。
  * 和 GET_INFO 的 width/height（合成器已经切过去的尺寸）区分开：方向必须看配置，
  * 否则会跟着合成器慢半拍。*/
@@ -1612,6 +1633,7 @@ static void tick_cb(int64_t frame_time_ns, void *data)
     (void)data;
     __atomic_add_fetch(&g_tick_seq, 1, __ATOMIC_RELAXED);
     g_tick_ms = now_ms();
+    g_panel_vsync_ns = mono_ns();
     if (g_tick_fd >= 0) {
         uint64_t one = 1;
         ssize_t r = write(g_tick_fd, &one, sizeof(one));
@@ -1638,6 +1660,44 @@ static void *tick_thread(void *arg)
     while (g_tick_on)
         ALooper_pollOnce(-1, NULL, NULL, NULL);
     return NULL;
+}
+
+/* 每 ~500ms 跑一次：读内核 tick 时刻，和面板 vsync 比，调相位。
+ * 目标相位 TARGET_NS：让 tick 比面板 vsync 提前这么多。*/
+#define VDRM_PLL_TARGET_NS   (-2000000LL)   /* tick 早 2ms */
+#define VDRM_PLL_GAIN        0.3
+
+static void pll_update(void)
+{
+    struct vdrm_tick_info ti;
+    int64_t period, delta, err, want;
+
+    if (g_vdrm_fd < 0)
+        return;
+    if (ioctl(g_vdrm_fd, VDRM_IOCTL_TICK_INFO, &ti) < 0 || !ti.running)
+        return;
+    if (!g_panel_vsync_ns || !ti.last_tick_ns || !ti.period_ns)
+        return;
+
+    period = (int64_t)ti.period_ns;
+    /* tick 相对面板 vsync 的相位，折到 [-period/2, period/2) */
+    delta = (int64_t)(ti.last_tick_ns - (int64_t)g_panel_vsync_ns);
+    while (delta >= period / 2)
+        delta -= period;
+    while (delta < -period / 2)
+        delta += period;
+    g_pll_delta_ns = delta;
+
+    err = VDRM_PLL_TARGET_NS - delta;
+    want = ti.phase_ns + (int64_t)(err * VDRM_PLL_GAIN);
+    if (want > period)
+        want = period;
+    if (want < -period)
+        want = -period;
+    if (want != ti.phase_ns) {
+        if (ioctl(g_vdrm_fd, VDRM_IOCTL_TICK_PHASE, &want) == 0)
+            g_pll_phase_ns = want;
+    }
 }
 
 static void tick_start(void)
@@ -1709,6 +1769,7 @@ static void *render_loop(void *arg)
                  " | apply2latch=%lluus(max %llu) latch2present=%lluus(max %llu)"
                  " | push2read=%lluus(max %llu) read2apply=%lluus(max %llu)"
                  " present2ret=%lluus(max %llu)"
+                 " | pll_phase=%lldus delta=%lldus"
                  " | evgap_max=%llums n40=%llu n80=%llu latch_max=%lluus%s",
                  (unsigned long long)stat_ev, (unsigned long long)stat_show,
                  (unsigned long long)stat_deferred, submission_count(),
@@ -1716,6 +1777,7 @@ static void *render_loop(void *arg)
                  g_a2l_last_us, g_a2l_max_us, g_l2p_last_us, g_l2p_max_us,
                  g_p2r_last_us, g_p2r_max_us, g_r2a_last_us, g_r2a_max_us,
                  g_p2t_last_us, g_p2t_max_us,
+                 (long long)(g_pll_phase_ns / 1000), (long long)(g_pll_delta_ns / 1000),
                  g_ev_gap_max_ms, g_ev_gap_n40, g_ev_gap_n80, g_latch_max_us,
                  g_lat_rejects ? " [lat clock mismatch!]" : "");
             stat_ev = 0; stat_show = 0; stat_deferred = 0;
@@ -1731,6 +1793,10 @@ static void *render_loop(void *arg)
             if (now - last_mode_check_ms >= 1000) {
                 last_mode_check_ms = now;
                 maybe_rebuild_pool(c);
+            }
+            if (now - g_pll_last_ms >= 500) {
+                g_pll_last_ms = now;
+                pll_update();
             }
         }
 
