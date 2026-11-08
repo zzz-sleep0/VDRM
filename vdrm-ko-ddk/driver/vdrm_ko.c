@@ -936,6 +936,7 @@ MODULE_PARM_DESC(present_seen, "PRESENTED notifications received (diagnostics on
  * SF 合成 → 扫描输出 → present fence signal。合成器是"flip-done 才开始画
  * 下一帧"的串行循环，所以它基本上就是帧周期的下界；想知道"为什么只有
  * 30fps"，先看这两个数。*/
+#define VDRM_PRESENT_LAT_SANE_US 1000000ull	/* > 1s 的样本视为过期时间戳 */
 static unsigned long long g_present_lat_us, g_present_lat_max_us;
 module_param_named(present_lat_us, g_present_lat_us, ullong, 0444);
 MODULE_PARM_DESC(present_lat_us, "commit -> App reported present, last (us)");
@@ -1896,6 +1897,10 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 			if (g_pool[i].used && g_pool[i].id == req.id) {
 				if (g_pool[i].state == VDRM_ST_DISPL)
 					g_pool[i].state = VDRM_ST_FREE;
+				/* 槽回到池里，上一帧的提交时刻就没意义了：
+				 * 不清的话，下次这个槽被提交前若来了一个迟到的
+				 * present，会拿旧时间戳算出一个假延迟。*/
+				g_pool[i].pend_since_ns = 0;
 				/* 合成器已经销毁了 handle（旧尺寸 buffer 被丢弃），
 				 * 这一帧也放完了：分配权现在可以真正放开。
 				 * owner 为空 + handle_count 为 0 覆盖 postclose 的
@@ -2088,9 +2093,16 @@ static long vdrm_misc_ioctl(struct file *file, unsigned int cmd,
 				if (g_pool[i].pend_since_ns) {
 					u64 dt = (now - g_pool[i].pend_since_ns) / 1000;
 
-					g_present_lat_us = dt;
-					if (dt > g_present_lat_max_us)
-						g_present_lat_max_us = dt;
+					/* 超过 1 秒的"延迟"不是延迟：那是槽提交后
+					 * 桌面静止了很久才来 present，`pend_since_ns`
+					 * 早就是几十秒前的时间戳了。这种样本会把
+					 * present_lat_max_us 直接写成"上次空闲了多久"
+					 * （实测出现过 52s），丢掉别污染统计。*/
+					if (dt <= VDRM_PRESENT_LAT_SANE_US) {
+						g_present_lat_us = dt;
+						if (dt > g_present_lat_max_us)
+							g_present_lat_max_us = dt;
+					}
 				}
 				g_pool[i].pend_presented = 1;
 				/* 让 pace=2 知道"SF 已经翻过这一帧"*/
