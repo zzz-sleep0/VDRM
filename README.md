@@ -69,7 +69,7 @@ KWin、libinput、logind 全是原生实现，内核侧没有一行图形相关�
 enable_hw_access=0
 enable_gpu_mode=1
 allow_sandboxing=1
-privileged=nomask
+privileged=nomask,noseccomp
 bind_mounts=/dev/tty0:/dev/tty0,/dev/tty1:/dev/tty1,/dev/tty2:/dev/tty2,/dev/tty3:/dev/tty3,/dev/tty4:/dev/tty4,/dev/tty5:/dev/tty5,/dev/tty6:/dev/tty6,/dev/dri/card1:/dev/dri/card1,/dev/input/event7:/dev/input/event7,/dev/input/event8:/dev/input/event8,/dev/input/event9:/dev/input/event9,/dev/snd/controlC0:/dev/snd/controlC0,/dev/snd/pcmC0D0p:/dev/snd/pcmC0D0p,/dev/snd/pcmC0D1c:/dev/snd/pcmC0D1c,/dev/snd/timer:/dev/snd/timer
 ```
 
